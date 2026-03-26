@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"log"
 	"math"
 	"slices"
 	"strconv"
@@ -18,6 +19,10 @@ import (
 
 const timeDay = 24 * time.Hour
 const timeMonth = 31 * 24 * time.Hour
+
+func shouldDebugCache2Query(q *queryBuilder) bool {
+	return q != nil && q.metric != nil && format.HardwareMetric(q.metric.MetricID)
+}
 
 type cache2 struct {
 	waitN     atomic.Int64
@@ -563,6 +568,10 @@ func (l *cache2Loader) run(ctx context.Context) (cache2Data, error) {
 		l.handler.endpointStat.reportTiming("cache-load-all-chunks", time.Since(start))
 	}()
 	if len(l.chunks) != 0 {
+		if shouldDebugCache2Query(l.query) {
+			log.Printf("[debug] cache2 load enqueue metric=%q user=%q key=%q lod=[%d,%d)/step=%d chunks=%d wait_chunks=%d force=%v",
+				l.query.metric.Name, l.query.user, l.query.getOrBuildCacheKey(), l.lod.FromSec, l.lod.ToSec, l.lod.StepSec, len(l.chunks), l.waitN, l.forceLoad)
+		}
 		if l.waitC == nil {
 			l.waitC = make(chan error)
 		}
@@ -658,10 +667,18 @@ func (l *cache2Loader) loadChunks(ctx context.Context) {
 	h, q := l.handler, l.query
 	c, b := l.cache, l.bucket
 	data := l.data[first.chunkStart:last.chunkEnd]
+	if shouldDebugCache2Query(q) {
+		log.Printf("[debug] cache2 load start metric=%q user=%q key=%q chunk_range=[%d,%d) lod=[%d,%d)/step=%d chunks=%d",
+			q.metric.Name, q.user, q.getOrBuildCacheKey(), first.chunkStart, last.chunkEnd, lod.FromSec, lod.ToSec, lod.StepSec, len(chunks))
+	}
 
 	ctx, cancel := context.WithTimeout(ctx, QuerySelectTimeoutDefault)
 	defer cancel()
 	_, err := c.loader(ctx, h, q, lod, data, 0)
+	if shouldDebugCache2Query(q) {
+		log.Printf("[debug] cache2 load done metric=%q user=%q key=%q dur=%s err=%v ctx_err=%v",
+			q.metric.Name, q.user, q.getOrBuildCacheKey(), time.Since(startLoadChunks), err, ctx.Err())
+	}
 	if err == nil {
 		startMapTags := time.Now()
 		cache2MapStringTags(h, q, data)
@@ -755,8 +772,16 @@ func (l *cache2Loader) wait(ctx context.Context) error {
 	}()
 	select {
 	case err := <-c:
+		if shouldDebugCache2Query(l.query) {
+			log.Printf("[debug] cache2 wait done metric=%q user=%q key=%q err=%v",
+				l.query.metric.Name, l.query.user, l.query.getOrBuildCacheKey(), err)
+		}
 		return err
 	case <-ctx.Done():
+		if shouldDebugCache2Query(l.query) {
+			log.Printf("[debug] cache2 wait canceled metric=%q user=%q key=%q err=%v",
+				l.query.metric.Name, l.query.user, l.query.getOrBuildCacheKey(), ctx.Err())
+		}
 		return ctx.Err()
 	}
 }

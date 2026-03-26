@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"slices"
 	"strconv"
 	"sync"
@@ -364,6 +365,14 @@ func QueryKind(isFast, isLight, isHardware bool) int {
 	}
 	return slowHeavy
 }
+
+func debugMetricName(meta QueryMetaInto) string {
+	if meta.Metric == nil {
+		return ""
+	}
+	return meta.Metric.Name
+}
+
 func (ch1 *ClickHouse) Select(ctx context.Context, meta QueryMetaInto, query chgo.Query) (info QueryHandleInfo, err error) {
 	pool, trotCfg := ch1.resolvePoolBy(meta)
 	return pool.selectCH(ctx, ch1, meta, query, trotCfg)
@@ -430,6 +439,11 @@ func (pool *connPool) selectCH(ctx context.Context, ch *ClickHouse, meta QueryMe
 		}
 		if !slices.Contains(meta.DisableCHAddrs, servers[i].addr) {
 			startTime := time.Now()
+			if meta.IsHardware {
+				active, maxActive, waitingUsers, waitingQueries := sem.DebugSnapshot()
+				log.Printf("[debug] ch sem acquire start metric=%q user=%q kind=%d pool=%q active=%d/%d waiting_users=%d waiting_queries=%d shard=%d host=%q",
+					debugMetricName(meta), meta.User, kind, pool.poolName, active, maxActive, waitingUsers, waitingQueries, shard+1, servers[i].addr)
+			}
 
 			err = sem.Acquire(ctx, meta.User)
 			info.WaitLockDuration = time.Since(startTime)
@@ -437,6 +451,11 @@ func (pool *connPool) selectCH(ctx context.Context, ch *ClickHouse, meta QueryMe
 			info.Shard = shard + 1
 
 			statshouse.Value("statshouse_wait_lock", statshouse.Tags{1: strconv.FormatInt(int64(kind), 10), 2: meta.User, 3: pool.poolName, 5: strconv.Itoa(shard + 1)}, info.WaitLockDuration.Seconds())
+			if meta.IsHardware {
+				active, maxActive, waitingUsers, waitingQueries := sem.DebugSnapshot()
+				log.Printf("[debug] ch sem acquire done metric=%q user=%q kind=%d pool=%q wait=%s err=%v active=%d/%d waiting_users=%d waiting_queries=%d shard=%d host=%q",
+					debugMetricName(meta), meta.User, kind, pool.poolName, info.WaitLockDuration, err, active, maxActive, waitingUsers, waitingQueries, shard+1, servers[i].addr)
+			}
 			if err != nil {
 				info.ErrorCode = format.TagValueIDAPIResponseExceptionSemError
 				if errors.Is(ctx.Err(), context.Canceled) {
@@ -476,6 +495,11 @@ func (pool *connPool) selectCH(ctx context.Context, ch *ClickHouse, meta QueryMe
 			err = throttling(servers[i].rate.GetReplicaKey(), pool.rnd, err, trotCfg)
 			info.QueryDuration = time.Since(start)
 			sem.Release()
+			if meta.IsHardware {
+				active, maxActive, waitingUsers, waitingQueries := sem.DebugSnapshot()
+				log.Printf("[debug] ch sem release metric=%q user=%q kind=%d pool=%q query=%s err=%v active=%d/%d waiting_users=%d waiting_queries=%d shard=%d host=%q",
+					debugMetricName(meta), meta.User, kind, pool.poolName, info.QueryDuration, err, active, maxActive, waitingUsers, waitingQueries, shard+1, servers[i].addr)
+			}
 			pool.recordQueryDuration(info.QueryDuration, shard)
 
 			if queryCtx.Err() != nil && !errors.Is(queryCtx.Err(), ctx.Err()) {

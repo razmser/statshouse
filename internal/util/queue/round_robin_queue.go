@@ -159,6 +159,16 @@ func (q *Queue) Observe() (int64, error) {
 	return q.activeQuery, nil
 }
 
+func (q *Queue) DebugSnapshot() (active, maxActive int64, waitingUsers, waitingQueries int) {
+	q.mx.Lock()
+	defer q.mx.Unlock()
+	waitingUsers = len(q.waitingUsersByName)
+	for _, u := range q.waitingUsersByName {
+		waitingQueries += u.qry.Len()
+	}
+	return q.activeQuery, q.maxActiveQuery, waitingUsers, waitingQueries
+}
+
 func (q *Queue) AdjustCapacity(cap uint64) {
 	q.mx.Lock()
 	defer q.mx.Unlock()
