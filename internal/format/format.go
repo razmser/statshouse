@@ -1068,31 +1068,38 @@ func validStringValueLegacy(s mem.RO, maxLen int) bool {
 }
 
 func validStringValue(s mem.RO, maxLen int) bool {
-	if s.Len() > maxLen {
+	n := s.Len()
+	if n > maxLen {
 		return false
 	}
-	if s.Len() == 0 {
+	if n == 0 {
 		return true
 	}
 	previousSpace := true // fail on first space
-	for r := 0; r < s.Len(); {
-		if c := s.At(r); bytePrint(c) {
-			isSpace := c == ' '
-			if isSpace && previousSpace {
-				return false
+	for r := 0; r < n; {
+		// Hot path: printable non-space ASCII (0x21..0x7e). Ordering this first,
+		// before the space bookkeeping, is what makes the common all-ASCII case fast.
+		if c := s.At(r); c >= 0x21 && c <= 0x7e {
+			previousSpace = false
+			r++
+			continue
+		} else if c == ' ' {
+			if previousSpace {
+				return false // no leading space, no consecutive spaces
 			}
-			previousSpace = isSpace
+			previousSpace = true
 			r++
 			continue
 		}
+		// Control byte (<0x20 or 0x7f) or the start of a multi-byte rune.
 		c, nr := mem.DecodeRune(s.SliceFrom(r))
 		if c == utf8.RuneError && nr <= 1 {
 			return false
 		}
-		switch {
-		case unicode.IsSpace(c):
-			return false // only ascii spaces are allowed
-		case !unicode.IsPrint(c):
+		// Only ASCII space is allowed. unicode.IsPrint returns true for U+0020 only
+		// among whitespace, and U+0020 is handled above, so !IsPrint already rejects
+		// every non-ASCII whitespace rune (no separate unicode.IsSpace check needed).
+		if !unicode.IsPrint(c) {
 			return false
 		}
 		previousSpace = false
