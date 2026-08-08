@@ -1,0 +1,37 @@
+<!--
+    Minimal single-node ClickHouse config for the e2e harness.
+
+    - remote_servers.statlogs2: one shard / one replica pointing at this container's
+      own loopback (host = localhost, port = 9000). The aggregator autoconfigures from
+      system.clusters (single row -> demo mode, shard=1 replica=1).
+    - storage_configuration: defines the ssd_then_hdd policy as an alias over the
+      default disk. This is required because the committed v6-init.sql (a faithful
+      two-edit de-replication of the production schema) sets
+      storage_policy = 'ssd_then_hdd' on the 1s/1m/1h tables. Mirrors
+      localdebug/clickhouse-cluster/configs/ch/config.xml.
+
+    Deliberately omitted (vs production / localdebug): zookeeper, prometheus, macros.
+-->
+<clickhouse>
+    <remote_servers>
+        <statlogs2>
+            <shard>
+                <replica>
+                    <host>localhost</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+        </statlogs2>
+    </remote_servers>
+    <storage_configuration>
+        <policies>
+            <ssd_then_hdd>
+                <volumes>
+                    <hdd>
+                        <disk>default</disk>
+                    </hdd>
+                </volumes>
+            </ssd_then_hdd>
+        </policies>
+    </storage_configuration>
+</clickhouse>
