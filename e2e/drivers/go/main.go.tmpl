@@ -1,0 +1,169 @@
+{{- /* Driver template for the go StatsHouse client (spec §4).
+   Rendered by the e2e harness (Go text/template) from the single generated
+   counter stream (e2e/stream.go). "Pinned seed" = injection: the exact writes
+   below are the same bytes the harness asserts against, there is no per-language
+   RNG. This is a harness-owned program, NOT the upstream client's test_template.txt.
+
+   Every real write goes through the client's Historic bypass path
+   (*Client.NamedCountHistoric → *MetricRef.CountHistoric → write with an explicit
+   past ts), so each observation serializes immediately with its own timestamp —
+   bucket assignment is exact regardless of the client's 1s flush jitter. Close()
+   does the final synchronous flush; the harness waits for this process to exit
+   before asserting.
+
+   COLD-START PRE-WARM. The agent drops every packet for a metric name not yet in
+   its local mapping (cmd/statshouse/worker.go: fillMetricMeta → MetricNotFound,
+   return false) even though it asynchronously asks metadata to auto-create the
+   metric. Creation → journal broadcast → agent mapping-cache update is async, so a
+   single short-lived driver loses its entire payload to that window (the metric
+   ends up defined but with zero rows). To defeat this we first send one count=1
+   "seed" per metric — it is itself dropped (it is the first packet, so it hits the
+   same unmapped window), but its arrival is what triggers the auto-create — then
+   poll /api/metrics-list until metadata has created every metric. At that point
+   the agent's longpoll journal subscription has the mapping too; a 2s settle
+   covers any subscription skew, after which the real stream maps cleanly. Seeds
+   use ts=base-60 (outside the asserted [base, base+70] window, inside the 24h
+   HistoricWindow) so that even if one landed it could not perturb an assertion
+   bucket; the client skips count=0 writes (client_bucket.go: countToSend>0), so
+   the seed must carry count>0. */ -}}
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"time"
+
+	"github.com/VKCOM/statshouse-go"
+)
+
+func main() {
+	addr := os.Getenv("STATSHOUSE_ADDR")
+	if addr == "" {
+		addr = statshouse.DefaultAddr
+	}
+	// TCP is the reliable client→agent metric path on :13337: the agent's RPC
+	// listener hijacks every connection carrying the "statshousev" handshake
+	// (cmd/statshouse/statshouse.go hijackConnection → internal/receiver TCP
+	// metric receiver), and this client sends exactly that handshake
+	// (client_conn.go). UDP is lossy across containers — a dropped datagram is
+	// silent — so spec §4 mandates TCP here. The Historic writes still carry
+	// explicit timestamps.
+	c := statshouse.NewClientEx(statshouse.ConfigureArgs{StatsHouseAddr: addr, Network: "tcp"})
+
+	metrics := []string{
+		{{- range .Metrics}}
+		{{printf "%q" .}},
+		{{- end}}
+	}
+	const seedTS = {{.SeedTS}}
+
+	// One count=1 seed per metric: dropped on arrival (unmapped), but it is the
+	// packet that triggers metadata auto-create for the name.
+	for _, m := range metrics {
+		c.NamedCountHistoric(m, statshouse.NamedTags{}, 1, seedTS)
+	}
+
+	// STATSHOUSE_API_ADDR is the api container's <ip>:10888 on the run network
+	// (the harness publishes a host port for its own assertions, but the driver
+	// container reaches the api by its in-network IP). Empty → fixed fallback.
+	apiAddr := os.Getenv("STATSHOUSE_API_ADDR")
+	if apiAddr == "" {
+		time.Sleep(5 * time.Second)
+	} else {
+		waitMetricsExist("http://"+apiAddr+"/api/metrics-list", metrics)
+		// Settle so the agent's longpoll mapping-cache subscription catches up to
+		// metadata before the real (counted) writes begin.
+		time.Sleep(2 * time.Second)
+	}
+
+	// The real stream: one NamedCountHistoric per generated counter observation.
+	// Tags render as positional [2]string pairs; empty values are emitted verbatim
+	// so the client's fillTag empty-drop (client_packet.go) is exercised on the wire.
+	{{- range .Writes}}
+	c.NamedCountHistoric({{printf "%q" .Metric}}, statshouse.NamedTags{ {{- range .Tags}}{ {{printf "%q" .Key}}, {{printf "%q" .Val}} }, {{end}} }, {{printf "%v" .Count}}, {{.TS}})
+	{{- end}}
+
+	// Close flushes the in-flight packet (c.send(0)) and closes the socket;
+	// without it the last batch is lost. Then a brief settle so the agent finishes
+	// draining the datagrams before the container exits.
+	if err := c.Close(); err != nil {
+		fmt.Fprintln(os.Stderr, "statshouse-go driver: close error:", err)
+		os.Exit(1)
+	}
+	time.Sleep(time.Second)
+	fmt.Printf("statshouse-go driver: wrote {{len .Writes}} counters to %s\n", addr)
+}
+
+// metricsListReply is the minimal slice of /api/metrics-list's reply: the known
+// metric names under data.metrics.
+type metricsListReply struct {
+	Data struct {
+		Metrics []struct {
+			Name string `json:"name"`
+		} `json:"metrics"`
+	} `json:"data"`
+}
+
+// waitMetricsExist blocks until /api/metrics-list reports every metric name,
+// which means metadata has auto-created them all. Polls for up to 60s; on timeout
+// it logs and returns (the real write is still attempted so the harness
+// assertions surface the real failure rather than a hang).
+func waitMetricsExist(listURL string, metrics []string) {
+	want := make(map[string]bool, len(metrics))
+	for _, m := range metrics {
+		want[m] = true
+	}
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		known, err := fetchMetricNames(listURL)
+		if err == nil {
+			missing := false
+			for m := range want {
+				if !known[m] {
+					missing = true
+					break
+				}
+			}
+			if !missing {
+				fmt.Printf("statshouse-go driver: all %d metric(s) created after pre-warm\n", len(metrics))
+				return
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	fmt.Fprintln(os.Stderr, "statshouse-go driver: timeout waiting for metric creation; continuing")
+}
+
+// preWarmClient is the HTTP client for the cold-start /api/metrics-list poll. A
+// bounded timeout so a hung/unreachable api cannot stall the driver past its exit.
+var preWarmClient = &http.Client{Timeout: 5 * time.Second}
+
+// fetchMetricNames returns the set of metric names the api currently knows. A
+// request/parse failure returns an error so the caller just retries.
+func fetchMetricNames(listURL string) (map[string]bool, error) {
+	resp, err := preWarmClient.Get(listURL + "?full=1")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	var r metricsListReply
+	if err := json.Unmarshal(body, &r); err != nil {
+		return nil, err
+	}
+	out := make(map[string]bool, len(r.Data.Metrics))
+	for _, m := range r.Data.Metrics {
+		out[m.Name] = true
+	}
+	return out, nil
+}

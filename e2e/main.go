@@ -232,19 +232,98 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeo
 	}
 	rec.logf("/api/query answered 200 on %s (%d bytes)", queryAddr, len(body))
 
-	// -v: capture every container's log to artifacts on the happy path.
-	if verbose {
+	// --- go client tracer bullet (ticket 09): generate the counter stream once,
+	// drive the pinned go client over TCP with explicit historic timestamps, wait
+	// for its clean exit, then assert exact per-bucket/per-series equality. ---
+	passed, failed := runGoClientPhase(ctx, rt, rec, goClientPhaseOpts{
+		network:          network,
+		agentIP:          ds.agent.ip,
+		apiAddr:          queryAddr,
+		apiContainerAddr: net.JoinHostPort(ds.api.ip, strconv.Itoa(apiPort)),
+		runID:            runID,
+		arch:             arch,
+		repoRoot:         root,
+		artifactsDir:     artifactsDir,
+	})
+	// The run is a failure if any assertion failed (non-zero exit) even though the
+	// stack came up. Service logs are dumped on failure for diagnosis.
+	if failed > 0 {
 		dumpServiceLogs(rec, rt, containers, artifactsDir)
+		writeSummary(artifactsDir, rec.lines)
+		return 1
 	}
 
 	// --- PASS summary ---
-	summary := fmt.Sprintf("PASS: 5-service stack up, /api/query answers, runtime=%s, runid=%s",
-		rt.Name(), runID)
+	// On a successful run the service logs are only captured under -v (matching the
+	// failure path, which always dumps them); captured before the summary write so
+	// any dump progress lines land in summary.txt too.
+	if verbose {
+		dumpServiceLogs(rec, rt, containers, artifactsDir)
+	}
+	summary := fmt.Sprintf("PASS: go client drove the full pipeline, %d counter metric(s) exact-matched, runtime=%s, runid=%s",
+		passed, rt.Name(), runID)
 	rec.logf("%s", summary)
 	writeSummary(artifactsDir, rec.lines)
 	fmt.Println(summary)
 	fmt.Printf("/api/query response: %s\n", truncate(strings.TrimSpace(body), 400))
 	return 0
+}
+
+// goClientPhaseOpts configures runGoClientPhase.
+type goClientPhaseOpts struct {
+	network          string
+	agentIP          string // agent container IP on the run network
+	apiAddr          string // published api address (host:port) for assertions
+	apiContainerAddr string // api container <ip>:port on the run network (driver pre-warm polling)
+	runID            string
+	arch             string
+	repoRoot         string
+	artifactsDir     string
+}
+
+// runGoClientPhase generates the counter stream, builds+runs the go client, and
+// asserts the result. Returns pass/fail counts. A build/run launch error or a
+// non-zero driver exit is reported as a single FAIL line (all metrics fail).
+func runGoClientPhase(ctx context.Context, rt Runtime, rec *recorder, o goClientPhaseOpts) (passed, failed int) {
+	stream := generateCounterStream(o.runID, time.Now())
+	rec.logf("generated counter stream: base=%d buckets=%d metrics=%d writes=%d",
+		stream.Base, numBuckets, len(stream.Metrics), len(stream.Writes))
+
+	cache, err := e2eCacheDir()
+	if err != nil {
+		rec.logf("FAIL: %v", err)
+		return 0, len(stream.Metrics)
+	}
+	agentAddr := net.JoinHostPort(o.agentIP, strconv.Itoa(agentPort))
+	clientContainer := e2ePrefix + o.runID + "-client-go"
+
+	exitCode, output, runErr := buildAndRunGoClient(ctx, rt, rec, goClientRunOpts{
+		stream:     stream,
+		network:    o.network,
+		agentAddr:  agentAddr,
+		apiAddr:    o.apiContainerAddr,
+		container:  clientContainer,
+		workDir:    filepath.Join(o.artifactsDir, "driver-go"),
+		gomodcache: filepath.Join(cache, "gomodcache"),
+		gocache:    filepath.Join(cache, "gocache"),
+		repoRoot:   o.repoRoot,
+		arch:       o.arch,
+	})
+	if runErr != nil {
+		rec.logf("FAIL: go client build/run did not launch: %v\n%s", runErr, indent(output))
+		fmt.Printf("FAIL go client build/run: %v\n", runErr)
+		return 0, len(stream.Metrics)
+	}
+	if exitCode != 0 {
+		rec.logf("FAIL: go client driver exited %d\n%s", exitCode, indent(output))
+		fmt.Printf("FAIL go client driver exited %d\n", exitCode)
+		return 0, len(stream.Metrics)
+	}
+	rec.logf("go client driver exited 0\n%s", indent(truncate(strings.TrimSpace(output), 1200)))
+
+	passed, failed = assertCounters(ctx, rec, o.apiAddr, stream)
+	rec.logf("counter assertions: %d PASS, %d FAIL", passed, failed)
+	return passed, failed
 }
 
 // resolveArch picks the GOARCH to cross-compile daemons for. An explicit --arch

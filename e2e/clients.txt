@@ -1,0 +1,22 @@
+# Pinned client sources for the e2e harness (spec §4).
+#
+# One line per client, whitespace-separated fields:
+#   <name> <repo-url> <git-ref> <driver-template-dir>
+#
+# First run clones <git-ref> into ~/.cache/statshouse-e2e/clients/<name>@<ref>/
+# on the HOST (containers have no internet) and reuses the checkout across runs.
+# The pinned ref — NOT default-branch HEAD — is the source of truth for every
+# client's wire behavior; cmd/statshouse-client-test clones unpinned HEAD, the
+# harness must not. The initial refs are the commits ticket 03's behavior analysis
+# verified (HEADs at 2026-08).
+#
+# driver-template-dir is relative to e2e/ and holds the harness-owned Go
+# text/template that renders the generated stream into a client program.
+#
+# Active (ticket 09 wires the go client end-to-end):
+statshouse-go  https://github.com/VKCOM/statshouse-go  8c034cab32b42d41d213280760370b290f28b9f4  drivers/go
+
+# Added by ticket 10 (rust/cpp tracer bullets). Left commented so the harness
+# only drives clients whose driver templates and build recipes exist today.
+# statshouse-rs   https://github.com/VKCOM/statshouse-rs    43b4a629  drivers/rust
+# statshouse-cpp  https://github.com/VKCOM/statshouse-cpp   112a449   drivers/cpp
