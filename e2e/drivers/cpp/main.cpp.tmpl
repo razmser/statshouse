@@ -1,0 +1,226 @@
+{{- /* Driver template for the cpp StatsHouse client (spec §4).
+
+   Rendered by the e2e harness (Go text/template) from the single generated
+   counter stream (e2e/stream.go). "Pinned seed" = injection: the exact writes
+   below are the same observations the harness asserts against — there is no
+   per-language RNG. This is a harness-owned program, NOT the upstream client's
+   example/main.cpp.
+
+   WIRE BEHAVIOR of statshouse-cpp @ 112a449 (the pinned source of truth):
+   - No client-side aggregation: write_count serializes one TL counter item
+     carrying the explicit ts passed in (write_count_impl → pack_header with the
+     given tsUnixSec), so bucket assignment is exact regardless of flush jitter.
+     ts=0 would mean "now"; every write below passes an explicit historic ts.
+   - TCP transport sends the "statshousev2" handshake (TransportTCP ctor →
+     build_tcp_handshake_v2, statshouse.hpp). The agent's hijack listener accepts
+     it (internal/receiver/tcp_handshake.go: TCPMagicV2Balancer), the same
+     variant the go client uses — no upstream patching needed.
+   - The ctor's refresh_pools() → resolve_addrs() resolves the host via
+     getaddrinfo, which accepts an IP literal directly (no DNS), so an
+     IP-only STATSHOUSE_ADDR on the container network connects at once.
+   - write_count does not reject count <= 0 (it always serializes), but every
+     count here (seeds included) is > 0.
+   - Tags are sent verbatim, empty values included (cpp has no empty-drop like
+     go). The harness normalizes empty tags away when comparing (assert.go:
+     tagSignature).
+   - Flush-on-destruction: ~TransportTCP calls flush(true) then joins its worker
+     threads (statshouse.hpp). main must return normally — std::exit/quick_exit
+     would skip the destructor and lose the tail batch. The harness waits for
+     this process's clean exit before asserting.
+
+   COLD-START PRE-WARM, same rationale as the go/rust drivers: the agent drops
+   the first packet for any metric name not yet in its mapping (it async-asks
+   metadata to auto-create), so a short-lived driver loses its whole payload to
+   that window. We send one count=1 seed per metric (itself dropped — it IS the
+   first packet, so it triggers the same unmapped window, but its arrival is what
+   triggers auto-create), then poll /api/metrics-list until metadata has created
+   every metric. After a 2s settle the agent's longpoll mapping subscription has
+   caught up and the real stream maps cleanly. Seeds use ts=base-60 (outside the
+   asserted [base, base+70] window) so even a seed that landed could not perturb
+   an assertion bucket.
+
+   The driver is header-only (single include of statshouse.hpp); the pre-warm
+   poll uses POSIX sockets directly since there is no HTTP client dependency. */ -}}
+#include <statshouse.hpp>
+
+#include <netdb.h>        // getaddrinfo, freeaddrinfo, addrinfo
+#include <netinet/in.h>   // IPPROTO_TCP
+#include <sys/socket.h>   // socket, connect, setsockopt, AF_UNSPEC, SOCK_STREAM, SOL_SOCKET, SO_RCVTIMEO
+#include <sys/time.h>     // timeval
+#include <unistd.h>       // read, write, close, sleep, usleep
+
+#include <cstdint>
+#include <cstdlib>
+#include <iostream>
+#include <string>
+#include <vector>
+
+namespace {
+
+constexpr uint32_t kSeedTS = {{.SeedTS}};
+
+// kMetrics is the metric names this driver writes; used both for the cold-start
+// seeds and the /api/metrics-list pre-warm poll.
+const char *const kMetrics[] = {
+    {{- range .Metrics}}
+    "{{cString .}}",
+    {{- end}}
+};
+
+// split_host_port splits "host:port" on the last ':' into host/port. The e2e
+// addresses are IP literals with a numeric port (no brackets), so a plain rfind
+// suffices; std::stoi throws on a non-numeric port, which we let abort main.
+void split_host_port(const std::string &addr, std::string &host, int &port) {
+    auto colon = addr.rfind(':');
+    host = addr.substr(0, colon);
+    port = std::stoi(addr.substr(colon + 1));
+}
+
+// http_get issues a minimal HTTP/1.0 GET to host:port/path and returns the body
+// (after the blank header line), or "" on any connect/I/O failure so the caller
+// retries. getaddrinfo resolves the IP-literal host directly.
+std::string http_get(const std::string &host, int port, const std::string &path) {
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    addrinfo *result = nullptr;
+    if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &result) != 0) {
+        return "";
+    }
+    int fd = -1;
+    for (addrinfo *rp = result; rp != nullptr; rp = rp->ai_next) {
+        fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (fd < 0) {
+            continue;
+        }
+        timeval to{.tv_sec = 5, .tv_usec = 0};
+        (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
+        if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) {
+            break;
+        }
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(result);
+    if (fd < 0) {
+        return "";
+    }
+    std::string req = "GET " + path + "?full=1 HTTP/1.0\r\nHost: " + host +
+                      "\r\nConnection: close\r\n\r\n";
+    if (write(fd, req.data(), req.size()) != static_cast<ssize_t>(req.size())) {
+        close(fd);
+        return "";
+    }
+    std::string buf;
+    char chunk[4096];
+    for (;;) {
+        ssize_t n = read(fd, chunk, sizeof(chunk));
+        if (n <= 0) {
+            break;
+        }
+        buf.append(chunk, static_cast<size_t>(n));
+    }
+    close(fd);
+    auto sep = buf.find("\r\n\r\n");
+    return sep == std::string::npos ? std::string() : buf.substr(sep + 4);
+}
+
+// wait_metrics_exist polls /api/metrics-list until every metric name is present
+// (metadata has auto-created them all). Returns true once all are present, false
+// on timeout. A timeout is a HARD failure: the agent↔agg path is almost certainly
+// down (metrics never get created), so the driver returns non-zero
+// (preWarmExit=3) rather than writing a payload the harness would then report as
+// 6 cryptic "series absent" failures. A substring match suffices — the e2e_
+// metric names are unique.
+bool wait_metrics_exist(const std::string &host, int port) {
+    std::vector<std::string> want;
+    for (const char *m : kMetrics) {
+        want.emplace_back(m);
+    }
+    for (int i = 0; i < 120; ++i) {  // 120 × 0.5s = 60s deadline
+        std::string body = http_get(host, port, "/api/metrics-list");
+        if (!body.empty()) {
+            bool ok = true;
+            for (const auto &m : want) {
+                if (body.find(m) == std::string::npos) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (ok) {
+                std::cerr << "statshouse-cpp driver: all " << want.size()
+                          << " metric(s) created after pre-warm" << std::endl;
+                return true;
+            }
+        }
+        usleep(500 * 1000);
+    }
+    std::cerr << "statshouse-cpp driver: FAIL: pre-warm timed out (metrics never created — agent/agg path down?)" << std::endl;
+    return false;
+}
+
+}  // namespace
+
+int main() {
+    const char *env = std::getenv("STATSHOUSE_ADDR");
+    std::string addr = (env && *env) ? std::string(env) : "127.0.0.1:13337";
+    std::string agent_host;
+    int agent_port = 0;
+    split_host_port(addr, agent_host, agent_port);
+
+    // TCP is the reliable client→agent metric path on :13337; UDP loss across
+    // containers is silent. The cpp client's statshousev2 handshake is the same
+    // variant the go driver proved works there.
+    statshouse::TransportTCP transport(agent_host, agent_port);
+
+    // One count=1 seed per metric: dropped on arrival (unmapped), but it is the
+    // packet that triggers metadata auto-create for the name.
+    for (const char *m : kMetrics) {
+        transport.metric(m).write_count(1.0, kSeedTS);
+    }
+    // Force the seeds out now. TransportTCP flushes at most once per wall-clock
+    // second (maybe_flush: now != packet_ts), so a sub-second seed loop leaves
+    // seeds buffered in the transport — and the pre-warm poll below would then
+    // wait on metrics the agent never received, timing out while every seed
+    // still sits locally. A forced flush (the same path the destructor takes)
+    // sends every seed this instant, so auto-create fires for all of them
+    // before the poll.
+    transport.flush(true);
+
+    // STATSHOUSE_API_ADDR is the api container's <ip>:10888 on the run network.
+    // Empty → fixed fallback sleep.
+    const char *api_env = std::getenv("STATSHOUSE_API_ADDR");
+    if (!api_env || !*api_env) {
+        sleep(5);
+    } else {
+        std::string api_host;
+        int api_port = 0;
+        split_host_port(api_env, api_host, api_port);
+        if (!wait_metrics_exist(api_host, api_port)) {
+            // Pre-warm timed out: metrics were never created, so the agent↔agg
+            // path is down. Fail fast with a distinct exit code (preWarmExit=3)
+            // BEFORE any real write. Returning from main runs ~TransportTCP
+            // (force-flush + join), which is harmless here — the seeds were
+            // already flushed and no real write happened.
+            return 3;
+        }
+        // Settle so the agent's longpoll mapping-cache subscription catches up to
+        // metadata before the real (counted) writes begin.
+        sleep(2);
+    }
+
+    // The real stream: one write_count per generated counter observation. Each
+    // call serializes one TL counter item with the explicit past ts on the wire.
+    {{- range .Writes}}
+    transport.metric("{{cString .Metric}}"){{- range .Tags}}.tag("{{cString .Key}}", "{{cString .Val}}"){{- end}}.write_count({{cFloat .Count}}, {{.TS}});
+    {{- end}}
+
+    // Explicit flush, then `transport` is destroyed at the end of main, whose
+    // destructor force-flushes again. Do NOT call std::exit — it skips the
+    // destructor and the tail batch is lost.
+    transport.flush();
+    std::cerr << "statshouse-cpp driver: wrote {{len .Writes}} counters to "
+              << agent_host << ":" << agent_port << std::endl;
+    return 0;
+}

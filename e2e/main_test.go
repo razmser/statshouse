@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
 
 func TestRunIDRe(t *testing.T) {
 	cases := map[string]bool{
@@ -22,5 +25,100 @@ func TestRunIDRe(t *testing.T) {
 		if got := runIDRe.MatchString(in); got != want {
 			t.Errorf("runIDRe.MatchString(%q) = %v, want %v", in, got, want)
 		}
+	}
+}
+
+// TestSelectDrivers covers the --client resolution: empty = all (default order),
+// a tag selects one, the full "statshouse-<tag>" form is accepted, repeats
+// dedupe, and an unknown selector is a hard error. Comparison is by tag/name only
+// because clientDriver carries a function field, and reflect.DeepEqual defines
+// non-nil funcs as never equal.
+func TestSelectDrivers(t *testing.T) {
+	tags := func(ds []clientDriver) []string {
+		out := make([]string, len(ds))
+		for i, d := range ds {
+			out[i] = d.tag
+		}
+		return out
+	}
+
+	t.Run("empty selects all in registry order", func(t *testing.T) {
+		got, err := selectDrivers(nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if want := tags(clientDrivers); !reflect.DeepEqual(tags(got), want) {
+			t.Errorf("empty selection tags = %v, want %v", tags(got), want)
+		}
+	})
+
+	t.Run("single tag", func(t *testing.T) {
+		got, err := selectDrivers([]string{"rust"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if want := []string{"rust"}; !reflect.DeepEqual(tags(got), want) {
+			t.Errorf("got %v, want %v", tags(got), want)
+		}
+	})
+
+	t.Run("multiple tags preserve selection order", func(t *testing.T) {
+		// cpp before go on purpose: order follows the selector, not the registry.
+		got, err := selectDrivers([]string{"cpp", "go"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if want := []string{"cpp", "go"}; !reflect.DeepEqual(tags(got), want) {
+			t.Errorf("got %v, want %v", tags(got), want)
+		}
+	})
+
+	t.Run("full statshouse- name accepted", func(t *testing.T) {
+		got, err := selectDrivers([]string{"statshouse-cpp"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(got) != 1 || got[0].tag != "cpp" {
+			t.Errorf("got %+v, want single cpp driver", got)
+		}
+	})
+
+	t.Run("duplicates collapse", func(t *testing.T) {
+		got, err := selectDrivers([]string{"go", "go", "statshouse-go"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(got) != 1 || got[0].tag != "go" {
+			t.Errorf("got %+v, want single go driver", got)
+		}
+	})
+
+	t.Run("unknown selector errors", func(t *testing.T) {
+		for _, sel := range []string{"python", "", "statshouse-zig"} {
+			if _, err := selectDrivers([]string{sel}); err == nil {
+				t.Errorf("selectDrivers(%q): want error, got nil", sel)
+			}
+		}
+	})
+}
+
+// TestClientFlag covers the repeatable --client flag.Var: Set appends and String
+// joins, mirroring flag's contract for repeated values.
+func TestClientFlag(t *testing.T) {
+	var c clientFlag
+	if c.String() != "" {
+		t.Errorf("zero-value String() = %q, want empty", c.String())
+	}
+	if err := c.Set("go"); err != nil {
+		t.Fatalf("Set(go): %v", err)
+	}
+	if err := c.Set("rust"); err != nil {
+		t.Fatalf("Set(rust): %v", err)
+	}
+	if got, want := c.String(), "go,rust"; got != want {
+		t.Errorf("String() = %q, want %q", got, want)
+	}
+	if got, want := ([]string)(c), []string{"go", "rust"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("values = %v, want %v", got, want)
 	}
 }

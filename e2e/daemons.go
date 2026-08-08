@@ -423,6 +423,64 @@ func httpGet(ctx context.Context, url string) (string, int, error) {
 	return string(b), resp.StatusCode, err
 }
 
+// waitAggConveyor gates "stack ready" on a REAL agent→agg→api round-trip, not
+// just TCP dials. It polls /api/query for the agg's receive-delay builtin
+// (__agg_bucket_receive_delay_sec — set every second per agent that delivered a
+// bucket, and the api's OWN healthcheck metric, internal/api/handler.go) and
+// waits for at least one recent non-zero point. The recurring flake this guards:
+// the stack comes up with every TCP dial green, but the agent↔agg RPC channel is
+// silently dead (no keep-alive, auto-create never fires, every client write then
+// times out). A recent point here proves the agent is delivering buckets, the agg
+// is inserting them, and the api reads them back — before any client starts. The
+// ~24s historic conveyor plus agent cold-start skew is well inside the 90s budget.
+// Reuses queryCounter/poll so it stays cheap.
+func waitAggConveyor(ctx context.Context, apiAddr string) error {
+	now := time.Now()
+	qurl := fmt.Sprintf("http://%s/api/query?s=%s&f=%d&t=%d&w=1s&ac=1&qw=count",
+		apiAddr, queryMetric, now.Add(-5*time.Minute).Unix(), now.Unix())
+	// "Recent": a point in the last 3 minutes of the 5-minute query window — loose
+	// enough to absorb clock skew between the host and the containers.
+	cutoff := now.Add(-3 * time.Minute).Unix()
+	const timeout = 90 * time.Second
+	var lastErr string
+	if err := poll(ctx, timeout, 3*time.Second, func() (bool, error) {
+		resp, qerr := queryCounter(ctx, qurl)
+		if qerr != nil {
+			lastErr = qerr.Error()
+			return false, nil
+		}
+		if hasRecentPoint(resp, cutoff) {
+			return true, nil
+		}
+		lastErr = "no recent non-zero data point"
+		return false, nil
+	}); err != nil {
+		return fmt.Errorf("agent↔agg round-trip: %s returned no recent point within %s — the agent→agg→api conveyor is likely down (TCP probes can be green while this channel is dead): %v\n%s",
+			queryMetric, timeout, err, lastErr)
+	}
+	return nil
+}
+
+// hasRecentPoint reports whether resp carries at least one non-zero data point at
+// a timestamp ≥ cutoff. The agg receive-delay metric's count is ≥1 whenever an
+// agent delivered a bucket that second, so any non-zero recent point is proof the
+// agent→agg→api conveyor is live. A null point unmarshals to 0.0, which is not a
+// false positive (a real delivery's count is ≥1).
+func hasRecentPoint(resp *apiSeriesResponse, cutoff int64) bool {
+	for i := range resp.Data.Series.SeriesMeta {
+		data := resp.Data.Series.SeriesData[i]
+		for j, ts := range resp.Data.Series.Time {
+			if j >= len(data) || ts < cutoff {
+				continue
+			}
+			if data[j] != 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s

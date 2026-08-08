@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -48,13 +49,79 @@ func main() {
 		keep        = flag.Bool("keep", false, "keep containers+network after the run for debugging")
 		verbose     = flag.Bool("v", false, "verbose: print extra detail")
 		timeout     = flag.Duration("timeout", 10*time.Minute, "overall run timeout")
+		clientSel   clientFlag
 	)
+	flag.Var(&clientSel, "client", "client(s) to drive (repeatable; one of: go, rust, cpp). Default: all three")
 	flag.Parse()
 
-	os.Exit(realMain(*runtimeFlag, *runIDFlag, *archFlag, *keep, *verbose, *timeout))
+	os.Exit(realMain(*runtimeFlag, *runIDFlag, *archFlag, *keep, *verbose, *timeout, clientSel))
 }
 
-func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeout time.Duration) int {
+// clientFlag is a repeatable --client selector (flag.Var). Each Set appends, so
+// `--client=go --client=rust` selects both; absent → empty → selectDrivers picks
+// all clients.
+type clientFlag []string
+
+func (c *clientFlag) String() string {
+	if c == nil {
+		return ""
+	}
+	return strings.Join(*c, ",")
+}
+
+func (c *clientFlag) Set(v string) error {
+	*c = append(*c, v)
+	return nil
+}
+
+// clientDriver is one client the harness can build+run+assert. name matches the
+// active entry in e2e/clients.txt; tag is the short --client selector AND the
+// per-client metric-name prefix that isolates one client's writes from another's
+// (stream.go); buildRun is the language-specific clone→render→build→run.
+type clientDriver struct {
+	name     string // e.g. "statshouse-go"
+	tag      string // e.g. "go"
+	buildRun func(ctx context.Context, rt Runtime, rec *recorder, o clientRunOpts) (int, string, error)
+}
+
+// clientDrivers is the registry of every client the harness can drive, in the
+// order a default (no --client) run executes them. Adding a client here (and to
+// e2e/clients.txt) is all the wiring the main loop needs.
+var clientDrivers = []clientDriver{
+	{name: goClientName, tag: "go", buildRun: buildAndRunGoClient},
+	{name: rustClientName, tag: "rust", buildRun: buildAndRunRustClient},
+	{name: cppClientName, tag: "cpp", buildRun: buildAndRunCppClient},
+}
+
+// selectDrivers resolves the repeatable --client selectors to the drivers to
+// run. An empty selection means all of them (the default). Each selector may be
+// a tag ("go"/"rust"/"cpp") or the full client name ("statshouse-go"); an
+// unknown selector is a hard error. Duplicates collapse to the first occurrence.
+func selectDrivers(sels []string) ([]clientDriver, error) {
+	if len(sels) == 0 {
+		return clientDrivers, nil
+	}
+	byTag := make(map[string]clientDriver, len(clientDrivers))
+	for _, d := range clientDrivers {
+		byTag[d.tag] = d
+	}
+	var out []clientDriver
+	seen := make(map[string]bool, len(sels))
+	for _, s := range sels {
+		s = strings.TrimSpace(s)
+		d, ok := byTag[strings.TrimPrefix(s, "statshouse-")]
+		if !ok {
+			return nil, fmt.Errorf("unknown --client %q (want one of: go, rust, cpp)", s)
+		}
+		if !seen[d.tag] {
+			out = append(out, d)
+			seen[d.tag] = true
+		}
+	}
+	return out, nil
+}
+
+func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeout time.Duration, clientSel clientFlag) int {
 	runID := runIDFlag
 	if runID == "" {
 		runID = time.Now().Format("20060102-150405")
@@ -150,6 +217,20 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeo
 	}
 	rec.logf("created network %s", network)
 
+	// --- preflight published-port check + load publish config ---
+	// Every published host port must be FREE before any container binds one.
+	// Two concurrent harness runs collide hard — prune wars plus the fixed api
+	// publish port mean one run's assertions silently query the other's api.
+	// Bail before the expensive ClickHouse/daemon setup if a configured host
+	// port already answers.
+	cfg, err := loadConfig(filepath.Join(root, "e2e", "config.yaml"))
+	if err != nil {
+		return fail(rec, artifactsDir, rt, containers, fmt.Errorf("load e2e/config.yaml: %w", err))
+	}
+	if err := checkPublishedPortsFree(ctx, cfg); err != nil {
+		return fail(rec, artifactsDir, rt, containers, err)
+	}
+
 	// --- ClickHouse ---
 	start := time.Now()
 	ch, err := startClickHouse(ctx, rt, chContainer, network, root)
@@ -191,11 +272,6 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeo
 		return fail(rec, artifactsDir, rt, containers, fmt.Errorf("build daemons: %w", err))
 	}
 
-	// --- load published-port config + bring up the daemon stack ---
-	cfg, err := loadConfig(filepath.Join(root, "e2e", "config.yaml"))
-	if err != nil {
-		return fail(rec, artifactsDir, rt, containers, fmt.Errorf("load e2e/config.yaml: %w", err))
-	}
 	// Shared RPC crypto key: mounted into all four daemons so their cross-
 	// container RPC (metadata↔agg, metadata↔api, agg↔agent) passes the nonce
 	// exchange, which requires encryption whenever the peers are not on the same
@@ -232,10 +308,30 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeo
 	}
 	rec.logf("/api/query answered 200 on %s (%d bytes)", queryAddr, len(body))
 
-	// --- go client tracer bullet (ticket 09): generate the counter stream once,
-	// drive the pinned go client over TCP with explicit historic timestamps, wait
-	// for its clean exit, then assert exact per-bucket/per-series equality. ---
-	passed, failed := runGoClientPhase(ctx, rt, rec, goClientPhaseOpts{
+	// --- gate "stack ready" on a REAL agent→agg→api round-trip, not just TCP
+	// dials (ticket 10): the agent↔agg channel can be dead while every TCP probe
+	// is green, and every client write then silently times out. A recent point on
+	// the agg's receive-delay builtin proves the conveyor is live before clients
+	// start. ---
+	if err := waitAggConveyor(ctx, queryAddr); err != nil {
+		return fail(rec, artifactsDir, rt, containers, err)
+	}
+	rec.logf("agent↔agg conveyor live (recent %s point)", queryMetric)
+
+	// --- client phase (tickets 09/10): drive each selected client over TCP with
+	// explicit historic timestamps, wait for its clean exit, then assert exact
+	// per-bucket/per-series equality. go came first (ticket 09); ticket 10 adds
+	// rust and cpp on the same path. The three are isolated by per-client metric
+	// prefixes so their counts never collide on the shared stack. ---
+	drivers, err := selectDrivers(clientSel)
+	if err != nil {
+		return fail(rec, artifactsDir, rt, containers, err)
+	}
+	cache, err := e2eCacheDir()
+	if err != nil {
+		return fail(rec, artifactsDir, rt, containers, fmt.Errorf("resolve e2e cache dir: %w", err))
+	}
+	phaseOpts := clientPhaseOpts{
 		network:          network,
 		agentIP:          ds.agent.ip,
 		apiAddr:          queryAddr,
@@ -244,10 +340,17 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeo
 		arch:             arch,
 		repoRoot:         root,
 		artifactsDir:     artifactsDir,
-	})
-	// The run is a failure if any assertion failed (non-zero exit) even though the
-	// stack came up. Service logs are dumped on failure for diagnosis.
-	if failed > 0 {
+		cache:            cache,
+	}
+	var totalPass, totalFail int
+	for _, d := range drivers {
+		p, f := runClientPhase(ctx, rt, rec, d, phaseOpts)
+		totalPass += p
+		totalFail += f
+	}
+	// The run is a failure if any client's assertions failed (non-zero exit) even
+	// though the stack came up. Service logs are dumped on failure for diagnosis.
+	if totalFail > 0 {
 		dumpServiceLogs(rec, rt, containers, artifactsDir)
 		writeSummary(artifactsDir, rec.lines)
 		return 1
@@ -260,8 +363,12 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeo
 	if verbose {
 		dumpServiceLogs(rec, rt, containers, artifactsDir)
 	}
-	summary := fmt.Sprintf("PASS: go client drove the full pipeline, %d counter metric(s) exact-matched, runtime=%s, runid=%s",
-		passed, rt.Name(), runID)
+	names := make([]string, 0, len(drivers))
+	for _, d := range drivers {
+		names = append(names, d.tag)
+	}
+	summary := fmt.Sprintf("PASS: client(s) [%s] drove the full pipeline, %d counter metric assertion(s) exact-matched, runtime=%s, runid=%s",
+		strings.Join(names, " "), totalPass, rt.Name(), runID)
 	rec.logf("%s", summary)
 	writeSummary(artifactsDir, rec.lines)
 	fmt.Println(summary)
@@ -269,8 +376,9 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeo
 	return 0
 }
 
-// goClientPhaseOpts configures runGoClientPhase.
-type goClientPhaseOpts struct {
+// clientPhaseOpts configures runClientPhase. It is shared across clients; each
+// client folds its own tag into the generated stream's metric-name prefix.
+type clientPhaseOpts struct {
 	network          string
 	agentIP          string // agent container IP on the run network
 	apiAddr          string // published api address (host:port) for assertions
@@ -279,50 +387,63 @@ type goClientPhaseOpts struct {
 	arch             string
 	repoRoot         string
 	artifactsDir     string
+	cache            string // e2e cache root (~/.cache/statshouse-e2e)
 }
 
-// runGoClientPhase generates the counter stream, builds+runs the go client, and
-// asserts the result. Returns pass/fail counts. A build/run launch error or a
-// non-zero driver exit is reported as a single FAIL line (all metrics fail).
-func runGoClientPhase(ctx context.Context, rt Runtime, rec *recorder, o goClientPhaseOpts) (passed, failed int) {
-	stream := generateCounterStream(o.runID, time.Now())
-	rec.logf("generated counter stream: base=%d buckets=%d metrics=%d writes=%d",
-		stream.Base, numBuckets, len(stream.Metrics), len(stream.Writes))
+// runClientPhase drives one client: generate its per-client counter stream,
+// build+run its driver in the foreground, wait for the clean exit, then assert
+// exact per-bucket/per-series equality. Returns pass/fail counts for this
+// client. A build/run launch error or a non-zero driver exit is reported as a
+// single FAIL line for the client (all its metrics fail). The harness waits for
+// the driver process to exit before asserting because rust/cpp flush only on
+// destruction.
+func runClientPhase(ctx context.Context, rt Runtime, rec *recorder, d clientDriver, o clientPhaseOpts) (passed, failed int) {
+	stream := generateCounterStream(o.runID, d.tag, time.Now())
+	rec.logf("%s: generated counter stream: base=%d buckets=%d metrics=%d writes=%d",
+		d.name, stream.Base, numBuckets, len(stream.Metrics), len(stream.Writes))
 
-	cache, err := e2eCacheDir()
-	if err != nil {
-		rec.logf("FAIL: %v", err)
-		return 0, len(stream.Metrics)
-	}
 	agentAddr := net.JoinHostPort(o.agentIP, strconv.Itoa(agentPort))
-	clientContainer := e2ePrefix + o.runID + "-client-go"
+	clientContainer := e2ePrefix + o.runID + "-client-" + d.tag
 
-	exitCode, output, runErr := buildAndRunGoClient(ctx, rt, rec, goClientRunOpts{
-		stream:     stream,
-		network:    o.network,
-		agentAddr:  agentAddr,
-		apiAddr:    o.apiContainerAddr,
-		container:  clientContainer,
-		workDir:    filepath.Join(o.artifactsDir, "driver-go"),
-		gomodcache: filepath.Join(cache, "gomodcache"),
-		gocache:    filepath.Join(cache, "gocache"),
-		repoRoot:   o.repoRoot,
-		arch:       o.arch,
+	exitCode, output, runErr := d.buildRun(ctx, rt, rec, clientRunOpts{
+		stream:    stream,
+		network:   o.network,
+		agentAddr: agentAddr,
+		apiAddr:   o.apiContainerAddr,
+		container: clientContainer,
+		workDir:   filepath.Join(o.artifactsDir, "driver-"+d.tag),
+		repoRoot:  o.repoRoot,
+		arch:      o.arch,
+		cache:     o.cache,
 	})
 	if runErr != nil {
-		rec.logf("FAIL: go client build/run did not launch: %v\n%s", runErr, indent(output))
-		fmt.Printf("FAIL go client build/run: %v\n", runErr)
+		rec.logf("FAIL %s: build/run did not launch: %v\n%s", d.name, runErr, indent(output))
+		fmt.Printf("FAIL %s build/run: %v\n", d.tag, runErr)
 		return 0, len(stream.Metrics)
 	}
 	if exitCode != 0 {
-		rec.logf("FAIL: go client driver exited %d\n%s", exitCode, indent(output))
-		fmt.Printf("FAIL go client driver exited %d\n", exitCode)
+		// A pre-warm timeout (drivers exit preWarmExit) is the common infra
+		// failure: the agent↔agg path is down so metrics were never created.
+		// Surface it by name up front rather than letting 6 cryptic per-metric
+		// "series absent" failures bury the real cause.
+		if exitCode == preWarmExit {
+			rec.logf("FAIL %s: pre-warm timed out (metrics never created — agent/agg path down?)\n%s", d.name, indent(output))
+			fmt.Printf("FAIL %s: pre-warm timed out (agent/agg path down?)\n", d.tag)
+		} else {
+			rec.logf("FAIL %s: driver exited %d\n%s", d.name, exitCode, indent(output))
+			fmt.Printf("FAIL %s driver exited %d\n", d.tag, exitCode)
+		}
 		return 0, len(stream.Metrics)
 	}
-	rec.logf("go client driver exited 0\n%s", indent(truncate(strings.TrimSpace(output), 1200)))
+	rec.logf("%s: driver exited 0\n%s", d.name, indent(truncate(strings.TrimSpace(output), 1200)))
 
 	passed, failed = assertCounters(ctx, rec, o.apiAddr, stream)
-	rec.logf("counter assertions: %d PASS, %d FAIL", passed, failed)
+	rec.logf("%s: counter assertions: %d PASS, %d FAIL", d.name, passed, failed)
+	if failed == 0 {
+		fmt.Printf("PASS %s: %d metric(s) exact-matched\n", d.tag, passed)
+	} else {
+		fmt.Printf("FAIL %s: %d PASS, %d FAIL\n", d.tag, passed, failed)
+	}
 	return passed, failed
 }
 
@@ -367,6 +488,32 @@ func listSafe(ctx context.Context, fn func(context.Context) ([]string, error)) [
 		return nil
 	}
 	return v
+}
+
+// checkPublishedPortsFree dials every host address the config publishes; if any
+// already accepts a connection, another process owns that port (a parallel e2e
+// run, a --keep stack, or a stray binding). Two concurrent harness runs collide
+// hard: they prune each other's containers AND share the fixed api publish port,
+// so one run's assertions silently query the other's api. Failing here — before
+// the stack publishes anything — is far cheaper than debugging the cross-talk.
+// The dial is short: nothing answering returns "refused" instantly; any other
+// error is treated as "free" so a flaky loopback never blocks a clean run.
+func checkPublishedPortsFree(ctx context.Context, cfg publishConfig) error {
+	var clash []string
+	for _, host := range cfg {
+		d := net.Dialer{Timeout: 500 * time.Millisecond}
+		c, err := d.DialContext(ctx, "tcp", host)
+		if err == nil {
+			c.Close()
+			clash = append(clash, host)
+		}
+	}
+	if len(clash) > 0 {
+		sort.Strings(clash)
+		return fmt.Errorf("published port(s) already in use: %s — another e2e run? a --keep stack? stop it, or change e2e/config.yaml publish ports",
+			strings.Join(clash, ", "))
+	}
+	return nil
 }
 
 func repoRoot() (string, error) {

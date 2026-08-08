@@ -72,8 +72,14 @@ func main() {
 	apiAddr := os.Getenv("STATSHOUSE_API_ADDR")
 	if apiAddr == "" {
 		time.Sleep(5 * time.Second)
+	} else if !waitMetricsExist("http://"+apiAddr+"/api/metrics-list", metrics) {
+		// Pre-warm timed out: metrics were never created, so the agent↔agg path
+		// is down. Fail fast with preWarmExit=3 BEFORE the real writes so the
+		// harness reports one clear cause, not 6 "series absent" failures. The
+		// seeds were written ~60s ago and the client's 1s flush fired many times
+		// during the poll, so there is no tail batch to lose by skipping Close.
+		os.Exit(3)
 	} else {
-		waitMetricsExist("http://"+apiAddr+"/api/metrics-list", metrics)
 		// Settle so the agent's longpoll mapping-cache subscription catches up to
 		// metadata before the real (counted) writes begin.
 		time.Sleep(2 * time.Second)
@@ -108,10 +114,12 @@ type metricsListReply struct {
 }
 
 // waitMetricsExist blocks until /api/metrics-list reports every metric name,
-// which means metadata has auto-created them all. Polls for up to 60s; on timeout
-// it logs and returns (the real write is still attempted so the harness
-// assertions surface the real failure rather than a hang).
-func waitMetricsExist(listURL string, metrics []string) {
+// which means metadata has auto-created them all. Polls for up to 60s; returns
+// true once all are present, false on timeout. A timeout is a HARD failure: the
+// agent↔agg path is almost certainly down (metrics never get created), so main
+// exits non-zero (preWarmExit=3) rather than writing a payload the harness would
+// then report as 6 cryptic "series absent" failures.
+func waitMetricsExist(listURL string, metrics []string) bool {
 	want := make(map[string]bool, len(metrics))
 	for _, m := range metrics {
 		want[m] = true
@@ -129,12 +137,13 @@ func waitMetricsExist(listURL string, metrics []string) {
 			}
 			if !missing {
 				fmt.Printf("statshouse-go driver: all %d metric(s) created after pre-warm\n", len(metrics))
-				return
+				return true
 			}
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	fmt.Fprintln(os.Stderr, "statshouse-go driver: timeout waiting for metric creation; continuing")
+	fmt.Fprintln(os.Stderr, "statshouse-go driver: FAIL: pre-warm timed out (metrics never created — agent/agg path down?)")
+	return false
 }
 
 // preWarmClient is the HTTP client for the cold-start /api/metrics-list poll. A

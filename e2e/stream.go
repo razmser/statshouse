@@ -70,11 +70,14 @@ type counterStream struct {
 // slice is rendered into the driver template, and Metrics is derived from the same
 // construction, so there is exactly one source of truth (no per-language RNG).
 //
-// runID prefixes every metric name (e2e_<runID>_…) for isolation; now is passed in
-// (not read inside) so Base is deterministic for a given invocation and the harness
-// can log it before the clients run.
-func generateCounterStream(runID string, now time.Time) counterStream {
-	prefix := "e2e_" + runID + "_"
+// runID prefixes every metric name for isolation; clientTag ("go"/"rust"/"cpp") is
+// folded into the prefix too, so the three clients — all driven against the same
+// single agent/stack in one run — write disjoint metric names and their per-bucket
+// counts cannot collide (a shared name would sum every client's count and break the
+// exact-match assertion). now is passed in (not read inside) so Base is deterministic
+// for a given invocation and the harness can log it before the client runs.
+func generateCounterStream(runID, clientTag string, now time.Time) counterStream {
+	prefix := "e2e_" + runID + "_" + clientTag + "_"
 	base := uint32(now.Unix()) - 120 // floor(now) − 120s (now is already second-granular)
 
 	// One builder per metric. Each series carries raw tags (empties kept for the

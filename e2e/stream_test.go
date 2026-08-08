@@ -12,8 +12,9 @@ import (
 // runID name prefix, all-positive counts, and the rendered full-key cap.
 func TestGenerateCounterStream(t *testing.T) {
 	const runID = "testrun"
+	const clientTag = "go"
 	now := time.Unix(1_700_000_000, 0) // second-granular, so floor(now) == now.Unix()
-	s := generateCounterStream(runID, now)
+	s := generateCounterStream(runID, clientTag, now)
 
 	// Base anchors the 70 buckets at floor(now) − 120s.
 	if wantBase := uint32(now.Unix()) - 120; s.Base != wantBase {
@@ -25,7 +26,7 @@ func TestGenerateCounterStream(t *testing.T) {
 		t.Fatalf("len(Metrics) = %d, want 6", len(s.Metrics))
 	}
 
-	prefix := "e2e_" + runID + "_"
+	prefix := "e2e_" + runID + "_" + clientTag + "_"
 	var totalSeries int
 	for _, m := range s.Metrics {
 		if !strings.HasPrefix(m.Name, prefix) {

@@ -214,12 +214,21 @@ func formatFail(m counterMetric, qurl string, mismatches []seriesMismatch, missi
 }
 
 // tagSignature is the normalized identity of an API series: sorted "k=v" pairs
-// with the go client's _h host tag stripped (it is never in the harness's qb, so
-// it does not appear here in practice — stripped defensively per spec §4).
+// with (a) the go client's _h host tag stripped — it is never in the harness's qb
+// (stripped defensively per spec §4), and (b) empty-valued tags dropped. The drop
+// mirrors the expected-model normalizeTags: go drops empty tags client-side, but
+// rust/cpp SEND them verbatim (their libraries have no empty-drop). The agent maps
+// an empty tag value to nothing (internal/agent/agent_mapping.go: len(v.Value)==0
+// case body is empty), so an empty tag is a no-op on the wire, but the API may
+// still surface it in series_meta — dropping it here keeps the rust/cpp signature
+// equal to the (empty-free) expected signature.
 func tagSignature(tags map[string]apiMetaTag) string {
 	keys := make([]string, 0, len(tags))
-	for k := range tags {
+	for k, v := range tags {
 		if k == "_h" {
+			continue
+		}
+		if v.Value == "" {
 			continue
 		}
 		keys = append(keys, k)

@@ -1,0 +1,150 @@
+{{- /* Driver template for the rust StatsHouse client (spec §4).
+
+   Rendered by the e2e harness (Go text/template) from the single generated
+   counter stream (e2e/stream.go). "Pinned seed" = injection: the exact writes
+   below are the same observations the harness asserts against — there is no
+   per-language RNG. This is a harness-owned program, NOT the upstream client's
+   test_template.txt.
+
+   WIRE BEHAVIOR of statshouse-rs @ 43b4a629 (the pinned source of truth):
+   - No client-side aggregation: every write_count serializes one TL item with the
+     explicit ts passed in, so bucket assignment is exact regardless of flush jitter.
+   - TCP transport sends the "statshousev1" handshake (lib.rs: TCP_HANDSHAKE). The
+     agent's hijack listener accepts it (internal/receiver/tcp_handshake.go:
+     TCPMagicV1Default), so no upstream template patching is needed — but unlike
+     the upstream rust template (which HARDCODES 127.0.0.1:13337), this driver
+     honors STATSHOUSE_ADDR, as spec §4 requires.
+   - write_count rejects count <= 0, so every count here (seeds included) is > 0.
+   - Tags are sent verbatim, empty values included (rust has no empty-drop like go).
+     The harness normalizes empty tags away when comparing (assert.go: tagSignature).
+   - Flush-on-Drop: Transport::drop calls flush_impl (lib.rs: impl Drop). main must
+     return normally — process::exit would skip Drop and lose the tail batch. The
+     harness waits for this process's clean exit before asserting.
+
+   COLD-START PRE-WARM, same rationale as the go driver: the agent drops the first
+   packet for any metric name not yet in its mapping (it async-asks metadata to
+   auto-create), so a short-lived driver loses its whole payload to that window. We
+   send one count=1 seed per metric (itself dropped — it IS the first packet, so it
+   triggers the same unmapped window, but its arrival is what triggers auto-create),
+   then poll /api/metrics-list until metadata has created every metric. After a 2s
+   settle the agent's longpoll mapping subscription has caught up and the real
+   stream maps cleanly. Seeds use ts=base-60 (outside the asserted [base, base+70]
+   window) so even a seed that landed could not perturb an assertion bucket.
+
+   The statshouse crate is zero-dependency (pure std), so there is no HTTP client
+   library available — the pre-warm poll uses a minimal hand-rolled HTTP/1.0 GET. */ -}}
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::time::Duration;
+
+fn main() {
+    let addr = std::env::var("STATSHOUSE_ADDR").unwrap_or_else(|_| "127.0.0.1:13337".to_string());
+    // TCP is the reliable client→agent metric path; UDP loss across containers is
+    // silent. The go driver already proved statshousev2 TCP works on :13337; the
+    // rust crate's statshousev1 variant is accepted by the same hijack listener.
+    let mut t = statshouse::Transport::tcp(&addr);
+
+    const SEED_TS: u32 = {{.SeedTS}};
+    let metrics: &[&[u8]] = &[
+        {{- range .Metrics}}
+        b"{{rustBytes .}}",
+        {{- end}}
+    ];
+
+    // One count=1 seed per metric: dropped on arrival (unmapped), but it is the
+    // packet that triggers metadata auto-create for the name. count>0 is mandatory.
+    for m in metrics {
+        statshouse::MetricBuilder::new(m).write_count(&mut t, 1.0, SEED_TS);
+    }
+    // Force the seeds out now. The crate flushes at most once per wall-clock
+    // second (maybe_flush: last_flush != now), and Transport's last_flush is
+    // initialized to the current second in new(), so a sub-second seed loop
+    // leaves EVERY seed — including the first — buffered in the transport, and
+    // the whole pre-warm poll below would then wait on metrics the agent never
+    // received, timing out while every seed still sits locally. An explicit
+    // flush sends every seed this second (the TCP connection is already up —
+    // Transport::tcp connects eagerly in new()), so auto-create fires for all of
+    // them before the poll.
+    t.flush();
+
+    let api_addr = std::env::var("STATSHOUSE_API_ADDR").unwrap_or_default();
+    if api_addr.is_empty() {
+        std::thread::sleep(Duration::from_secs(5));
+    } else {
+        if !wait_metrics_exist(&format!("http://{}/api/metrics-list", api_addr), metrics) {
+            // Pre-warm timed out: metrics were never created, so the agent↔agg
+            // path is down. Fail fast with a distinct exit code (preWarmExit=3)
+            // BEFORE any real write — there is no tail batch to lose yet (the
+            // seeds were flushed above), so an immediate exit is safe and
+            // surfaces the real cause rather than 6 "series absent" failures.
+            // (process::exit is normally forbidden because it skips Drop, but at
+            // this point nothing is buffered and `t` owns only an idle socket.)
+            std::process::exit(3);
+        }
+        // Settle so the agent's longpoll mapping-cache subscription catches up to
+        // metadata before the real (counted) writes begin.
+        std::thread::sleep(Duration::from_secs(2));
+    }
+
+    // The real stream: one write_count per generated counter observation. Each call
+    // serializes one TL item with the explicit past ts on the wire.
+    {{- range .Writes}}
+    statshouse::MetricBuilder::new(b"{{rustBytes .Metric}}"){{- range .Tags}}.tag(b"{{rustBytes .Key}}", b"{{rustBytes .Val}}"){{- end}}.write_count(&mut t, {{rustFloat .Count}}, {{.TS}});
+    {{- end}}
+
+    // Explicit flush, then `t` drops at the end of main for a final synchronous
+    // flush. Do NOT call process::exit — it skips Drop and the tail batch is lost.
+    t.flush();
+    eprintln!("statshouse-rs driver: wrote {{len .Writes}} counters to {}", addr);
+}
+
+// wait_metrics_exist polls /api/metrics-list until every metric name is present
+// (metadata has auto-created them all). Returns true once all are present, false
+// on timeout. A timeout is a HARD failure: the agent↔agg path is almost certainly
+// down (metrics never get created), so the driver exits non-zero (preWarmExit=3)
+// rather than writing a payload the harness would then report as 6 cryptic
+// "series absent" failures. A substring match suffices — the e2e_ metric names
+// are unique.
+fn wait_metrics_exist(list_url: &str, metrics: &[&[u8]]) -> bool {
+    let want: Vec<String> = metrics
+        .iter()
+        .map(|m| String::from_utf8_lossy(m).into_owned())
+        .collect();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while std::time::Instant::now() < deadline {
+        if let Some(body) = http_get(list_url) {
+            if want.iter().all(|m| body.contains(m)) {
+                eprintln!(
+                    "statshouse-rs driver: all {} metric(s) created after pre-warm",
+                    metrics.len()
+                );
+                return true;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    eprintln!("statshouse-rs driver: FAIL: pre-warm timed out (metrics never created — agent/agg path down?)");
+    false
+}
+
+// http_get issues a minimal HTTP/1.0 GET and returns the response body (after the
+// blank header line), or None on any connect/I/O failure so the caller retries.
+fn http_get(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("http://")?;
+    let slash = rest.find('/').unwrap_or(rest.len());
+    let host_port = &rest[..slash];
+    let path = if slash < rest.len() { &rest[slash..] } else { "/" };
+    let addr = host_port.to_socket_addrs().ok()?.next()?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).ok()?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let req = format!(
+        "GET {}?full=1 HTTP/1.0\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        path, host_port
+    );
+    stream.write_all(req.as_bytes()).ok()?;
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).ok()?;
+    let body = String::from_utf8_lossy(&buf);
+    let body_start = body.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
+    Some(body[body_start..].to_string())
+}

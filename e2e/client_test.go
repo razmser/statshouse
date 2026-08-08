@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"go/format"
 	"os"
 	"path/filepath"
@@ -54,5 +55,52 @@ func TestRenderGoDriverQuoting(t *testing.T) {
 	s := string(src)
 	if !strings.Contains(s, "caf") || !strings.Contains(s, "東京") {
 		t.Errorf("rendered source lost the unicode parts of the injected value")
+	}
+}
+
+// TestClassifyCloneCache pins the one inviolable rule of cache reuse: a git probe
+// that FAILED under a cancelled context never tears down a healthy checkout
+// (cloneAbort — the bug that destroyed a good cache when a 10m run timed out
+// mid-probe), while every genuine condition is decided without touching the cache
+// (exact match → reuse; mismatch, missing repo, unreadable, or unresolvable ref →
+// reclone). The error values are opaque sentinels: only their nil/non-nil state
+// and ctxCancelled matter to the classifier.
+func TestClassifyCloneCache(t *testing.T) {
+	var (
+		errHead    = errors.New("head probe failed")
+		errResolve = errors.New("resolve probe failed")
+		shaA       = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		shaB       = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	)
+	cases := []struct {
+		name       string
+		head       string
+		headErr    error
+		resolved   string
+		resolveErr error
+		ctxCancel  bool
+		want       cloneAction
+	}{
+		{"exact match → reuse", shaA, nil, shaA, nil, false, cloneReuse},
+		{"HEAD ≠ ref → reclone", shaA, nil, shaB, nil, false, cloneReclone},
+		{"ref unresolvable → reclone", shaA, nil, "", errResolve, false, cloneReclone},
+		{"not a repo (empty head) → reclone", "", nil, "", nil, false, cloneReclone},
+		{"unreadable head → reclone", "", errHead, "", nil, false, cloneReclone},
+
+		// The regression this guards: a cancelled run must NOT discard a good cache.
+		{"head probe failed + cancelled → abort (keep cache)", shaA, errHead, "", nil, true, cloneAbort},
+		{"resolve probe failed + cancelled → abort (keep cache)", shaA, nil, "", errResolve, true, cloneAbort},
+
+		// A probe that COMPLETED is trusted even if the context is now cancelled:
+		// the results are valid, so reuse/reclone as usual (no abort).
+		{"completed + later cancel, exact match → reuse", shaA, nil, shaA, nil, true, cloneReuse},
+		{"completed + later cancel, mismatch → reclone", shaA, nil, shaB, nil, true, cloneReclone},
+	}
+	for _, tc := range cases {
+		got := classifyCloneCache(tc.head, tc.headErr, tc.resolved, tc.resolveErr, tc.ctxCancel)
+		if got != tc.want {
+			t.Errorf("%s: classifyCloneCache(%q,%v,%q,%v,%v) = %v, want %v",
+				tc.name, tc.head, tc.headErr, tc.resolved, tc.resolveErr, tc.ctxCancel, got, tc.want)
+		}
 	}
 }
