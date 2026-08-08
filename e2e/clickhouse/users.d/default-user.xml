@@ -1,0 +1,20 @@
+<!--
+    Overrides the clickhouse-server image's built-in users.d/default-user.xml,
+    which locks the `default` user to loopback (::1, 127.0.0.1). The daemon
+    stack (agg, api) reaches ClickHouse over the run network from OTHER
+    containers, so the default user must accept those source IPs. Mounted at
+    /etc/clickhouse-server/users.d/default-user.xml, replacing the stock file.
+
+    This is an ephemeral test ClickHouse with no sensitive data on an isolated
+    per-run network, so opening the credential-less default user to all IPs is
+    appropriate. (Ticket 08: needed once agg/api connect to CH by IP.)
+-->
+<clickhouse>
+    <users>
+        <default>
+            <networks>
+                <ip>::/0</ip>
+            </networks>
+        </default>
+    </users>
+</clickhouse>

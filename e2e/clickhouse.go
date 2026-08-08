@@ -18,6 +18,10 @@ const (
 
 	chConfigMount = "/etc/clickhouse-server/config.d/config.xml"
 	chInitMount   = "/docker-entrypoint-initdb.d/v6-init.sql"
+	// chUsersMount overlays the image's users.d/default-user.xml (which restricts
+	// the default user to loopback) so the agg/api — connecting from other
+	// containers over the run network — are not denied with HTTP 403.
+	chUsersMount = "/etc/clickhouse-server/users.d/default-user.xml"
 )
 
 // clickHouse is the running ClickHouse service handle.
@@ -33,7 +37,8 @@ type clickHouse struct {
 func startClickHouse(ctx context.Context, rt Runtime, container, network, repoRoot string) (*clickHouse, error) {
 	configPath := filepath.Join(repoRoot, "e2e", "clickhouse", "config.xml")
 	initPath := filepath.Join(repoRoot, "e2e", "clickhouse", "v6-init.sql")
-	for _, p := range []string{configPath, initPath} {
+	usersPath := filepath.Join(repoRoot, "e2e", "clickhouse", "users.d", "default-user.xml")
+	for _, p := range []string{configPath, initPath, usersPath} {
 		if !fileExists(p) {
 			return nil, fmt.Errorf("missing committed ClickHouse asset %q", p)
 		}
@@ -46,6 +51,7 @@ func startClickHouse(ctx context.Context, rt Runtime, container, network, repoRo
 		Volumes: []string{
 			configPath + ":" + chConfigMount,
 			initPath + ":" + chInitMount,
+			usersPath + ":" + chUsersMount,
 		},
 		// Fresh, ephemeral data dir on every run: the init SQL always re-runs.
 		Detach: true,

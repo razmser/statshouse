@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<!--
+    Minimal placeholder for the StatsHouse UI's index.html.
+
+    The e2e harness serves NO real UI: it only proves /api/query answers
+    end-to-end. The api, however, parses index.html as a Go text/template at
+    startup (template.ParseFS(staticDir, "index.html"), internal/api/handler.go)
+    and refuses to start if the file is absent. Building the full UI (npm) is out
+    of scope for the harness, so this static page — with no template actions —
+    satisfies the parse and is served verbatim for any HTML request. /api/query
+    never touches it. Mounted read-only at /static via --static-dir=/static.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>StatsHouse (e2e)</title>
+  </head>
+  <body>
+    <p>StatsHouse e2e harness — UI not built. Query <code>/api/query</code>.</p>
+  </body>
+</html>

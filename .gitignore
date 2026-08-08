@@ -23,3 +23,6 @@ node_modules/
 
 # e2e harness per-run artifacts (logs, dumps, summaries)
 /e2e/artifacts/
+
+# built harness binary (go build run inside e2e/)
+/e2e/e2e

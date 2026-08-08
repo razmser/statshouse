@@ -1,8 +1,13 @@
 // Command e2e drives the StatsHouse end-to-end test harness.
 //
-// Ticket 07 scope: bring up a single-node ClickHouse with the committed schema
-// and prove the harness skeleton (runtime abstraction, preflight, readiness
-// probes, teardown, artifacts) works on macOS via apple/container.
+// Ticket 07 brought up a single-node ClickHouse with the committed schema and
+// proved the harness skeleton (runtime abstraction, preflight, readiness probes,
+// teardown, artifacts).
+//
+// Ticket 08 builds on that: it cross-compiles the four daemons (metadata, agg,
+// api, agent), bind-mounts each into a minimal alpine image, and brings up the
+// full five-service stack — clickhouse, metadata, agg, api, agent — wired by
+// inspected IP, then proves /api/query answers on the published port.
 //
 //	go run ./e2e
 package main
@@ -12,10 +17,13 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -36,16 +44,17 @@ func main() {
 	var (
 		runtimeFlag = flag.String("runtime", "", "container runtime: \"container\" (apple, default on macOS) or \"docker\" (default on Linux); auto-detected if empty")
 		runIDFlag   = flag.String("run-id", "", "run identifier (default: local datetime 20060102-150405)")
+		archFlag    = flag.String("arch", "", "GOARCH to cross-compile daemons for (default arm64; the apple/container + lima/arm64 verification path)")
 		keep        = flag.Bool("keep", false, "keep containers+network after the run for debugging")
 		verbose     = flag.Bool("v", false, "verbose: print extra detail")
 		timeout     = flag.Duration("timeout", 10*time.Minute, "overall run timeout")
 	)
 	flag.Parse()
 
-	os.Exit(realMain(*runtimeFlag, *runIDFlag, *keep, *verbose, *timeout))
+	os.Exit(realMain(*runtimeFlag, *runIDFlag, *archFlag, *keep, *verbose, *timeout))
 }
 
-func realMain(runtimeFlag, runIDFlag string, keep, verbose bool, timeout time.Duration) int {
+func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeout time.Duration) int {
 	runID := runIDFlag
 	if runID == "" {
 		runID = time.Now().Format("20060102-150405")
@@ -71,7 +80,7 @@ func realMain(runtimeFlag, runIDFlag string, keep, verbose bool, timeout time.Du
 	rec.logf("runid=%s artifacts=%s", runID, artifactsDir)
 
 	network := e2ePrefix + runID
-	container := e2ePrefix + runID + "-clickhouse"
+	chContainer := e2ePrefix + runID + "-clickhouse"
 
 	// The run context is cancelled by --timeout OR an incoming SIGINT/SIGTERM.
 	// Deferred calls (teardown) still run on signal-driven cancel because
@@ -83,16 +92,16 @@ func realMain(runtimeFlag, runIDFlag string, keep, verbose bool, timeout time.Du
 
 	rt, err := selectRuntime(runtimeFlag)
 	if err != nil {
-		return fail(rec, artifactsDir, rt, container, err)
+		return fail(rec, artifactsDir, rt, nil, err)
 	}
 	rec.logf("runtime=%s", rt.Name())
 
 	// --- preflight ---
 	if err := rt.EnsureSystem(ctx); err != nil {
-		return fail(rec, artifactsDir, rt, container, fmt.Errorf("preflight ensure-system: %w", err))
+		return fail(rec, artifactsDir, rt, nil, fmt.Errorf("preflight ensure-system: %w", err))
 	}
 	if err := rt.CheckVersion(ctx); err != nil {
-		return fail(rec, artifactsDir, rt, container, fmt.Errorf("preflight version check: %w", err))
+		return fail(rec, artifactsDir, rt, nil, fmt.Errorf("preflight version check: %w", err))
 	}
 	rec.logf("preflight ok (%s)", rt.Name())
 
@@ -104,52 +113,65 @@ func realMain(runtimeFlag, runIDFlag string, keep, verbose bool, timeout time.Du
 		rec.logf("no stale e2e-* resources to prune")
 	}
 
+	// Every container created during the run, appended as it starts, so teardown
+	// and fail() can clean/capture them uniformly (even on partial starts).
+	var containers []string
+
 	// --- teardown unless --keep ---
 	// Uses a fresh context (not the run ctx, which the --timeout deadline or a
 	// signal may have cancelled) so cleanup still runs after the run deadline fires.
 	teardown := func() {
 		if keep {
-			rec.logf("keeping resources (--keep): container=%s network=%s", container, network)
+			rec.logf("keeping resources (--keep): containers=%v network=%s", containers, network)
 			return
 		}
-		tctx, tcancel := context.WithTimeout(context.Background(), 30*time.Second)
+		tctx, tcancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer tcancel()
 		var errs []string
-		if err := rt.Rm(tctx, container, true); err != nil {
-			errs = append(errs, err.Error())
+		for _, c := range containers {
+			if err := rt.Rm(tctx, c, true); err != nil {
+				errs = append(errs, c+": "+err.Error())
+			}
 		}
 		if err := rt.NetworkRemove(tctx, network); err != nil {
-			errs = append(errs, err.Error())
+			errs = append(errs, "network "+network+": "+err.Error())
 		}
-		if len(errs) > 0 {
+		switch {
+		case len(errs) > 0:
 			rec.logf("teardown errors: %s", strings.Join(errs, "; "))
-		} else {
-			rec.logf("teardown ok: removed container %s and network %s", container, network)
+		default:
+			rec.logf("teardown ok: removed %d container(s) and network %s", len(containers), network)
 		}
 	}
 	defer teardown()
 
 	if err := rt.NetworkCreate(ctx, network); err != nil {
-		return fail(rec, artifactsDir, rt, container, fmt.Errorf("create network %s: %w", network, err))
+		return fail(rec, artifactsDir, rt, containers, fmt.Errorf("create network %s: %w", network, err))
 	}
 	rec.logf("created network %s", network)
 
 	// --- ClickHouse ---
 	start := time.Now()
-	ch, err := startClickHouse(ctx, rt, container, network, root)
+	ch, err := startClickHouse(ctx, rt, chContainer, network, root)
+	containers = append(containers, chContainer)
 	if ch != nil && ch.ip != "" {
-		rec.logf("clickhouse container=%s ip=%s", container, ch.ip)
+		rec.logf("clickhouse container=%s ip=%s", chContainer, ch.ip)
 	} else {
-		rec.logf("clickhouse container=%s", container)
+		rec.logf("clickhouse container=%s", chContainer)
 	}
 	if err != nil {
-		return fail(rec, artifactsDir, rt, container, fmt.Errorf("clickhouse: %w", err))
+		return fail(rec, artifactsDir, rt, containers, fmt.Errorf("clickhouse: %w", err))
+	}
+	if ch.ip == "" {
+		// Ticket 07 treated a missing IP as non-fatal (it probed CH via Exec). The
+		// daemon stack wires to CH by IP (spec §2), so here it is fatal.
+		return fail(rec, artifactsDir, rt, containers, fmt.Errorf("clickhouse has no inspected IP on %s; daemons wire to it by IP", network))
 	}
 	rec.logf("clickhouse ready (probes green in %.1fs)", time.Since(start).Seconds())
 
 	tables, err := ch.tables(ctx, rt)
 	if err != nil {
-		return fail(rec, artifactsDir, rt, container, fmt.Errorf("read tables: %w", err))
+		return fail(rec, artifactsDir, rt, containers, fmt.Errorf("read tables: %w", err))
 	}
 	hasReady := false
 	for _, t := range tables {
@@ -159,32 +181,89 @@ func realMain(runtimeFlag, runIDFlag string, keep, verbose bool, timeout time.Du
 	}
 	rec.logf("schema loaded: %d tables (%s)", len(tables), strings.Join(tables, ", "))
 	if !hasReady {
-		return fail(rec, artifactsDir, rt, container, fmt.Errorf("readiness table %s missing from SHOW TABLES", chReadyTable))
+		return fail(rec, artifactsDir, rt, containers, fmt.Errorf("readiness table %s missing from SHOW TABLES", chReadyTable))
 	}
 
-	// -v: capture the ClickHouse container log to artifacts on the happy path
-	// (on failure this happens via fail()->dumpClickHouseLogs). Must run before
-	// teardown, which is deferred above.
+	// --- build the four daemons (cached across runs) ---
+	arch := resolveArch(archFlag)
+	binDir, err := buildDaemons(ctx, root, arch, rec.logf)
+	if err != nil {
+		return fail(rec, artifactsDir, rt, containers, fmt.Errorf("build daemons: %w", err))
+	}
+
+	// --- load published-port config + bring up the daemon stack ---
+	cfg, err := loadConfig(filepath.Join(root, "e2e", "config.yaml"))
+	if err != nil {
+		return fail(rec, artifactsDir, rt, containers, fmt.Errorf("load e2e/config.yaml: %w", err))
+	}
+	// Shared RPC crypto key: mounted into all four daemons so their cross-
+	// container RPC (metadata↔agg, metadata↔api, agg↔agent) passes the nonce
+	// exchange, which requires encryption whenever the peers are not on the same
+	// machine (always true here). Removed after the run.
+	rpcKeyPath, err := writeRPCKey()
+	if err != nil {
+		return fail(rec, artifactsDir, rt, containers, err)
+	}
+	defer os.Remove(rpcKeyPath)
+	start = time.Now()
+	ds, err := startDaemonStack(ctx, rt, rec, daemonStackOpts{
+		network:      network,
+		chIP:         ch.ip,
+		binDir:       binDir,
+		runID:        runID,
+		cfg:          cfg,
+		rpcKeyPath:   rpcKeyPath,
+		apiStaticDir: filepath.Join(root, "e2e", "api-static"),
+	})
+	containers = append(containers, ds.containerNames()...)
+	if err != nil {
+		return fail(rec, artifactsDir, rt, containers, fmt.Errorf("daemon stack: %w", err))
+	}
+	rec.logf("daemon stack ready (metadata+agg+api+agent green in %.1fs)", time.Since(start).Seconds())
+
+	// --- /api/query answers on the published port (ticket 08) ---
+	queryAddr := cfg.hostAddr("api") // "127.0.0.1:10888"; falls back to the container IP if not published
+	if queryAddr == "" {
+		queryAddr = net.JoinHostPort(ds.api.ip, strconv.Itoa(apiPort))
+	}
+	body, err := queryAPI(ctx, queryAddr)
+	if err != nil {
+		return fail(rec, artifactsDir, rt, containers, fmt.Errorf("api query: %w", err))
+	}
+	rec.logf("/api/query answered 200 on %s (%d bytes)", queryAddr, len(body))
+
+	// -v: capture every container's log to artifacts on the happy path.
 	if verbose {
-		if logs, err := rt.Logs(ctx, container); err == nil {
-			if err := os.WriteFile(filepath.Join(artifactsDir, "clickhouse.log"), []byte(logs), 0o644); err == nil {
-				rec.logf("verbose: wrote clickhouse.log (%d bytes)", len(logs))
-			}
-		}
+		dumpServiceLogs(rec, rt, containers, artifactsDir)
 	}
 
 	// --- PASS summary ---
-	summary := fmt.Sprintf("PASS: clickhouse ready, schema loaded (%d tables), runtime=%s, runid=%s",
-		len(tables), rt.Name(), runID)
+	summary := fmt.Sprintf("PASS: 5-service stack up, /api/query answers, runtime=%s, runid=%s",
+		rt.Name(), runID)
 	rec.logf("%s", summary)
 	writeSummary(artifactsDir, rec.lines)
 	fmt.Println(summary)
+	fmt.Printf("/api/query response: %s\n", truncate(strings.TrimSpace(body), 400))
 	return 0
+}
+
+// resolveArch picks the GOARCH to cross-compile daemons for. An explicit --arch
+// wins; otherwise runtime.GOARCH — arm64 on the verified macOS/lima paths, amd64
+// on an amd64 Linux box — matching spec §2 ("detected at preflight, default
+// arm64, overridable … an amd64 Linux box builds amd64").
+func resolveArch(flagArch string) string {
+	if flagArch != "" {
+		return flagArch
+	}
+	return runtime.GOARCH
 }
 
 // pruneStale removes every e2e-* container and network it can find. Returns the
 // counts removed. Best-effort: errors on individual resources are ignored so one
 // stuck resource doesn't abort the run.
+//
+// The e2e- prefix is shared by every run, so this pruning assumes a single
+// harness run at a time: concurrent runs would delete each other's live stack.
 func pruneStale(ctx context.Context, rt Runtime) (containers, networks int) {
 	for _, c := range listSafe(ctx, rt.ContainerList) {
 		if strings.HasPrefix(c, e2ePrefix) {
@@ -240,47 +319,64 @@ func (r *recorder) logf(format string, args ...any) {
 	fmt.Fprintln(os.Stderr, "[e2e] "+line)
 }
 
-// fail records the failure, dumps the ClickHouse container logs to artifacts (so
-// every failure path leaves a clickhouse.log — the tables()/schema-missing paths
-// previously embedded nothing), writes the summary, and returns the exit code.
-// rt/container are nil/"" before any container exists; dumpClickHouseLogs no-ops.
-func fail(rec *recorder, artifactsDir string, rt Runtime, container string, err error) int {
+// fail records the failure, dumps every started container's logs to artifacts
+// (so any daemon crash leaves a <service>.log for diagnosis), writes the summary,
+// and returns the exit code. rt is nil before the runtime is selected; containers
+// holds whatever was started before the failure (possibly empty).
+func fail(rec *recorder, artifactsDir string, rt Runtime, containers []string, err error) int {
 	msg := fmt.Sprintf("FAIL: %v", err)
 	rec.lines = append(rec.lines, msg)
 	fmt.Fprintln(os.Stderr, "[e2e] "+msg)
-	dumpClickHouseLogs(rec, rt, container, artifactsDir)
+	dumpServiceLogs(rec, rt, containers, artifactsDir)
 	writeSummary(artifactsDir, rec.lines)
 	fmt.Fprintln(os.Stderr, msg)
 	return 1
 }
 
-// dumpClickHouseLogs writes the container's accumulated logs to
-// <artifacts>/clickhouse.log when the container exists. Best-effort: a capture
-// failure is logged but never masks the run result.
-func dumpClickHouseLogs(rec *recorder, rt Runtime, container, artifactsDir string) {
-	if rt == nil || container == "" {
+// dumpServiceLogs writes each started container's accumulated logs to
+// <artifacts>/<service>.log (the service name is the last dash-segment of the
+// container name, e.g. e2e-<runid>-metadata -> metadata.log). Best-effort: a
+// capture failure is logged but never masks the run result.
+func dumpServiceLogs(rec *recorder, rt Runtime, containers []string, artifactsDir string) {
+	if rt == nil || len(containers) == 0 {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	present, err := resourceInList(ctx, rt.ContainerList, container)
+	existing, err := rt.ContainerList(ctx)
 	if err != nil {
-		rec.logf("could not capture clickhouse logs (list containers): %v", err)
+		rec.logf("could not capture service logs (list containers): %v", err)
 		return
 	}
-	if !present {
-		return
+	present := make(map[string]bool, len(existing))
+	for _, c := range existing {
+		present[c] = true
 	}
-	logs, lerr := rt.Logs(ctx, container)
-	if lerr != nil {
-		rec.logf("could not capture clickhouse logs: %v", lerr)
-		return
+	for _, c := range containers {
+		if !present[c] {
+			continue
+		}
+		logs, lerr := rt.Logs(ctx, c)
+		if lerr != nil {
+			rec.logf("could not capture logs for %s: %v", c, lerr)
+			continue
+		}
+		name := serviceLogName(c)
+		if werr := os.WriteFile(filepath.Join(artifactsDir, name+".log"), []byte(logs), 0o644); werr != nil {
+			rec.logf("could not write %s.log: %v", name, werr)
+			continue
+		}
+		rec.logf("wrote %s.log (%d bytes)", name, len(logs))
 	}
-	if werr := os.WriteFile(filepath.Join(artifactsDir, "clickhouse.log"), []byte(logs), 0o644); werr != nil {
-		rec.logf("could not write clickhouse.log: %v", werr)
-		return
+}
+
+// serviceLogName reduces a container name to its service role: the last dash-
+// separated segment (e2e-<runid>-clickhouse -> clickhouse, ...-metadata -> metadata).
+func serviceLogName(container string) string {
+	if i := strings.LastIndex(container, "-"); i >= 0 {
+		return container[i+1:]
 	}
-	rec.logf("wrote clickhouse.log (%d bytes)", len(logs))
+	return container
 }
 
 func writeSummary(artifactsDir string, lines []string) {

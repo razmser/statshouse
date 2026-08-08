@@ -1,0 +1,431 @@
+package main
+
+import (
+	"context"
+	crand "crypto/rand"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+)
+
+const (
+	// alpineBase is the minimal image each daemon binary is bind-mounted into.
+	// No image builds anywhere (spec §2). alpine (busybox) gives the static Go
+	// binaries a Linux userland + /bin/sh for the entrypoint; pinned to the exact
+	// minor tag present locally (3.24 on this machine), not the floating alpine:3
+	// tag, so a rerun reproduces the same userland (spec/ticket: pinned base image).
+	alpineBase = "alpine:3.24"
+
+	metaPort   = 2442  // metadata RPC
+	aggPort    = 13336 // aggregator receive
+	apiPort    = 10888 // api HTTP (the only published port by default)
+	apiRPCPort = 10889 // api RPC
+	agentPort  = 13337 // agent client: raw UDP + RPC TCP
+
+	// rpcKeyMount is where the shared RPC crypto key is mounted inside every
+	// daemon container. The agg/agent read it from this default path
+	// (defaultPathToPwd = "/etc/engine/pass"); the metadata/api read it via
+	// --rpc-crypto-path=/etc/engine/pass. All four must hold the SAME key so the
+	// nonce-exchange handshake (which requires encryption whenever the two peers
+	// are not on the same machine) succeeds for every cross-container link.
+	rpcKeyMount = "/etc/engine/pass"
+
+	// apiStaticMount is where the minimal UI index.html is mounted into the api.
+	// The api parses index.html as a Go template at startup (and refuses to start
+	// if it is missing); the harness ships a placeholder page instead of building
+	// the full npm UI. Passed to the api via --static-dir=/static.
+	apiStaticMount = "/static"
+
+	// queryMetric is a builtin resolved in-process by the api (no metadata
+	// mapping required), so /api/query returns 200 with empty data on a fresh
+	// stack — proving the api answers end-to-end (it still has to reach metadata
+	// + ClickHouse to build the reply). See format.BuiltinMetricByName.
+	queryMetric = "__agg_bucket_receive_delay_sec"
+)
+
+// daemonStack is the set of running daemon services.
+type daemonStack struct {
+	metadata *service
+	agg      *service
+	api      *service
+	agent    *service
+}
+
+// service is one running daemon container and its inspected IP.
+type service struct {
+	name string // container name
+	ip   string
+}
+
+// containerNames returns the names of the services that were started (nil ones,
+// from a partial start, are skipped) — for teardown and log capture.
+func (ds *daemonStack) containerNames() []string {
+	var names []string
+	for _, s := range []*service{ds.metadata, ds.agg, ds.api, ds.agent} {
+		if s != nil {
+			names = append(names, s.name)
+		}
+	}
+	return names
+}
+
+// daemonStackOpts configures startDaemonStack.
+type daemonStackOpts struct {
+	network      string
+	chIP         string // ClickHouse IPv4 on the run network
+	binDir       string // host dir holding the four compiled daemon binaries
+	runID        string
+	cfg          publishConfig
+	rpcKeyPath   string // host path to the shared RPC crypto key (mounted into all four)
+	apiStaticDir string // host dir with index.html (mounted into the api at apiStaticMount)
+}
+
+func (o daemonStackOpts) cname(role string) string { return e2ePrefix + o.runID + "-" + role }
+
+// keyVol is the read-only volume spec mounting the shared RPC crypto key into a
+// daemon container at rpcKeyMount.
+func (o daemonStackOpts) keyVol() string { return o.rpcKeyPath + ":" + rpcKeyMount + ":ro" }
+
+// startDaemonStack brings up metadata, agg, api, and agent on the run network,
+// wired entirely by inspected IP (never container DNS — apple/container in-
+// container DNS does not resolve names), with the exact flags of spec §2, and
+// waits on each one's real readiness probe (TCP dial; no fixed sleeps).
+//
+// Startup order (spec §2): metadata → agg → api + agent. Each daemon binary is
+// bind-mounted read-only into alpineBase and run via a /bin/sh entrypoint that
+// mkdirs its writable dirs then execs the binary (so the binary becomes PID 1).
+func startDaemonStack(ctx context.Context, rt Runtime, rec *recorder, o daemonStackOpts) (*daemonStack, error) {
+	ds := &daemonStack{}
+
+	// --- metadata ---
+	// First boot only: --create-binlog initializes the binlog and EXITS, then the
+	// server starts without it (spec §2; verified in cmd/statshouse-metadata: the
+	// create-binlog path returns nil immediately). Both run in ONE container
+	// sharing its writable layer, so the init step's binlog is present for the
+	// server. metadata is the root service, so all its flags are static literals.
+	metaC := o.cname("metadata")
+	// mkdir (child) -> create-binlog (child, exits 0) -> exec server (replaces
+	// shell, becomes PID 1). Only the server is exec'd: exec'ing create-binlog
+	// would make the (exiting) init step PID 1 and stop the container before the
+	// server starts.
+	metaScript := "mkdir -p /var/lib/meta/binlog && " +
+		`/statshouse-metadata -p 2442 --db-path=/var/lib/meta/db --binlog-prefix=/var/lib/meta/binlog/bl --create-binlog "0,1"` +
+		" && exec " +
+		"/statshouse-metadata -p 2442 --db-path=/var/lib/meta/db --binlog-prefix=/var/lib/meta/binlog/bl" +
+		" --rpc-crypto-path=" + rpcKeyMount
+	if err := rt.Run(ctx, RunOpts{
+		Name:    metaC,
+		Image:   alpineBase,
+		Network: o.network,
+		Volumes: []string{
+			filepath.Join(o.binDir, "statshouse-metadata") + ":/statshouse-metadata:ro",
+			o.keyVol(),
+		},
+		Cmd:    []string{"/bin/sh", "-c", metaScript},
+		Detach: true,
+	}); err != nil {
+		return ds, fmt.Errorf("start metadata: %w", err)
+	}
+	// Track the container before InspectIP: if the inspect errors the container is
+	// already running, and an untracked service is skipped by teardown (and blocks
+	// NetworkRemove while it stays attached). Fill ip only once known.
+	ds.metadata = &service{name: metaC}
+	metaIP, err := rt.InspectIP(ctx, metaC, o.network)
+	if err != nil {
+		return ds, fmt.Errorf("inspect metadata IP: %w", err)
+	}
+	ds.metadata.ip = metaIP
+	rec.logf("metadata container=%s ip=%s", metaC, metaIP)
+	if err := waitTCP(ctx, rt, rec, "metadata", metaC, metaIP, metaPort); err != nil {
+		return ds, err
+	}
+	rec.logf("metadata ready (tcp :%d)", metaPort)
+
+	// --- aggregator ---
+	// --receive-budget-warming=0 is MANDATORY (spec §2): the default 15m ramp
+	// starves per-metric receive budgets and agents sample even tiny payloads.
+	//
+	// The agg must advertise its REAL run-network IP to agents, not the CH
+	// cluster's host_name ("localhost"). selectShardReplica reads host_name from
+	// system.clusters (config.xml remote_servers.statlogs2 -> <host>localhost</host>)
+	// and uses it verbatim as the agg's own address; the agent then adopts that
+	// topology and dials localhost:13336 for buckets + its metric journal — which
+	// never resolves cross-container (apple/container in-container DNS does not
+	// resolve names). localdebug sidesteps this by running everything on 127.0.0.1.
+	//
+	// --cluster-shards-addrs overrides the advertised list. The agg's own IP is
+	// not known until the container starts, so the entrypoint discovers it from
+	// its eth0 interface (scope global excludes loopback/link-local) and injects
+	// it into the flag. Listening stays on 0.0.0.0 (robust); only the advertised
+	// address is the reachable IP.
+	//
+	// `-u root -g root` keeps the agg as root: alpine has no 'kitten' user, and
+	// ChangeUserGroup only no-ops for non-root, so it would fatally setuid to the
+	// missing user otherwise (see the agent block for the full rationale).
+	aggC := o.cname("agg")
+	metaAggAddr := net.JoinHostPort(metaIP, strconv.Itoa(metaPort))
+	aggScript := fmt.Sprintf(`set -e
+mkdir -p /cache
+AGG_IP=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+[ -n "$AGG_IP" ] || { echo 'e2e: could not determine aggregator run-network IP' >&2; exit 1; }
+exec /statshouse-agg \
+  --agg-addr=0.0.0.0:%[1]d \
+  --cluster=statlogs2 \
+  --kh=%[2]s:8123 \
+  --auto-create \
+  --auto-create-default-namespace \
+  --deny-old-agents=false \
+  --metadata-addr=%[3]s \
+  --cache-dir=/cache \
+  --receive-budget-warming=0 \
+  --cluster-shards-addrs=${AGG_IP}:%[1]d,${AGG_IP}:%[1]d,${AGG_IP}:%[1]d \
+  -u root -g root`,
+		aggPort, o.chIP, metaAggAddr)
+	if err := rt.Run(ctx, RunOpts{
+		Name:    aggC,
+		Image:   alpineBase,
+		Network: o.network,
+		Volumes: []string{
+			filepath.Join(o.binDir, "statshouse-agg") + ":/statshouse-agg:ro",
+			o.keyVol(),
+		},
+		Cmd:    []string{"/bin/sh", "-c", aggScript},
+		Detach: true,
+	}); err != nil {
+		return ds, fmt.Errorf("start agg: %w", err)
+	}
+	ds.agg = &service{name: aggC} // track before inspect; see metadata
+	aggIP, err := rt.InspectIP(ctx, aggC, o.network)
+	if err != nil {
+		return ds, fmt.Errorf("inspect agg IP: %w", err)
+	}
+	ds.agg.ip = aggIP
+	rec.logf("agg container=%s ip=%s", aggC, aggIP)
+	if err := waitTCP(ctx, rt, rec, "agg", aggC, aggIP, aggPort); err != nil {
+		return ds, err
+	}
+	rec.logf("agg ready (tcp :%d)", aggPort)
+
+	// --- api (+ published port from config) ---
+	apiC := o.cname("api")
+	apiPortSpec, apiPublished := o.cfg.publishSpec("api", apiPort) // default 127.0.0.1:10888:10888
+	apiStatic := filepath.Join(o.apiStaticDir, "index.html")
+	if !fileExists(apiStatic) {
+		return ds, fmt.Errorf("missing api static asset %q (the api needs index.html to parse at startup)", apiStatic)
+	}
+	chV2 := strings.Repeat(o.chIP+":9000,", 3)
+	chV2 = strings.TrimSuffix(chV2, ",") // <ch-ip>:9000 three times (cluster config shape)
+	apiCmd := joinSh(
+		"mkdir -p /cache",
+		"/statshouse-api",
+		"--local-mode",
+		"--insecure-mode",
+		"--clickhouse-v2-addrs="+chV2,
+		"--listen-addr=0.0.0.0:"+strconv.Itoa(apiPort),
+		"--listen-rpc-addr=0.0.0.0:"+strconv.Itoa(apiRPCPort),
+		"--metadata-addr="+net.JoinHostPort(metaIP, strconv.Itoa(metaPort)),
+		"--available-shards=1",
+		"--cache-dir=/cache",
+		"--rpc-crypto-path="+rpcKeyMount,
+		// The api is built without the `embed` tag, so statshouseui.FS() is nil
+		// and it loads index.html from --static-dir. We ship a placeholder page
+		// (e2e/api-static/index.html) rather than building the npm UI.
+		"--static-dir="+apiStaticMount,
+	)
+	apiRun := RunOpts{
+		Name:    apiC,
+		Image:   alpineBase,
+		Network: o.network,
+		Volumes: []string{
+			filepath.Join(o.binDir, "statshouse-api") + ":/statshouse-api:ro",
+			o.keyVol(),
+			o.apiStaticDir + ":" + apiStaticMount + ":ro",
+		},
+		Cmd:    apiCmd,
+		Detach: true,
+	}
+	if apiPublished {
+		apiRun.Ports = []string{apiPortSpec}
+	}
+	if err := rt.Run(ctx, apiRun); err != nil {
+		return ds, fmt.Errorf("start api: %w", err)
+	}
+	ds.api = &service{name: apiC} // track before inspect; see metadata
+	apiIP, err := rt.InspectIP(ctx, apiC, o.network)
+	if err != nil {
+		return ds, fmt.Errorf("inspect api IP: %w", err)
+	}
+	ds.api.ip = apiIP
+	if apiPublished {
+		rec.logf("api container=%s ip=%s publish=%s", apiC, apiIP, apiPortSpec)
+	} else {
+		rec.logf("api container=%s ip=%s (not published)", apiC, apiIP)
+	}
+	if err := waitTCP(ctx, rt, rec, "api", apiC, apiIP, apiPort); err != nil {
+		return ds, err
+	}
+	rec.logf("api ready (tcp :%d)", apiPort)
+
+	// --- agent ---
+	agentC := o.cname("agent")
+	agg3 := strings.TrimSuffix(strings.Repeat(net.JoinHostPort(aggIP, strconv.Itoa(aggPort))+",", 3), ",")
+	agentCmd := joinSh(
+		"mkdir -p /cache",
+		"/statshouse",
+		"-agent",
+		"--cluster=statlogs2",
+		"--hostname=agent1",
+		"--agg-addr="+agg3,
+		"--cache-dir=/cache",
+		"--hardware-metric-scrape-disable",
+		// Same 'kitten' setuid reason as the agg: the agent runs as root in the
+		// container and would fatally fail to drop to the missing 'kitten' user.
+		"-u", "root", "-g", "root",
+	)
+	if err := rt.Run(ctx, RunOpts{
+		Name:    agentC,
+		Image:   alpineBase,
+		Network: o.network,
+		Volumes: []string{
+			filepath.Join(o.binDir, "statshouse") + ":/statshouse:ro",
+			o.keyVol(),
+		},
+		Cmd:    agentCmd,
+		Detach: true,
+	}); err != nil {
+		return ds, fmt.Errorf("start agent: %w", err)
+	}
+	ds.agent = &service{name: agentC} // track before inspect; see metadata
+	agentIP, err := rt.InspectIP(ctx, agentC, o.network)
+	if err != nil {
+		return ds, fmt.Errorf("inspect agent IP: %w", err)
+	}
+	ds.agent.ip = agentIP
+	rec.logf("agent container=%s ip=%s", agentC, agentIP)
+	if err := waitTCP(ctx, rt, rec, "agent", agentC, agentIP, agentPort); err != nil {
+		return ds, err
+	}
+	rec.logf("agent ready (tcp :%d)", agentPort)
+
+	return ds, nil
+}
+
+// joinSh builds a /bin/sh -c argv that runs `prep` (e.g. "mkdir -p /cache") then
+// execs the binary+flags passed as the remaining args. The flags are passed as
+// separate argv elements after the "--" $0 placeholder, so `exec "$@"` runs them
+// verbatim — no shell quoting of the (IP-laden) flags is needed.
+func joinSh(prep string, bin string, flags ...string) []string {
+	return append([]string{"/bin/sh", "-c", prep + `; exec "$@"`, "--", bin}, flags...)
+}
+
+// writeRPCKey writes a fresh 32-byte RPC crypto key to a host temp file and
+// returns its path. It is mounted read-only into every daemon at rpcKeyMount so
+// all four derive the same KeyID and their cross-container RPC handshakes
+// succeed. localdebug avoids encryption by running every daemon on 127.0.0.1
+// (sameMachine → encryption skipped); the container stack cannot, so a shared
+// key is mandatory. 32 bytes satisfies MinCryptoKeyLen, and random bytes almost
+// never begin with four zero bytes (the other rejection). The caller removes the
+// file when done.
+func writeRPCKey() (string, error) {
+	key := make([]byte, 32)
+	if _, err := crand.Read(key); err != nil {
+		return "", fmt.Errorf("generate RPC crypto key: %w", err)
+	}
+	f, err := os.CreateTemp("", "statshouse-e2e-rpckey-*")
+	if err != nil {
+		return "", fmt.Errorf("create RPC crypto key file: %w", err)
+	}
+	name := f.Name()
+	if _, err := f.Write(key); err != nil {
+		f.Close()
+		os.Remove(name) // don't leak the temp file on the error path
+		return "", fmt.Errorf("write RPC crypto key: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(name) // don't leak the temp file on the error path
+		return "", fmt.Errorf("close RPC crypto key file: %w", err)
+	}
+	return name, nil
+}
+
+// waitTCP polls a real TCP dial to addr (host→container IP; verified reachable
+// on apple/container, docker-on-Linux, and the lima guest) until the port is
+// accepting connections, surfacing the container logs on timeout. No fixed sleeps.
+func waitTCP(ctx context.Context, rt Runtime, rec *recorder, label, container, ip string, port int) error {
+	addr := net.JoinHostPort(ip, strconv.Itoa(port))
+	const (
+		timeout  = 3 * time.Minute
+		interval = 2 * time.Second
+	)
+	var lastErr string
+	if err := poll(ctx, timeout, interval, func() (bool, error) {
+		c, derr := net.DialTimeout("tcp", addr, 2*time.Second)
+		if derr == nil {
+			_ = c.Close()
+			return true, nil
+		}
+		lastErr = derr.Error()
+		return false, nil
+	}); err != nil {
+		return fmt.Errorf("%s readiness (tcp %s) not reached within %s: %v\n%s",
+			label, addr, timeout, err, diagnose(ctx, rt, container, lastErr))
+	}
+	return nil
+}
+
+// queryAPI polls GET /api/query on the api's host address until it answers HTTP
+// 200 (empty data is fine — ticket 08). It proves the api serves end-to-end.
+// apiAddr is the published host address ("127.0.0.1:10888") or, when the api is
+// not published, the container IP:port.
+func queryAPI(ctx context.Context, apiAddr string) (string, error) {
+	now := time.Now()
+	url := fmt.Sprintf("http://%s/api/query?s=%s&f=%d&t=%d&w=1&qw=count",
+		apiAddr, queryMetric, now.Add(-5*time.Minute).Unix(), now.Unix())
+	const timeout = 2 * time.Minute
+	var (
+		lastBody string
+		lastCode int
+	)
+	if err := poll(ctx, timeout, 2*time.Second, func() (bool, error) {
+		body, code, gerr := httpGet(ctx, url)
+		if gerr != nil {
+			lastBody = gerr.Error()
+			return false, nil
+		}
+		lastCode, lastBody = code, body
+		return code == http.StatusOK, nil
+	}); err != nil {
+		return "", fmt.Errorf("/api/query did not answer 200 within %s (last code=%d): %v\nlast body: %s",
+			timeout, lastCode, err, truncate(lastBody, 1000))
+	}
+	return lastBody, nil
+}
+
+func httpGet(ctx context.Context, url string) (string, int, error) {
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(cctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", 0, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", 0, err
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	return string(b), resp.StatusCode, err
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
+}
