@@ -1,8 +1,11 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestSignatureAlignment pins the key-prefix convention that lets the expected
@@ -298,4 +301,101 @@ func TestClientWriteErrForLang(t *testing.T) {
 			t.Errorf(`sentinel " 0" series falsely matched lang %q`, lang)
 		}
 	}
+}
+
+// scriptedResp is one scripted absence-query result.
+type scriptedResp struct {
+	val float64
+	err error
+}
+
+// scriptedQuery replays a fixed list of responses for an absence poll. Once the
+// list is exhausted it repeats the LAST entry forever, so an all-error or all-zero
+// script stays uniform across as many iterations as poll drives.
+type scriptedQuery struct {
+	resps []scriptedResp
+	n     int
+}
+
+// scripted builds an injectable absenceQueryFunc backed by s.
+func scripted(s *scriptedQuery) absenceQueryFunc {
+	return func(ctx context.Context) (float64, error) {
+		i := s.n
+		if i >= len(s.resps) {
+			i = len(s.resps) - 1
+		}
+		r := s.resps[i]
+		s.n++
+		return r.val, r.err
+	}
+}
+
+// TestPollAbsenceTripwire pins the four outcomes of the fail-closed absence poll:
+// (1) every query erroring for the whole window FAILS CLOSED — a down stack never
+// passes for "absent"; (2) a clean zero confirms absence → pass; (3) a non-zero
+// point fails FAST (before the timeout); (4) errors followed by a later clean zero
+// still pass (one clean observation suffices). The query func is the seam, so this
+// needs no live API.
+func TestPollAbsenceTripwire(t *testing.T) {
+	ctx := context.Background()
+	// Short window/interval so the test is sub-100ms; the fail-fast case asserts it
+	// ends well before `to`, so the exact magnitudes are not load-bearing.
+	const to = 100 * time.Millisecond
+	const iv = 5 * time.Millisecond
+	errBoom := errors.New("api unreachable")
+
+	t.Run("all queries fail → fail closed", func(t *testing.T) {
+		s := &scriptedQuery{resps: []scriptedResp{{err: errBoom}}}
+		o := pollAbsenceTripwire(ctx, to, iv, scripted(s))
+		if o.ok {
+			t.Error("ok=true, want false — a down stack must never pass for absence")
+		}
+		if o.confirmed {
+			t.Error("confirmed=true, want false — no clean query ever ran")
+		}
+		if !errors.Is(o.queryErr, errBoom) {
+			t.Errorf("queryErr=%v, want errBoom", o.queryErr)
+		}
+	})
+
+	t.Run("clean and absent → pass", func(t *testing.T) {
+		s := &scriptedQuery{resps: []scriptedResp{{val: 0}}}
+		o := pollAbsenceTripwire(ctx, to, iv, scripted(s))
+		if !o.ok {
+			t.Errorf("ok=false, want true (absence confirmed): %+v", o)
+		}
+		if !o.confirmed {
+			t.Error("confirmed=false, want true")
+		}
+	})
+
+	t.Run("violation surfaces → fail fast", func(t *testing.T) {
+		s := &scriptedQuery{resps: []scriptedResp{{val: 0}, {val: 42}}}
+		start := time.Now()
+		o := pollAbsenceTripwire(ctx, to, iv, scripted(s))
+		elapsed := time.Since(start)
+		if o.ok {
+			t.Error("ok=true, want false — a non-zero point surfaced")
+		}
+		if !o.confirmed {
+			t.Error("confirmed=false, want true — clean queries preceded the violation")
+		}
+		if o.worst != 42 {
+			t.Errorf("worst=%g, want 42", o.worst)
+		}
+		if elapsed >= to {
+			t.Errorf("did not fail fast: elapsed=%s >= timeout=%s (queries=%d)", elapsed, to, s.n)
+		}
+	})
+
+	t.Run("errors then clean → pass", func(t *testing.T) {
+		s := &scriptedQuery{resps: []scriptedResp{{err: errBoom}, {err: errBoom}, {val: 0}}}
+		o := pollAbsenceTripwire(ctx, to, iv, scripted(s))
+		if !o.ok {
+			t.Errorf("ok=false, want true (a later clean zero confirms absence): %+v", o)
+		}
+		if !o.confirmed {
+			t.Error("confirmed=false, want true — a clean query eventually ran")
+		}
+	})
 }

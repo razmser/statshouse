@@ -88,9 +88,9 @@ type clientDriver struct {
 // order a default (no --client) run executes them. Adding a client here (and to
 // e2e/clients.txt) is all the wiring the main loop needs.
 var clientDrivers = []clientDriver{
-	{name: goClientName, tag: "go", buildRun: buildAndRunGoClient},
-	{name: rustClientName, tag: "rust", buildRun: buildAndRunRustClient},
-	{name: cppClientName, tag: "cpp", buildRun: buildAndRunCppClient},
+	{name: goClientName, tag: goClientTag, buildRun: buildAndRunGoClient},
+	{name: rustClientName, tag: rustClientTag, buildRun: buildAndRunRustClient},
+	{name: cppClientName, tag: cppClientTag, buildRun: buildAndRunCppClient},
 }
 
 // selectDrivers resolves the repeatable --client selectors to the drivers to
@@ -464,7 +464,31 @@ func runClientPhase(ctx context.Context, rt Runtime, rec *recorder, d clientDriv
 	if !werrOK {
 		failed++ // count the silent-loss failure alongside any value mismatches
 	}
-	rec.logf("%s: assertions: %d PASS, %d FAIL", d.name, passed, failed)
+
+	// ticket 12: rejection statuses (criterion 2), conservation ledger (criteria
+	// 3+5), and the whole-run sampling tripwire (criterion 4). They run AFTER the
+	// visible matrix so any sampling on a queried view is already caught; each
+	// prints its own labelled PASS/FAIL lines inside. Only their FAILURES fold into
+	// the client total — the matrix PASS count (passed) stays at the 17 (metric,
+	// func) pairs, so the run summary still reads "N metric/func assertion(s)"
+	// while the ledger/rejection/sampling lines stand as their own evidence.
+	rjPassed, rjFailed := assertRejections(ctx, rec, o.apiAddr, d.tag, stream)
+	ldPassed, ldFailed := assertConservationLedger(ctx, rec, o.apiAddr, d.tag, stream)
+	if ok, det := assertNoAggSampling(ctx, o.apiAddr, d.tag, stream.Base); !ok {
+		failed++
+		const samplingTripwire = "agg sampling tripwire (__agg_sampling_factor non-zero)"
+		rec.logf("FAIL %s: %s\n%s", d.name, samplingTripwire, indent(det))
+		fmt.Printf("FAIL %s: %s\n", d.tag, samplingTripwire)
+	} else {
+		// Echo the PASS so the tripwire's success is explicit evidence in the run
+		// log, mirroring the ledger/rejection lines — a silent tripwire is
+		// indistinguishable from one that never ran.
+		rec.logf("PASS %s: agg sampling tripwire — %s absent/zero across the run", d.name, aggSamplingFactorMetric)
+		fmt.Printf("PASS %s: agg sampling tripwire — __agg_sampling_factor absent\n", d.tag)
+	}
+	failed += rjFailed + ldFailed
+	rec.logf("%s: assertions: %d PASS, %d FAIL (matrix %d, rejections %d/%d, ledger %d/%d)",
+		d.name, passed, failed, passed, rjPassed, rjPassed+rjFailed, ldPassed, ldPassed+ldFailed)
 	if failed == 0 {
 		fmt.Printf("PASS %s: %d metric/func assertion(s) matched\n", d.tag, passed)
 	} else {

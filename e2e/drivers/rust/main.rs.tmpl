@@ -129,6 +129,10 @@ fn driver_main() {
     statshouse::MetricBuilder::new(b"{{rustBytes .Metric}}"){{- range .Tags}}.tag(b"{{rustBytes .Key}}", b"{{rustBytes .Val}}"){{- end}}.write_count(&mut t, {{rustFloat .Count}}, {{.TS}});
     {{- else if eq .Kind "value"}}
     statshouse::MetricBuilder::new(b"{{rustBytes .Metric}}"){{- range .Tags}}.tag(b"{{rustBytes .Key}}", b"{{rustBytes .Val}}"){{- end}}.write_values(&mut t, &[{{range .Values}}{{rustFloat .}},{{end}}], 0.0, {{.TS}});
+    {{- else if eq .Kind "value_nan"}}
+    statshouse::MetricBuilder::new(b"{{rustBytes .Metric}}"){{- range .Tags}}.tag(b"{{rustBytes .Key}}", b"{{rustBytes .Val}}"){{- end}}.write_value(&mut t, f64::NAN, {{.TS}});
+    {{- else if eq .Kind "value_inf"}}
+    statshouse::MetricBuilder::new(b"{{rustBytes .Metric}}"){{- range .Tags}}.tag(b"{{rustBytes .Key}}", b"{{rustBytes .Val}}"){{- end}}.write_value(&mut t, f64::INFINITY, {{.TS}});
     {{- else if eq .Kind "value_p"}}
     {{- if eq .Gen.Kind "valueUniform"}}
     {

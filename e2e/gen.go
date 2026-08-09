@@ -186,3 +186,116 @@ func repeatChar(c byte, n int) string {
 	}
 	return string(buf)
 }
+
+// --- ticket 12: rejection cases (spec §5) ------------------------------------
+//
+// addRejections builds the four spec §5 rejection inputs as DEDICATED metrics so
+// their rejections never bleed into a normal metric's expected model. Each write is
+// rejected by the pipeline and asserted through __src_ingestion_status (the exact
+// status) plus the conservation ledger — never via visible output.
+//
+// CLIENT-SIDE REJECTION is the crux of "conservation of input: nothing accepted
+// silently disappears". The go client only sends a counter when countToSend > 0
+// (statshouse-go/client_bucket.go: send's `if b.countToSend > 0` guard) and the
+// rust client rejects count <= 0 inside write_count (statshouse-rs/lib.rs: `if
+// count <= 0. { return false }`). So a ZERO or NEGATIVE count is dropped by BOTH
+// before it ever reaches the agent — no server-side status is recorded, and there
+// is nothing for the ledger to account for (the input never entered the pipeline;
+// the drop is an explicit client decision, not a silent loss). The cpp client
+// (statshouse-cpp: write_count_impl has no such guard) sends count <= 0, so the
+// server rejects it (62 zero_counter / 25 negative_counter). We therefore generate
+// the counter-rejection metrics as REAL writes for cpp (the server records 62/25);
+// for go/rust it records the same two cases as Sent==false SKIP entries — no writes,
+// since the input never reached the agent — so assertRejections prints an explicit
+// SKIP line per case instead of the cases being invisible ("rejections 2/2" with no
+// trace of what a cpp run would exercise). The value cases (NaN / +Inf) are sent by
+// all three clients — none validates value payloads — so they are generated as real
+// writes for every client.
+func (b *streamBuilder) addRejections(clientTag string) {
+	switch clientTag {
+	case cppClientTag:
+		// cpp sends count<=0 (no client-side guard) → the server rejects it
+		// (ValidateMetricData→62 / ValidateCounter→25). Real writes, Sent==true.
+		b.addRejectionCounter("c_zero", 0, statusNameZeroCounter, statusIDZeroCounter)
+		b.addRejectionCounter("c_neg", -5, statusNameNegCounter, statusIDNegCounter)
+	default:
+		// go/rust DROP count<=0 before the wire (see the note above): no packet
+		// reaches the agent, so there is no server status and nothing for the ledger
+		// to account. Record the case Sent==false so it surfaces as a documented SKIP
+		// rather than silently disappearing. No writes are appended.
+		b.addRejectionCounterSkipped("c_zero", statusNameZeroCounter, statusIDZeroCounter)
+		b.addRejectionCounterSkipped("c_neg", statusNameNegCounter, statusIDNegCounter)
+	}
+	// Value rejections are sent by all three clients (none validates value payloads).
+	b.addRejectionValue("v_nan", kindValueNaN, statusNameNanInfValue, statusIDNanInfValue)
+	b.addRejectionValue("v_inf", kindValueInf, statusNameTooBigValue, statusIDTooBigValue)
+}
+
+// addRejectionCounter builds one counter metric whose every write carries an
+// invalid count (zero or negative) that the server rejects (ValidateMetricData →
+// 62 / ValidateCounter → 25). The writes use the plain counter kind, so the
+// existing driver counter branch renders them. cpp sends count <= 0 (no client-side
+// guard), so addRejections calls this only for cpp: every entry is Sent==true and
+// the ledger accounts its numBuckets writes as rejected.
+func (b *streamBuilder) addRejectionCounter(suffix string, count float64, statusName string, statusID int32) {
+	name := b.prefix + suffix
+	for i := 0; i < numBuckets; i++ {
+		ts := b.base + uint32(i)
+		b.writes = append(b.writes, metricWrite{Kind: kindCounter, Metric: name, Count: count, TS: ts})
+	}
+	if n := len(name); n > b.maxKey {
+		b.maxKey = n
+	}
+	b.rejections = append(b.rejections, rejectionMetric{
+		Name:       name,
+		Kind:       kindCounter,
+		StatusName: statusName,
+		StatusID:   statusID,
+		Writes:     numBuckets,
+		Sent:       true,
+	})
+}
+
+// addRejectionCounterSkipped records a counter-rejection case the client DROPS
+// client-side (go/rust refuse count<=0 before the wire — see addRejections). Unlike
+// addRejectionCounter it appends NO writes: the input never reaches the agent, so
+// there is no server status and nothing for the conservation ledger to balance. It
+// marks the rejection Sent==false with a SkipReason so assertRejections renders an
+// explicit SKIP line — a documented client-side drop, not a silent disappearance.
+func (b *streamBuilder) addRejectionCounterSkipped(suffix, statusName string, statusID int32) {
+	name := b.prefix + suffix
+	b.rejections = append(b.rejections, rejectionMetric{
+		Name:       name,
+		Kind:       kindCounter,
+		StatusName: statusName,
+		StatusID:   statusID,
+		Writes:     0,
+		Sent:       false,
+		SkipReason: "client drops count<=0 before the wire",
+	})
+}
+
+// addRejectionValue builds one value metric whose every write carries a single
+// invalid float (NaN or +Inf) that the server rejects (ValidateValue → 23 / 61).
+// NaN/+Inf are not valid float literals in any driver language, so the write uses
+// a dedicated kind (kindValueNaN/kindValueInf) rendered by a dedicated template
+// branch (math.NaN()/f64::NAN/NAN, …). The metric auto-creates as a VALUE metric
+// from its valid value=1 seed.
+func (b *streamBuilder) addRejectionValue(suffix, kind, statusName string, statusID int32) {
+	name := b.prefix + suffix
+	for i := 0; i < numBuckets; i++ {
+		ts := b.base + uint32(i)
+		b.writes = append(b.writes, metricWrite{Kind: kind, Metric: name, TS: ts})
+	}
+	if n := len(name); n > b.maxKey {
+		b.maxKey = n
+	}
+	b.rejections = append(b.rejections, rejectionMetric{
+		Name:       name,
+		Kind:       kind,
+		StatusName: statusName,
+		StatusID:   statusID,
+		Writes:     numBuckets,
+		Sent:       true,
+	})
+}

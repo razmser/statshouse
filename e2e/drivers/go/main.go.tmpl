@@ -56,6 +56,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"time"
@@ -136,6 +137,10 @@ func main() {
 	c.NamedCountHistoric({{printf "%q" .Metric}}, statshouse.NamedTags{ {{- range .Tags}}{ {{printf "%q" .Key}}, {{printf "%q" .Val}} }, {{end}} }, {{printf "%v" .Count}}, {{.TS}})
 	{{- else if eq .Kind "value"}}
 	c.NamedValuesHistoric({{printf "%q" .Metric}}, statshouse.NamedTags{ {{- range .Tags}}{ {{printf "%q" .Key}}, {{printf "%q" .Val}} }, {{end}} }, []float64{ {{- range .Values}}{{printf "%v" .}}, {{end}} }, {{.TS}})
+	{{- else if eq .Kind "value_nan"}}
+	c.NamedValuesHistoric({{printf "%q" .Metric}}, statshouse.NamedTags{ {{- range .Tags}}{ {{printf "%q" .Key}}, {{printf "%q" .Val}} }, {{end}} }, []float64{math.NaN()}, {{.TS}})
+	{{- else if eq .Kind "value_inf"}}
+	c.NamedValuesHistoric({{printf "%q" .Metric}}, statshouse.NamedTags{ {{- range .Tags}}{ {{printf "%q" .Key}}, {{printf "%q" .Val}} }, {{end}} }, []float64{math.Inf(1)}, {{.TS}})
 	{{- else if eq .Kind "value_p"}}
 	{{- if eq .Gen.Kind "valueUniform"}}
 	{

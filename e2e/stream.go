@@ -51,12 +51,79 @@ const fullKeyCap = 768
 // value if IsSetValue). kindValueP NEVER auto-creates, so the harness pre-creates
 // it via POST /api/metric before the client runs (metric_create.go). kindStag is a
 // counter metric whose assertion is cardinality (qw=cardinality, no group-by).
+//
+// kindValueNaN/kindValueInf (ticket 12) are REJECTED value payloads — a NaN and a
+// +Inf — every write of which the pipeline rejects. They auto-create as VALUE
+// metrics from a kind-matching (valid, value=1) seed, then the real writes are
+// rejected and asserted via __src_ingestion_status (status 23 / 61). They are
+// rendered by dedicated template branches because NaN/+Inf are not valid float
+// literals in any of the three driver languages (a plain {{printf "%v"}} would
+// emit "NaN"/"+Inf", which none of go/rust/cpp compile).
 const (
-	kindCounter = "counter"
-	kindValue   = "value"
-	kindValueP  = "value_p"
-	kindUnique  = "unique"
-	kindStag    = "stag"
+	kindCounter  = "counter"
+	kindValue    = "value"
+	kindValueP   = "value_p"
+	kindUnique   = "unique"
+	kindStag     = "stag"
+	kindValueNaN = "value_nan" // rejected value payload: NaN  → status 23 err_nan_inf_value
+	kindValueInf = "value_inf" // rejected value payload: +Inf → status 61 err_too_big_value
+)
+
+// --- ticket 12: rejection cases + conservation ledger ------------------------
+//
+// __src_ingestion_status (builtin metric ID -11, internal/format/builtin_metrics:
+// BuiltinMetricMetaIngestionStatus) is the per-event accounting record the agent
+// writes for every metric observation: status=ok_cached (10) when accepted, or one
+// err_* status when rejected. Its tags are positional: tag1=metric (the referenced
+// metric NAME), tag2=status (rendered as the numeric VALUE ID via format.CodeTagValue
+// — e.g. " 10"=ok_cached, " 23"=err_nan_inf_value; the human name lives only in the
+// builtin's ValueComments and is NOT in the query reply), tag3=tag_id, tag4=component.
+// Grouping a query by tag1+tag2 (qb=1&qb=2) yields one series per (metric, status).
+//
+// Source-of-truth status values (internal/format/builtin_tags.go +
+// internal/format/format.go ValidateCounter/ValidateValue):
+//
+//	zero counter   → ValidateMetricData: counter==0 && no value/unique → 62 err_zero_counter
+//	negative count → ValidateCounter: f < 0                               → 25 err_negative_counter
+//	NaN value      → ValidateValue: IsNaN                                  → 23 err_nan_inf_value
+//	+Inf value     → ValidateValue: +Inf > MaxFloat32                      → 61 err_too_big_value
+//
+// NOTE on the spec's "23/24" claim: spec §5 / ticket 12 say a +Inf VALUE yields
+// status 24. The source disagrees — ValidateValue maps +Inf to 61 (too_big_value),
+// and 24 (err_nan_inf_COUNTER) only fires for a NaN COUNTER via ValidateCounter,
+// which no spec-matrix input exercises. Per the ticket's own instruction ("verify
+// against … source of truth") the harness asserts the source-true status 61 and
+// documents the deviation; see DEVIATIONS in the ticket-12 report.
+const (
+	ingestionStatusMetric = "__src_ingestion_status"
+
+	// statusName* are the human DISPLAY names for the __src_ingestion_status tag2
+	// value IDs (mirroring the builtin's ValueComments in internal/format). The query
+	// API does NOT render these names — it renders the numeric ID (CodeTagValue, e.g.
+	// " 23") — so the assertions work in numeric IDs throughout (classifyIngestionSeries
+	// parses the ID, matched against rejectionMetric.StatusID); these name constants
+	// exist only to label PASS/FAIL lines readably. Classification: ok_cached =
+	// accepted, err_* = rejected (a loss), warn_* = warning (accepted, NOT a loss).
+	statusNameOKCached    = "ok_cached"
+	statusNameZeroCounter = "err_zero_counter"     // 62
+	statusNameNegCounter  = "err_negative_counter" // 25
+	statusNameNanInfValue = "err_nan_inf_value"    // 23
+	statusNameTooBigValue = "err_too_big_value"    // 61 (NOT 24 — see note above)
+
+	// statusID* mirror the numeric IDs the query API renders (CodeTagValue); the
+	// assertions key off these IDs (what the API actually returns), not the names.
+	statusIDZeroCounter = 62
+	statusIDNegCounter  = 25
+	statusIDNanInfValue = 23
+	statusIDTooBigValue = 61
+
+	// clientTag* are the per-client metric-name prefixes / --client selectors,
+	// matching the tags in clientDrivers (main.go). addRejections branches on them
+	// to model client-side rejection behavior (go/rust drop non-positive counts;
+	// cpp sends them).
+	goClientTag   = "go"
+	rustClientTag = "rust"
+	cppClientTag  = "cpp"
 )
 
 // tag is one positional StatsHouse tag: Key is the tag index ("0".."47"), Val its
@@ -137,12 +204,37 @@ type metricModel struct {
 }
 
 // metricStream is the single generated stream: Base anchors the buckets, Writes
-// is injected into every client driver (the "pinned seed"), and Metrics is the
-// shared expected model the assertions compare against.
+// is injected into every client driver (the "pinned seed"), Metrics is the
+// shared expected model the VISIBLE assertions compare against, and Rejections
+// (ticket 12) are the rejection-case metrics — every write rejected by the
+// pipeline, asserted via __src_ingestion_status + the conservation ledger, never
+// via visible output (so they stay out of Metrics and thus out of assertStream).
 type metricStream struct {
-	Base    uint32
-	Writes  []metricWrite
-	Metrics []metricModel
+	Base       uint32
+	Writes     []metricWrite
+	Metrics    []metricModel
+	Rejections []rejectionMetric
+}
+
+// rejectionMetric is one metric whose every write the pipeline REJECTS (Sent==true),
+// or — for go/rust's counter cases — every write the CLIENT drops before the wire
+// (Sent==false). It has no visible output either way. A Sent==true rejection is
+// asserted two ways: (1) the exact __src_ingestion_status status (StatusName) appears
+// with count == Writes, and (2) the conservation ledger balances for it
+// (sentWrites == 0 ok_cached + Writes rejected). Sent==false marks a case the client
+// drops CLIENT-SIDE — the go client only sends a counter when countToSend > 0
+// (client_bucket.go) and rust rejects count <= 0 inside write_count (lib.rs), so a
+// zero/negative count never reaches the agent and no server status is recorded: the
+// case has no writes (Writes==0) and is asserted as an explicit SKIP (assertRejections
+// prints SkipReason), documenting the drop rather than letting it pass silently.
+type rejectionMetric struct {
+	Name       string // e2e_<runID>_<client>_c_zero, …
+	Kind       string // kindCounter / kindValueNaN / kindValueInf (driver render + seed kind)
+	StatusName string // expected __src_ingestion_status name (err_zero_counter, …)
+	StatusID   int32  // numeric status (62/25/23/61) — diagnostics only
+	Writes     int    // sentWrites: #writes the harness generated for this metric
+	Sent       bool   // false ⇒ client drops client-side; ledger/status skip
+	SkipReason string // documented reason when Sent==false
 }
 
 // generateStream builds the full spec §5 stream once. The same Writes slice is
@@ -173,20 +265,22 @@ func generateStream(runID, clientTag string, now time.Time) metricStream {
 	b.addValueP()
 	b.addUnique()
 	b.addStag()
+	b.addRejections(clientTag)
 	if b.maxKey > fullKeyCap {
 		panic(fmt.Sprintf("e2e: generated full key %d B exceeds cap %d B", b.maxKey, fullKeyCap))
 	}
-	return metricStream{Base: base, Writes: b.writes, Metrics: b.metrics}
+	return metricStream{Base: base, Writes: b.writes, Metrics: b.metrics, Rejections: b.rejections}
 }
 
 // streamBuilder accumulates writes + the expected model and tracks the max
 // rendered key length for the fullKeyCap guard.
 type streamBuilder struct {
-	prefix  string
-	base    uint32
-	writes  []metricWrite
-	metrics []metricModel
-	maxKey  int
+	prefix     string
+	base       uint32
+	writes     []metricWrite
+	metrics    []metricModel
+	rejections []rejectionMetric
+	maxKey     int
 }
 
 // counterSeriesSpec is one counter series: raw tags + a per-bucket count fn.
@@ -288,10 +382,13 @@ func (b *streamBuilder) addCounters() {
 // seedKind returns the wire-write kind a driver must use to SEED this metric
 // during cold-start pre-warm so auto-create derives the right metric kind
 // (value/unique auto-create only from a kind-matching seed). value_p is
-// pre-created, so its seed kind is harmless; value matches its kind.
+// pre-created, so its seed kind is harmless; value matches its kind. The rejected
+// value kinds (value_nan/value_inf) seed as a plain VALUE so auto-create derives
+// a value metric — the seed itself is a valid value=1 write (the real, rejected
+// writes come after pre-warm).
 func seedKind(kind string) string {
 	switch kind {
-	case kindValue, kindValueP:
+	case kindValue, kindValueP, kindValueNaN, kindValueInf:
 		return kindValue
 	case kindUnique:
 		return kindUnique
@@ -312,13 +409,26 @@ type seedDef struct {
 // streamSeeds returns the per-metric seeds and the parallel name list the driver
 // templates consume. value/unique metrics seed with a kind-matching write so
 // auto-create derives value/unique (not the counter default); value_p is
-// pre-created by the harness so its seed (a value write) maps cleanly.
+// pre-created by the harness so its seed (a value write) maps cleanly. A Sent==true
+// rejection seeds with a VALID kind-matching write (count=1 / value=1) so auto-create
+// provisions the metric; the seed itself is dropped on arrival (unmapped → status
+// metric_not_found in __src_ingestion_status_no_shard, NOT in this metric's
+// ledger), and the real rejected writes follow after pre-warm. A Sent==false
+// rejection (go/rust counter drop) is NOT seeded: the client never sends it, so a
+// seed would only orphan an empty metric with no writes to follow.
 func streamSeeds(stream metricStream) (seeds []seedDef, names []string) {
-	seeds = make([]seedDef, 0, len(stream.Metrics))
-	names = make([]string, 0, len(stream.Metrics))
+	seeds = make([]seedDef, 0, len(stream.Metrics)+len(stream.Rejections))
+	names = make([]string, 0, len(stream.Metrics)+len(stream.Rejections))
 	for _, m := range stream.Metrics {
 		seeds = append(seeds, seedDef{Name: m.Name, Kind: seedKind(m.Kind)})
 		names = append(names, m.Name)
+	}
+	for _, r := range stream.Rejections {
+		if !r.Sent {
+			continue // client drops client-side before the wire; no real writes follow → no seed
+		}
+		seeds = append(seeds, seedDef{Name: r.Name, Kind: seedKind(r.Kind)})
+		names = append(names, r.Name)
 	}
 	return seeds, names
 }

@@ -82,12 +82,20 @@ func TestGenerateStream(t *testing.T) {
 		}
 		wantWrites += len(m.Series) * nb
 	}
+	// ticket 12: the rejection metrics append their own writes (one per bucket per
+	// rejection) to s.Writes — they are NOT in s.Metrics (rejected inputs have no
+	// visible model), so they must be added to the expected write total separately.
+	rejNames := make(map[string]bool, len(s.Rejections))
+	for _, r := range s.Rejections {
+		wantWrites += r.Writes
+		rejNames[r.Name] = true
+	}
 	if totalSeries == 0 {
 		t.Fatal("no series generated")
 	}
 
 	if len(s.Writes) != wantWrites {
-		t.Errorf("len(Writes) = %d, want %d (Σ series×buckets)", len(s.Writes), wantWrites)
+		t.Errorf("len(Writes) = %d, want %d (Σ series×buckets + rejection writes)", len(s.Writes), wantWrites)
 	}
 
 	// Every write timestamps inside the asserted window, carries the prefix, and
@@ -101,13 +109,19 @@ func TestGenerateStream(t *testing.T) {
 		}
 		switch w.Kind {
 		case kindCounter, kindStag:
-			if w.Count <= 0 {
-				t.Errorf("%s write count %g, want > 0 (zero/negative is ticket 12)", w.Metric, w.Count)
+			// Normal counter/stag writes carry a positive count; the ticket-12
+			// counter-REJECTION writes (cpp only: c_zero/c_neg) legitimately carry
+			// zero/negative, so the >0 check is scoped to non-rejection metrics.
+			if w.Count <= 0 && !rejNames[w.Metric] {
+				t.Errorf("%s write count %g, want > 0 (only rejection metrics may be ≤0)", w.Metric, w.Count)
 			}
 		case kindValue:
 			if len(w.Values) == 0 {
 				t.Errorf("%s value write has no values", w.Metric)
 			}
+		case kindValueNaN, kindValueInf:
+			// Rejected value payloads (NaN/+Inf) carry no Values slice — they render
+			// via dedicated template branches; nothing to validate beyond the kind.
 		case kindValueP, kindUnique:
 			if w.Gen == nil {
 				t.Errorf("%s %s write has no generator (Gen==nil)", w.Metric, w.Kind)

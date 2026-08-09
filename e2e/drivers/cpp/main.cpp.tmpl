@@ -57,8 +57,10 @@
 #include <unistd.h>       // read, write, close, sleep, usleep
 
 #include <cstdint>
+#include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -247,6 +249,10 @@ int main() {
         const std::vector<double> v{ {{range .Values}}{{cFloat .}},{{end}} };
         transport.metric("{{cString .Metric}}"){{- range .Tags}}.tag("{{cString .Key}}", "{{cString .Val}}"){{- end}}.write_values(v.data(), v.size(), 0.0, {{.TS}});
     }
+    {{- else if eq .Kind "value_nan"}}
+    transport.metric("{{cString .Metric}}"){{- range .Tags}}.tag("{{cString .Key}}", "{{cString .Val}}"){{- end}}.write_value(std::numeric_limits<double>::quiet_NaN(), {{.TS}});
+    {{- else if eq .Kind "value_inf"}}
+    transport.metric("{{cString .Metric}}"){{- range .Tags}}.tag("{{cString .Key}}", "{{cString .Val}}"){{- end}}.write_value(std::numeric_limits<double>::infinity(), {{.TS}});
     {{- else if eq .Kind "value_p"}}
     {{- if eq .Gen.Kind "valueUniform"}}
     {
