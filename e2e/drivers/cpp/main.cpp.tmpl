@@ -1,16 +1,15 @@
-{{- /* Driver template for the cpp StatsHouse client (spec §4).
+{{- /* Driver template for the cpp StatsHouse client (spec §4/§5).
 
-   Rendered by the e2e harness (Go text/template) from the single generated
-   counter stream (e2e/stream.go). "Pinned seed" = injection: the exact writes
-   below are the same observations the harness asserts against — there is no
-   per-language RNG. This is a harness-owned program, NOT the upstream client's
-   example/main.cpp.
+   Rendered by the e2e harness (Go text/template) from the single generated metric
+   stream (e2e/stream.go). "Pinned seed" = injection: the exact writes below are
+   the same observations the harness asserts against — there is no per-language
+   RNG. This is a harness-owned program, NOT the upstream client's example/main.cpp.
 
    WIRE BEHAVIOR of statshouse-cpp @ 112a449 (the pinned source of truth):
-   - No client-side aggregation: write_count serializes one TL counter item
-     carrying the explicit ts passed in (write_count_impl → pack_header with the
-     given tsUnixSec), so bucket assignment is exact regardless of flush jitter.
-     ts=0 would mean "now"; every write below passes an explicit historic ts.
+   - No client-side aggregation: every write serializes one TL item carrying the
+     explicit ts passed in (write_*_impl → pack_header with the given tsUnixSec),
+     so bucket assignment is exact regardless of flush jitter. ts=0 would mean
+     "now"; every write below passes an explicit historic ts.
    - TCP transport sends the "statshousev2" handshake (TransportTCP ctor →
      build_tcp_handshake_v2, statshouse.hpp). The agent's hijack listener accepts
      it (internal/receiver/tcp_handshake.go: TCPMagicV2Balancer), the same
@@ -19,7 +18,9 @@
      getaddrinfo, which accepts an IP literal directly (no DNS), so an
      IP-only STATSHOUSE_ADDR on the container network connects at once.
    - write_count does not reject count <= 0 (it always serializes), but every
-     count here (seeds included) is > 0.
+     count here (seeds included) is > 0. write_value/write_values/write_unique(s)
+     carry count=0; the agent defaults count to the value count, irrelevant to
+     value/value_p/unique assertions.
    - Tags are sent verbatim, empty values included (cpp has no empty-drop like
      go). The harness normalizes empty tags away when comparing (assert.go:
      tagSignature).
@@ -28,16 +29,22 @@
      would skip the destructor and lose the tail batch. The harness waits for
      this process's clean exit before asserting.
 
+   KIND DISPATCH (spec §5): counter/stag → write_count; value → write_values with
+   a literal payload; value_p/unique large payloads → a deterministic generator
+   loop (genSpec) reproducing the EXACT formula in quantile.go. The LCG relies on
+   unsigned long long overflow being DEFINED to wrap (mod 2^64) in C++, `(unsigned)
+   (x>>32)%1000`, and `(double)r*(double)r/1000.0` — bit-identical to go/rust.
+
    COLD-START PRE-WARM, same rationale as the go/rust drivers: the agent drops
    the first packet for any metric name not yet in its mapping (it async-asks
    metadata to auto-create), so a short-lived driver loses its whole payload to
-   that window. We send one count=1 seed per metric (itself dropped — it IS the
-   first packet, so it triggers the same unmapped window, but its arrival is what
-   triggers auto-create), then poll /api/metrics-list until metadata has created
-   every metric. After a 2s settle the agent's longpoll mapping subscription has
-   caught up and the real stream maps cleanly. Seeds use ts=base-60 (outside the
-   asserted [base, base+70] window) so even a seed that landed could not perturb
-   an assertion bucket.
+   that window. We send one kind-matching seed per metric — value/unique MUST seed
+   with their kind so auto-create derives value/unique, not the counter default
+   (value_p is pre-created, so its value seed is harmless) — then poll
+   /api/metrics-list until metadata has created every metric. After a 2s settle
+   the agent's longpoll mapping subscription has caught up and the real stream
+   maps cleanly. Seeds use ts=base-60 (outside the asserted [base, base+70]
+   window) so even a seed that landed could not perturb an assertion bucket.
 
    The driver is header-only (single include of statshouse.hpp); the pre-warm
    poll uses POSIX sockets directly since there is no HTTP client dependency. */ -}}
@@ -59,8 +66,9 @@ namespace {
 
 constexpr uint32_t kSeedTS = {{.SeedTS}};
 
-// kMetrics is the metric names this driver writes; used both for the cold-start
-// seeds and the /api/metrics-list pre-warm poll.
+// kMetrics is the metric names this driver writes; used for the /api/metrics-list
+// pre-warm poll. (The cold-start seeds below are rendered kind-aware inline, one
+// per metric, so the name list is the poll's only consumer here.)
 const char *const kMetrics[] = {
     {{- range .Metrics}}
     "{{cString .}}",
@@ -131,7 +139,7 @@ std::string http_get(const std::string &host, int port, const std::string &path)
 // on timeout. A timeout is a HARD failure: the agent↔agg path is almost certainly
 // down (metrics never get created), so the driver returns non-zero
 // (preWarmExit=3) rather than writing a payload the harness would then report as
-// 6 cryptic "series absent" failures. A substring match suffices — the e2e_
+// N cryptic "series absent" failures. A substring match suffices — the e2e_
 // metric names are unique.
 bool wait_metrics_exist(const std::string &host, int port) {
     std::vector<std::string> want;
@@ -174,11 +182,31 @@ int main() {
     // variant the go driver proved works there.
     statshouse::TransportTCP transport(agent_host, agent_port);
 
-    // One count=1 seed per metric: dropped on arrival (unmapped), but it is the
-    // packet that triggers metadata auto-create for the name.
-    for (const char *m : kMetrics) {
-        transport.metric(m).write_count(1.0, kSeedTS);
-    }
+    // The base transport defaults max_payload_size to DEFAULT_DATAGRAM_SIZE (1232
+    // B), and only raises it to MAX_DATAGRAM_SIZE when the agent is on localhost
+    // (statshouse.hpp set_max_udp_packet_size comment). The in-container agent is
+    // at 192.168.65.x, NOT localhost, so without this the 100k-unique / 2k-value
+    // writes fragment into ~650 tiny packets each and overflow the 512-deep TCP
+    // send queue (tcpConnBucketCount) — packets are dropped under backpressure and
+    // u_exact/u_approx/s_dist lose data. 65507 (MAX_DATAGRAM_SIZE) matches the
+    // go/rust ~64 KB packets, so the whole burst is ~164 packets, well under the
+    // queue depth, and value/unique payloads land unsplit (same accumulation order
+    // as go → exact sum). The setter clamps to MAX_DATAGRAM_SIZE internally.
+    transport.set_max_udp_packet_size(65507);
+
+    // One kind-matching seed per metric: dropped on arrival (unmapped), but it is
+    // the packet that triggers metadata auto-create for the name. value/unique
+    // MUST seed with their kind so auto-create derives value/unique, not the
+    // counter default (value_p is pre-created, so its value seed is harmless).
+    {{- range .Seeds}}
+    {{- if eq .Kind "value"}}
+    transport.metric("{{cString .Name}}").write_value(1.0, kSeedTS);
+    {{- else if eq .Kind "unique"}}
+    transport.metric("{{cString .Name}}").write_unique(static_cast<uint64_t>(1), kSeedTS);
+    {{- else}}
+    transport.metric("{{cString .Name}}").write_count(1.0, kSeedTS);
+    {{- end}}
+    {{- end}}
     // Force the seeds out now. TransportTCP flushes at most once per wall-clock
     // second (maybe_flush: now != packet_ts), so a sub-second seed loop leaves
     // seeds buffered in the transport — and the pre-warm poll below would then
@@ -210,17 +238,56 @@ int main() {
         sleep(2);
     }
 
-    // The real stream: one write_count per generated counter observation. Each
-    // call serializes one TL counter item with the explicit past ts on the wire.
+    // The real stream: one write per generated observation, dispatched on the kind.
     {{- range .Writes}}
+    {{- if or (eq .Kind "counter") (eq .Kind "stag")}}
     transport.metric("{{cString .Metric}}"){{- range .Tags}}.tag("{{cString .Key}}", "{{cString .Val}}"){{- end}}.write_count({{cFloat .Count}}, {{.TS}});
+    {{- else if eq .Kind "value"}}
+    {
+        const std::vector<double> v{ {{range .Values}}{{cFloat .}},{{end}} };
+        transport.metric("{{cString .Metric}}"){{- range .Tags}}.tag("{{cString .Key}}", "{{cString .Val}}"){{- end}}.write_values(v.data(), v.size(), 0.0, {{.TS}});
+    }
+    {{- else if eq .Kind "value_p"}}
+    {{- if eq .Gen.Kind "valueUniform"}}
+    {
+        std::vector<double> v({{.Gen.N}});
+        for (size_t i = 0; i < {{.Gen.N}}; ++i) { v[i] = static_cast<double>(i); }
+        transport.metric("{{cString .Metric}}"){{- range .Tags}}.tag("{{cString .Key}}", "{{cString .Val}}"){{- end}}.write_values(v.data(), v.size(), 0.0, {{.TS}});
+    }
+    {{- else if eq .Gen.Kind "valueSkewed"}}
+    {
+        std::vector<double> v({{.Gen.N}});
+        unsigned long long x = 0x9e3779b97f4a7c15ULL;
+        for (size_t i = 0; i < {{.Gen.N}}; ++i) {
+            x = x * 6364136223846793005ULL + 1442695040888963407ULL;
+            unsigned r = static_cast<unsigned>(x >> 32) % 1000;
+            v[i] = static_cast<double>(r) * static_cast<double>(r) / 1000.0;
+        }
+        transport.metric("{{cString .Metric}}"){{- range .Tags}}.tag("{{cString .Key}}", "{{cString .Val}}"){{- end}}.write_values(v.data(), v.size(), 0.0, {{.TS}});
+    }
+    {{- end}}
+    {{- else if eq .Kind "unique"}}
+    {{- if eq .Gen.Kind "uniqueDistinct"}}
+    {
+        std::vector<uint64_t> u({{.Gen.N}});
+        for (size_t i = 0; i < {{.Gen.N}}; ++i) { u[i] = static_cast<uint64_t>(i) + 1; }
+        transport.metric("{{cString .Metric}}"){{- range .Tags}}.tag("{{cString .Key}}", "{{cString .Val}}"){{- end}}.write_unique(u.data(), u.size(), 0.0, {{.TS}});
+    }
+    {{- else if eq .Gen.Kind "uniqueDedup"}}
+    {
+        std::vector<uint64_t> u(static_cast<size_t>({{.Gen.N}}) * 2);
+        for (size_t i = 0; i < static_cast<size_t>({{.Gen.N}}) * 2; ++i) { u[i] = static_cast<uint64_t>(i % {{.Gen.N}}) + 1; }
+        transport.metric("{{cString .Metric}}"){{- range .Tags}}.tag("{{cString .Key}}", "{{cString .Val}}"){{- end}}.write_unique(u.data(), u.size(), 0.0, {{.TS}});
+    }
+    {{- end}}
+    {{- end}}
     {{- end}}
 
     // Explicit flush, then `transport` is destroyed at the end of main, whose
     // destructor force-flushes again. Do NOT call std::exit — it skips the
     // destructor and the tail batch is lost.
     transport.flush();
-    std::cerr << "statshouse-cpp driver: wrote {{len .Writes}} counters to "
+    std::cerr << "statshouse-cpp driver: wrote {{len .Writes}} observations to "
               << agent_host << ":" << agent_port << std::endl;
     return 0;
 }

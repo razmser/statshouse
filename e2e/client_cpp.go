@@ -79,10 +79,10 @@ func cFloatLit(f float64) string {
 	return s
 }
 
-// renderCppDriver renders the counter stream into <outDir>/main.cpp via the cpp
+// renderCppDriver renders the metric stream into <outDir>/main.cpp via the cpp
 // driver template, binding the cString/cFloat escapers. See renderDriver for the
 // shared parse/execute contract.
-func renderCppDriver(tmplPath string, stream counterStream, outDir string) error {
+func renderCppDriver(tmplPath string, stream metricStream, outDir string) error {
 	return renderDriver(tmplPath, "cpp-driver", template.FuncMap{
 		"cString": cStringLit,
 		"cFloat":  cFloatLit,

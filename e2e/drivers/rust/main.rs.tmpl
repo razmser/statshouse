@@ -1,13 +1,12 @@
-{{- /* Driver template for the rust StatsHouse client (spec §4).
+{{- /* Driver template for the rust StatsHouse client (spec §4/§5).
 
-   Rendered by the e2e harness (Go text/template) from the single generated
-   counter stream (e2e/stream.go). "Pinned seed" = injection: the exact writes
-   below are the same observations the harness asserts against — there is no
-   per-language RNG. This is a harness-owned program, NOT the upstream client's
-   test_template.txt.
+   Rendered by the e2e harness (Go text/template) from the single generated metric
+   stream (e2e/stream.go). "Pinned seed" = injection: the exact writes below are
+   the same observations the harness asserts against — there is no per-language
+   RNG. This is a harness-owned program, NOT the upstream client's test_template.txt.
 
    WIRE BEHAVIOR of statshouse-rs @ 43b4a629 (the pinned source of truth):
-   - No client-side aggregation: every write_count serializes one TL item with the
+   - No client-side aggregation: every write serializes one TL item with the
      explicit ts passed in, so bucket assignment is exact regardless of flush jitter.
    - TCP transport sends the "statshousev1" handshake (lib.rs: TCP_HANDSHAKE). The
      agent's hijack listener accepts it (internal/receiver/tcp_handshake.go:
@@ -15,21 +14,34 @@
      the upstream rust template (which HARDCODES 127.0.0.1:13337), this driver
      honors STATSHOUSE_ADDR, as spec §4 requires.
    - write_count rejects count <= 0, so every count here (seeds included) is > 0.
+   - write_value/write_values pass count=0 → the counter field is omitted
+     (should_write_counter(count, len) is false for 0), so the agent defaults count
+     to len(values); irrelevant to value/value_p (we assert sum/min/max/avg and
+     percentiles, not count).
+   - write_uniques likewise takes count=0.
    - Tags are sent verbatim, empty values included (rust has no empty-drop like go).
      The harness normalizes empty tags away when comparing (assert.go: tagSignature).
    - Flush-on-Drop: Transport::drop calls flush_impl (lib.rs: impl Drop). main must
      return normally — process::exit would skip Drop and lose the tail batch. The
      harness waits for this process's clean exit before asserting.
 
+   KIND DISPATCH (spec §5): counter/stag → write_count; value → write_values with a
+   literal payload; value_p/unique large payloads → a deterministic generator loop
+   (genSpec) reproducing the EXACT formula in quantile.go. The LCG uses
+   wrapping_mul/wrapping_add (Rust panics on overflow in debug; release wraps, but
+   wrapping_* is explicit and matches in both profiles), `>>32` as u32, `%1000`,
+   and `(r as f64)*(r as f64)/1000.0` — bit-identical to go/cpp.
+
    COLD-START PRE-WARM, same rationale as the go driver: the agent drops the first
    packet for any metric name not yet in its mapping (it async-asks metadata to
    auto-create), so a short-lived driver loses its whole payload to that window. We
-   send one count=1 seed per metric (itself dropped — it IS the first packet, so it
-   triggers the same unmapped window, but its arrival is what triggers auto-create),
-   then poll /api/metrics-list until metadata has created every metric. After a 2s
-   settle the agent's longpoll mapping subscription has caught up and the real
-   stream maps cleanly. Seeds use ts=base-60 (outside the asserted [base, base+70]
-   window) so even a seed that landed could not perturb an assertion bucket.
+   send one kind-matching seed per metric — value/unique MUST seed with their kind
+   so auto-create derives value/unique, not the counter default (value_p is
+   pre-created, so its value seed is harmless) — then poll /api/metrics-list until
+   metadata has created every metric. After a 2s settle the agent's longpoll mapping
+   subscription has caught up and the real stream maps cleanly. Seeds use ts=base-60
+   (outside the asserted [base, base+70] window) so even a seed that landed could
+   not perturb an assertion bucket.
 
    The statshouse crate is zero-dependency (pure std), so there is no HTTP client
    library available — the pre-warm poll uses a minimal hand-rolled HTTP/1.0 GET. */ -}}
@@ -38,6 +50,23 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 fn main() {
+    // The statshouse crate's Transport stores a 64 KB TLBuffer on the stack
+    // (TLBuffer<MAX_PACKET_SIZE>, MAX_PACKET_SIZE = u16::MAX), and this driver is
+    // built UNOPTIMIZED (rustc with no -O, for a reproducible offline single-file
+    // build), so debug stack frames are large; under the container's default
+    // main-thread stack the per-bucket 100k-unique / 2k-value writes overflowed it
+    // ("thread 'main' has overflowed its stack"). Run the driver body on a thread
+    // with a 64 MB stack so the large TLBuffer frames never overflow. Drop
+    // semantics are preserved: Transport drops at the end of driver_main, right
+    // after its explicit flush, so the tail batch is not lost.
+    let handle = std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(driver_main)
+        .expect("statshouse-rs driver: failed to spawn driver thread");
+    handle.join().expect("statshouse-rs driver: driver thread panicked");
+}
+
+fn driver_main() {
     let addr = std::env::var("STATSHOUSE_ADDR").unwrap_or_else(|_| "127.0.0.1:13337".to_string());
     // TCP is the reliable client→agent metric path; UDP loss across containers is
     // silent. The go driver already proved statshousev2 TCP works on :13337; the
@@ -51,11 +80,19 @@ fn main() {
         {{- end}}
     ];
 
-    // One count=1 seed per metric: dropped on arrival (unmapped), but it is the
-    // packet that triggers metadata auto-create for the name. count>0 is mandatory.
-    for m in metrics {
-        statshouse::MetricBuilder::new(m).write_count(&mut t, 1.0, SEED_TS);
-    }
+    // One kind-matching seed per metric: dropped on arrival (unmapped), but it is
+    // the packet that triggers metadata auto-create for the name. value/unique MUST
+    // seed with their kind so auto-create derives value/unique, not the counter
+    // default (value_p is pre-created, so its value seed is harmless).
+    {{- range .Seeds}}
+    {{- if eq .Kind "value"}}
+    statshouse::MetricBuilder::new(b"{{rustBytes .Name}}").write_value(&mut t, 1.0, SEED_TS);
+    {{- else if eq .Kind "unique"}}
+    statshouse::MetricBuilder::new(b"{{rustBytes .Name}}").write_unique(&mut t, 1u64, SEED_TS);
+    {{- else}}
+    statshouse::MetricBuilder::new(b"{{rustBytes .Name}}").write_count(&mut t, 1.0, SEED_TS);
+    {{- end}}
+    {{- end}}
     // Force the seeds out now. The crate flushes at most once per wall-clock
     // second (maybe_flush: last_flush != now), and Transport's last_flush is
     // initialized to the current second in new(), so a sub-second seed loop
@@ -76,7 +113,7 @@ fn main() {
             // path is down. Fail fast with a distinct exit code (preWarmExit=3)
             // BEFORE any real write — there is no tail batch to lose yet (the
             // seeds were flushed above), so an immediate exit is safe and
-            // surfaces the real cause rather than 6 "series absent" failures.
+            // surfaces the real cause rather than N "series absent" failures.
             // (process::exit is normally forbidden because it skips Drop, but at
             // this point nothing is buffered and `t` owns only an idle socket.)
             std::process::exit(3);
@@ -86,23 +123,65 @@ fn main() {
         std::thread::sleep(Duration::from_secs(2));
     }
 
-    // The real stream: one write_count per generated counter observation. Each call
-    // serializes one TL item with the explicit past ts on the wire.
+    // The real stream: one write per generated observation, dispatched on the kind.
     {{- range .Writes}}
+    {{- if or (eq .Kind "counter") (eq .Kind "stag")}}
     statshouse::MetricBuilder::new(b"{{rustBytes .Metric}}"){{- range .Tags}}.tag(b"{{rustBytes .Key}}", b"{{rustBytes .Val}}"){{- end}}.write_count(&mut t, {{rustFloat .Count}}, {{.TS}});
+    {{- else if eq .Kind "value"}}
+    statshouse::MetricBuilder::new(b"{{rustBytes .Metric}}"){{- range .Tags}}.tag(b"{{rustBytes .Key}}", b"{{rustBytes .Val}}"){{- end}}.write_values(&mut t, &[{{range .Values}}{{rustFloat .}},{{end}}], 0.0, {{.TS}});
+    {{- else if eq .Kind "value_p"}}
+    {{- if eq .Gen.Kind "valueUniform"}}
+    {
+        let mut v = vec![0f64; {{.Gen.N}}];
+        for i in 0..{{.Gen.N}} {
+            v[i] = i as f64;
+        }
+        statshouse::MetricBuilder::new(b"{{rustBytes .Metric}}"){{- range .Tags}}.tag(b"{{rustBytes .Key}}", b"{{rustBytes .Val}}"){{- end}}.write_values(&mut t, &v, 0.0, {{.TS}});
+    }
+    {{- else if eq .Gen.Kind "valueSkewed"}}
+    {
+        let mut v = vec![0f64; {{.Gen.N}}];
+        let mut x: u64 = 0x9e3779b97f4a7c15;
+        for i in 0..{{.Gen.N}} {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let r = ((x >> 32) as u32) % 1000;
+            v[i] = (r as f64) * (r as f64) / 1000.0;
+        }
+        statshouse::MetricBuilder::new(b"{{rustBytes .Metric}}"){{- range .Tags}}.tag(b"{{rustBytes .Key}}", b"{{rustBytes .Val}}"){{- end}}.write_values(&mut t, &v, 0.0, {{.TS}});
+    }
+    {{- end}}
+    {{- else if eq .Kind "unique"}}
+    {{- if eq .Gen.Kind "uniqueDistinct"}}
+    {
+        let mut u = vec![0u64; {{.Gen.N}}];
+        for i in 0..{{.Gen.N}} {
+            u[i] = (i as u64) + 1;
+        }
+        statshouse::MetricBuilder::new(b"{{rustBytes .Metric}}"){{- range .Tags}}.tag(b"{{rustBytes .Key}}", b"{{rustBytes .Val}}"){{- end}}.write_uniques(&mut t, &u, 0.0, {{.TS}});
+    }
+    {{- else if eq .Gen.Kind "uniqueDedup"}}
+    {
+        let mut u = vec![0u64; {{.Gen.N}} * 2];
+        for i in 0..({{.Gen.N}} * 2) {
+            u[i] = ((i % {{.Gen.N}}) as u64) + 1;
+        }
+        statshouse::MetricBuilder::new(b"{{rustBytes .Metric}}"){{- range .Tags}}.tag(b"{{rustBytes .Key}}", b"{{rustBytes .Val}}"){{- end}}.write_uniques(&mut t, &u, 0.0, {{.TS}});
+    }
+    {{- end}}
+    {{- end}}
     {{- end}}
 
     // Explicit flush, then `t` drops at the end of main for a final synchronous
     // flush. Do NOT call process::exit — it skips Drop and the tail batch is lost.
     t.flush();
-    eprintln!("statshouse-rs driver: wrote {{len .Writes}} counters to {}", addr);
+    eprintln!("statshouse-rs driver: wrote {{len .Writes}} observations to {}", addr);
 }
 
 // wait_metrics_exist polls /api/metrics-list until every metric name is present
 // (metadata has auto-created them all). Returns true once all are present, false
 // on timeout. A timeout is a HARD failure: the agent↔agg path is almost certainly
 // down (metrics never get created), so the driver exits non-zero (preWarmExit=3)
-// rather than writing a payload the harness would then report as 6 cryptic
+// rather than writing a payload the harness would then report as N cryptic
 // "series absent" failures. A substring match suffices — the e2e_ metric names
 // are unique.
 fn wait_metrics_exist(list_url: &str, metrics: &[&[u8]]) -> bool {

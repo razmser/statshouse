@@ -76,10 +76,10 @@ func rustFloatLit(f float64) string {
 	return s
 }
 
-// renderRustDriver renders the counter stream into <outDir>/main.rs via the rust
+// renderRustDriver renders the metric stream into <outDir>/main.rs via the rust
 // driver template, binding the rustBytes/rustFloat escapers. See renderDriver for
 // the shared parse/execute contract.
-func renderRustDriver(tmplPath string, stream counterStream, outDir string) error {
+func renderRustDriver(tmplPath string, stream metricStream, outDir string) error {
 	return renderDriver(tmplPath, "rust-driver", template.FuncMap{
 		"rustBytes": rustByteStringLit,
 		"rustFloat": rustFloatLit,

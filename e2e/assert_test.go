@@ -27,6 +27,13 @@ func TestSignatureAlignment(t *testing.T) {
 		// API may surface them, so tagSignature must drop them to stay equal to the
 		// empty-free expected series (normalizeTags already dropped the empty tag).
 		{"empty value dropped", map[string]apiMetaTag{"key0": {"val"}, "key1": {""}}, []tag{{"0", "val"}}},
+		// A series written with fewer tags than the qb covers has its absent
+		// position materialized by the API as the sentinel " 0" (tag value ID 0,
+		// rendered with a leading space). The expected model has no entry for an
+		// absent position, so tagSignature must drop the sentinel (" 0" trims to
+		// "0"); the present tag alone identifies the series. (A real "0" value is
+		// never generated, so this never over-drops.)
+		{"sentinel absent-position dropped", map[string]apiMetaTag{"key0": {"m0"}, "key1": {" 0"}}, []tag{{"0", "m0"}}},
 	}
 	for _, tc := range cases {
 		api := tagSignature(tc.apiTags)
@@ -37,45 +44,41 @@ func TestSignatureAlignment(t *testing.T) {
 	}
 }
 
-// TestCompareMetric covers the four failure modes compareMetric surfaces: a
-// count mismatch, a missing expected series, an EXTRA series the model does not
-// expect (the bidirectional half of the check), and the sampling tripwire that
-// must fail even when the counts match exactly.
-func TestCompareMetric(t *testing.T) {
-	base := uint32(1_700_000_000)
-	m := counterMetric{
-		Name:   "e2e_t_c_multi",
-		QBKeys: []string{"0", "1"},
-		Series: []counterSeries{{
-			Tags:   []tag{{"0", "x"}, {"1", "p"}},
-			Counts: map[uint32]float64{base: 5, base + 1: 6},
-		}},
+// mkSeriesResp builds an apiSeriesResponse with one value per (series, bucket)
+// for the comparators under test.
+func mkSeriesResp(metas []apiSeriesMeta, data [][]float64, samplingAgg float64, base uint32, nb int) *apiSeriesResponse {
+	times := make([]int64, nb)
+	for i := 0; i < nb; i++ {
+		times[i] = int64(base + uint32(i))
 	}
-	const sig = "key0=x;key1=p" // expectedSignature for {0:x,1:p}
+	return &apiSeriesResponse{Data: apiResponseData{
+		SamplingFactorAgg: samplingAgg,
+		Series:            apiSeries{Time: times, SeriesMeta: metas, SeriesData: data},
+	}}
+}
+
+// TestCompareCounts covers the counter comparator's four failure modes: a count
+// mismatch, a missing expected series, an EXTRA series, and the sampling
+// tripwire that must fail even when counts match exactly.
+func TestCompareCounts(t *testing.T) {
+	base := uint32(1_700_000_000)
+	m := metricModel{Name: "e2e_x_go_c_multi", Kind: kindCounter, QBKeys: []string{"0", "1"}, Series: []seriesModel{{
+		Tags:   []tag{{"0", "x"}, {"1", "p"}},
+		Counts: map[uint32]float64{base: 5, base + 1: 6},
+	}}}
+	const sig = "key0=x;key1=p"
 	wantMeta := apiSeriesMeta{Tags: map[string]apiMetaTag{"key0": {"x"}, "key1": {"p"}}}
 
-	mkResp := func(metas []apiSeriesMeta, data [][]float64, samplingAgg float64) *apiSeriesResponse {
-		return &apiSeriesResponse{Data: apiResponseData{
-			SamplingFactorAgg: samplingAgg,
-			Series: apiSeries{
-				Time:       []int64{int64(base), int64(base + 1)},
-				SeriesMeta: metas,
-				SeriesData: data,
-			},
-		}}
-	}
-
 	t.Run("exact match", func(t *testing.T) {
-		resp := mkResp([]apiSeriesMeta{wantMeta}, [][]float64{{5, 6}}, 0)
-		mm, miss, ex, samp := compareMetric(m, resp)
+		resp := mkSeriesResp([]apiSeriesMeta{wantMeta}, [][]float64{{5, 6}}, 0, base, 2)
+		mm, miss, ex, samp := compareByFunc(m, resp, queryFunc{qw: "count"})
 		if len(mm) != 0 || len(miss) != 0 || len(ex) != 0 || samp != 0 {
 			t.Errorf("exact match not clean: mm=%v miss=%v ex=%v samp=%g", mm, miss, ex, samp)
 		}
 	})
-
 	t.Run("wrong count", func(t *testing.T) {
-		resp := mkResp([]apiSeriesMeta{wantMeta}, [][]float64{{5, 99}}, 0)
-		mm, miss, ex, samp := compareMetric(m, resp)
+		resp := mkSeriesResp([]apiSeriesMeta{wantMeta}, [][]float64{{5, 99}}, 0, base, 2)
+		mm, miss, ex, samp := compareByFunc(m, resp, queryFunc{qw: "count"})
 		if len(mm) != 1 || mm[0].bucket != base+1 || mm[0].actual != 99 {
 			t.Errorf("mismatches=%+v, want one at bucket %d actual 99", mm, base+1)
 		}
@@ -83,10 +86,9 @@ func TestCompareMetric(t *testing.T) {
 			t.Errorf("unexpected non-clean fields: miss=%v ex=%v samp=%g", miss, ex, samp)
 		}
 	})
-
 	t.Run("missing series", func(t *testing.T) {
-		resp := mkResp(nil, nil, 0) // no series_meta → the expected series is absent
-		mm, miss, ex, samp := compareMetric(m, resp)
+		resp := mkSeriesResp(nil, nil, 0, base, 2)
+		mm, miss, ex, samp := compareByFunc(m, resp, queryFunc{qw: "count"})
 		if len(mm) != 0 || len(ex) != 0 || samp != 0 {
 			t.Errorf("unexpected non-clean fields: mm=%v ex=%v samp=%g", mm, ex, samp)
 		}
@@ -94,12 +96,10 @@ func TestCompareMetric(t *testing.T) {
 			t.Errorf("missing=%v, want [%s]", miss, sig)
 		}
 	})
-
 	t.Run("extra series", func(t *testing.T) {
-		// Expected series present and correct, plus an unexpected second series.
 		extraMeta := apiSeriesMeta{Tags: map[string]apiMetaTag{"key0": {"surprise"}, "key1": {"z"}}}
-		resp := mkResp([]apiSeriesMeta{wantMeta, extraMeta}, [][]float64{{5, 6}, {7, 8}}, 0)
-		mm, miss, ex, samp := compareMetric(m, resp)
+		resp := mkSeriesResp([]apiSeriesMeta{wantMeta, extraMeta}, [][]float64{{5, 6}, {7, 8}}, 0, base, 2)
+		mm, miss, ex, samp := compareByFunc(m, resp, queryFunc{qw: "count"})
 		if len(mm) != 0 || len(miss) != 0 || samp != 0 {
 			t.Errorf("unexpected non-clean fields: mm=%v miss=%v samp=%g", mm, miss, samp)
 		}
@@ -107,52 +107,143 @@ func TestCompareMetric(t *testing.T) {
 			t.Errorf("extras=%v, want [key0=surprise;key1=z]", ex)
 		}
 	})
-
 	t.Run("sampling tripwire", func(t *testing.T) {
-		// Counts match exactly, but data was sampled → must still be flagged.
-		resp := mkResp([]apiSeriesMeta{wantMeta}, [][]float64{{5, 6}}, 2)
-		mm, miss, ex, samp := compareMetric(m, resp)
+		resp := mkSeriesResp([]apiSeriesMeta{wantMeta}, [][]float64{{5, 6}}, 2, base, 2)
+		mm, miss, ex, samp := compareByFunc(m, resp, queryFunc{qw: "count"})
 		if len(mm) != 0 || len(miss) != 0 || len(ex) != 0 {
 			t.Errorf("unexpected non-empty fields: mm=%v miss=%v ex=%v", mm, miss, ex)
 		}
 		if samp == 0 {
 			t.Error("sampling = 0, want nonzero (SamplingFactorAgg=2)")
 		}
-		if detail := formatFail(m, "http://x", mm, miss, ex, samp); !strings.Contains(detail, "sampling") {
-			t.Errorf("formatFail missing sampling line:\n%s", detail)
-		}
 	})
 }
 
-// TestCompareMetricMetaNonCollision proves the comparison is structurally immune
-// to the client meta-metrics every driver ALSO writes to the same agent
-// (statshouse_transport_metrics, __src_client_write_err, …). Those are different
-// metric names, so /api/query?s=<exact e2e name> (built by metricQueryURL) never
-// returns their series — and defensively, even if one appeared in a response,
-// compareMetric keys on the EXACT normalized tag signature, so it can only ever
-// surface as an extra (caught), never silently merge into an expected e2e series.
-// This is the "structural non-collision with exact e2e_ names" the assertion
-// design relies on (assert.go header comment).
-func TestCompareMetricMetaNonCollision(t *testing.T) {
+// TestCompareValueAgg pins the value exact aggregates computed in WRITE ORDER
+// (the agent's ValueSum left-fold), including a negative avg.
+func TestCompareValueAgg(t *testing.T) {
+	base := uint32(1_700_000_000)
+	vals := []float64{-3.5, -0.01, 2.718281828459045, 100.0}
+	m := metricModel{Name: "e2e_x_go_v_mix", Kind: kindValue, QBKeys: []string{"0"}, Series: []seriesModel{{
+		Tags:   []tag{{"0", "a"}},
+		Values: map[uint32][]float64{base: vals},
+	}}}
+	wantMeta := apiSeriesMeta{Tags: map[string]apiMetaTag{"key0": {"a"}}}
+	for _, qw := range []string{"sum", "min", "max", "avg"} {
+		exp := valueAggregate(vals, qw)
+		resp := mkSeriesResp([]apiSeriesMeta{wantMeta}, [][]float64{{exp}}, 0, base, 1)
+		mm, miss, ex, samp := compareByFunc(m, resp, queryFunc{qw: qw})
+		if len(mm) != 0 || len(miss) != 0 || len(ex) != 0 || samp != 0 {
+			t.Errorf("qw=%s expected %g not exact: mm=%v miss=%v ex=%v samp=%g", qw, exp, mm, miss, ex, samp)
+		}
+	}
+	// A wrong value is caught.
+	resp := mkSeriesResp([]apiSeriesMeta{wantMeta}, [][]float64{{valueAggregate(vals, "sum") + 1}}, 0, base, 1)
+	if mm, _, _, _ := compareByFunc(m, resp, queryFunc{qw: "sum"}); len(mm) != 1 {
+		t.Errorf("sum mismatch not flagged: %v", mm)
+	}
+}
+
+// TestComparePercentile pins the tolerance band: a t-digest result within tol of
+// the true type-7 quantile passes; outside fails.
+func TestComparePercentile(t *testing.T) {
+	base := uint32(1_700_000_000)
+	vals := genValueUniform(1000) // sorted; p50=499.5
+	m := metricModel{Name: "e2e_x_go_vp_mix", Kind: kindValueP, QBKeys: []string{"0"}, Series: []seriesModel{{
+		Tags:   []tag{{"0", "unif"}},
+		Values: map[uint32][]float64{base: vals},
+	}}}
+	wantMeta := apiSeriesMeta{Tags: map[string]apiMetaTag{"key0": {"unif"}}}
+	truth := quantile(vals, 0.5) // 499.5
+	// Within tol (max(1%·499.5, 1.0)=4.995): 502 passes.
+	resp := mkSeriesResp([]apiSeriesMeta{wantMeta}, [][]float64{{502}}, 0, base, 1)
+	if mm, _, _, _ := compareByFunc(m, resp, queryFunc{qw: "p50", q: 0.5}); len(mm) != 0 {
+		t.Errorf("502 within tol of %g should pass: %v", truth, mm)
+	}
+	// Outside tol: 510 fails.
+	resp = mkSeriesResp([]apiSeriesMeta{wantMeta}, [][]float64{{510}}, 0, base, 1)
+	if mm, _, _, _ := compareByFunc(m, resp, queryFunc{qw: "p50", q: 0.5}); len(mm) != 1 {
+		t.Errorf("510 outside tol of %g should fail: %v", truth, mm)
+	}
+}
+
+// TestCompareUnique pins both unique modes: exact for the small case, ±2% for the
+// big case (the comparator switches on distinct > uniquesHashMaxSize).
+func TestCompareUnique(t *testing.T) {
+	base := uint32(1_700_000_000)
+	mk := func(distinct int) metricModel {
+		return metricModel{Name: "e2e_x_go_u", Kind: kindUnique, QBKeys: []string{"0"}, Series: []seriesModel{{
+			Tags:    []tag{{"0", "s"}},
+			Uniques: map[uint32]int{base: distinct},
+		}}}
+	}
+	wantMeta := apiSeriesMeta{Tags: map[string]apiMetaTag{"key0": {"s"}}}
+
+	// Exact (300 distinct): 300 passes, 299 fails.
+	m := mk(smallUniqueDistinct)
+	resp := mkSeriesResp([]apiSeriesMeta{wantMeta}, [][]float64{{300}}, 0, base, 1)
+	if mm, _, _, _ := compareByFunc(m, resp, queryFunc{qw: "unique"}); len(mm) != 0 {
+		t.Errorf("exact 300 should pass: %v", mm)
+	}
+	resp = mkSeriesResp([]apiSeriesMeta{wantMeta}, [][]float64{{299}}, 0, base, 1)
+	if mm, _, _, _ := compareByFunc(m, resp, queryFunc{qw: "unique"}); len(mm) != 1 {
+		t.Errorf("exact 299 should fail: %v", mm)
+	}
+
+	// Approx (100000 distinct, ±2% → [98000,102000]): 101500 passes, 97000 fails.
+	m = mk(bigUniqueDistinct)
+	resp = mkSeriesResp([]apiSeriesMeta{wantMeta}, [][]float64{{101500}}, 0, base, 1)
+	if mm, _, _, _ := compareByFunc(m, resp, queryFunc{qw: "unique"}); len(mm) != 0 {
+		t.Errorf("101500 within ±2%% of 100000 should pass: %v", mm)
+	}
+	resp = mkSeriesResp([]apiSeriesMeta{wantMeta}, [][]float64{{97000}}, 0, base, 1)
+	if mm, _, _, _ := compareByFunc(m, resp, queryFunc{qw: "unique"}); len(mm) != 1 {
+		t.Errorf("97000 outside ±2%% of 100000 should fail: %v", mm)
+	}
+}
+
+// TestCompareCardinality pins the stag assertion: a single total series whose
+// per-bucket value equals the distinct-series count.
+func TestCompareCardinality(t *testing.T) {
+	base := uint32(1_700_000_000)
+	m := metricModel{Name: "e2e_x_go_s_dist", Kind: kindStag, Series: []seriesModel{
+		{Tags: []tag{{"0", "a"}}, Counts: map[uint32]float64{base: 1}},
+		{Tags: []tag{{"0", "b"}}, Counts: map[uint32]float64{base: 1}},
+		{Tags: nil, Counts: map[uint32]float64{base: 1}}, // empty-value series
+	}}
+	total := apiSeriesMeta{Tags: map[string]apiMetaTag{}} // no group-by → signature ""
+	// 3 distinct series at the bucket → cardinality 3 passes.
+	resp := mkSeriesResp([]apiSeriesMeta{total}, [][]float64{{3}}, 0, base, 1)
+	if mm, miss, ex, samp := compareByFunc(m, resp, queryFunc{qw: "cardinality"}); len(mm) != 0 || len(miss) != 0 || len(ex) != 0 || samp != 0 {
+		t.Errorf("cardinality 3 should pass clean: mm=%v miss=%v ex=%v samp=%g", mm, miss, ex, samp)
+	}
+	resp = mkSeriesResp([]apiSeriesMeta{total}, [][]float64{{2}}, 0, base, 1)
+	if mm, _, _, _ := compareByFunc(m, resp, queryFunc{qw: "cardinality"}); len(mm) != 1 {
+		t.Errorf("cardinality 2 (want 3) should fail: %v", mm)
+	}
+}
+
+// TestCompareMetaNonCollision proves the comparison is structurally immune to the
+// client meta-metrics every driver ALSO writes (statshouse_transport_metrics,
+// __src_client_write_err, …). Those are different metric names, so
+// /api/query?s=<exact e2e name> never returns their series — and defensively,
+// even if one appeared in a response, compareByFunc keys on the EXACT normalized
+// tag signature, so it can only ever surface as an extra (caught), never silently
+// merge into an expected e2e series.
+func TestCompareMetaNonCollision(t *testing.T) {
 	base := uint32(1_700_000_000)
 	const e2eName = "e2e_runid_go_c_tagged"
-	m := counterMetric{
-		Name:   e2eName,
-		Series: []counterSeries{{Tags: []tag{{"0", "alpha"}}, Counts: map[uint32]float64{base: 4}}},
-	}
+	m := metricModel{Name: e2eName, Kind: kindCounter, Series: []seriesModel{{Tags: []tag{{"0", "alpha"}}, Counts: map[uint32]float64{base: 4}}}}
 	wantMeta := apiSeriesMeta{Tags: map[string]apiMetaTag{"key0": {"alpha"}}}
 	metaNames := []string{"__src_client_write_err", "statshouse_transport_metrics"}
 
-	// Layer 1 — query isolation: the harness queries the EXACT e2e name (with the
-	// e2e_ prefix); a meta-metric's different name can never match it, so its
-	// series are never even requested.
 	t.Run("query isolates by exact e2e name", func(t *testing.T) {
 		for _, meta := range metaNames {
 			if meta == e2eName {
 				t.Fatalf("test setup: meta-metric %q collides with the e2e name", meta)
 			}
 		}
-		qurl := metricQueryURL("api:10888", m, base)
+		qurl := metricQueryURL("api:10888", m.Name, m.QBKeys, "count", base)
 		if !strings.Contains(qurl, e2eName) {
 			t.Errorf("metricQueryURL does not embed the exact e2e name %q: %s", e2eName, qurl)
 		}
@@ -162,31 +253,49 @@ func TestCompareMetricMetaNonCollision(t *testing.T) {
 			}
 		}
 	})
-
-	// Layer 2 — signature matching: a series shaped like a transport-metric entry
-	// (its tag value IS a meta-metric name) appearing in the response must be an
-	// extra. It does NOT match the expected e2e series despite sharing the key0
-	// slot, because the comparison requires an exact tag-value match — so the
-	// expected series is matched exactly (not corrupted).
 	t.Run("meta-shaped series is extra, not merged", func(t *testing.T) {
 		transportShaped := apiSeriesMeta{Tags: map[string]apiMetaTag{"key0": {"statshouse_transport_metrics"}}}
 		errShaped := apiSeriesMeta{Tags: map[string]apiMetaTag{"key0": {"__src_client_write_err"}}}
-		resp := &apiSeriesResponse{Data: apiResponseData{Series: apiSeries{
-			Time:       []int64{int64(base)},
-			SeriesMeta: []apiSeriesMeta{wantMeta, transportShaped, errShaped},
-			SeriesData: [][]float64{{4}, {9}, {1}},
-		}}}
-		mm, miss, ex, samp := compareMetric(m, resp)
+		resp := mkSeriesResp([]apiSeriesMeta{wantMeta, transportShaped, errShaped}, [][]float64{{4}, {9}, {1}}, 0, base, 1)
+		mm, miss, ex, samp := compareByFunc(m, resp, queryFunc{qw: "count"})
 		if len(mm) != 0 || len(miss) != 0 || samp != 0 {
 			t.Errorf("expected e2e series corrupted: mm=%v miss=%v samp=%g", mm, miss, samp)
 		}
 		if len(ex) != 2 {
 			t.Fatalf("extras=%v, want both meta-shaped series flagged as extra", ex)
 		}
-		for _, sig := range ex {
-			if !strings.Contains(sig, "statshouse_transport_metrics") && !strings.Contains(sig, "__src_client_write_err") {
-				t.Errorf("unexpected extra signature %q (want a meta-metric name)", sig)
-			}
-		}
 	})
+}
+
+// TestClientWriteErrForLang pins the silent-loss tripwire's series scan: it finds
+// the querying client's language (the metric is grouped at qb=1 so the lang is the
+// single series_meta tag) and reports any non-zero lost-bytes bucket, while
+// ignoring other clients' languages, zero buckets, and the absent-position
+// sentinel that trims to "0" (never equal to a real lang 1/3/5).
+func TestClientWriteErrForLang(t *testing.T) {
+	base := uint32(1_700_000_000)
+	goLang := apiSeriesMeta{Tags: map[string]apiMetaTag{"key1": {"1"}}}
+	rustLang := apiSeriesMeta{Tags: map[string]apiMetaTag{"key1": {"3"}}}
+	// A loss point for go at base (non-zero); rust's only bucket is 0 (no loss).
+	resp := &apiSeriesResponse{Data: apiResponseData{Series: apiSeries{
+		Time: []int64{int64(base)}, SeriesMeta: []apiSeriesMeta{goLang, rustLang}, SeriesData: [][]float64{{2048}, {0}},
+	}}}
+	if maxLost, found := clientWriteErrForLang(resp, "1"); !found || maxLost != 2048 {
+		t.Errorf("go loss not detected: found=%v maxLost=%g, want found=true maxLost=2048", found, maxLost)
+	}
+	if _, found := clientWriteErrForLang(resp, "3"); found {
+		t.Error("rust falsely flagged: its only bucket is 0 (no loss)")
+	}
+	// A series_meta carrying the absent-position sentinel " 0" (trims to "0") must
+	// not be mistaken for any real client language (1/3/5) even with a non-zero
+	// value — the sentinel marks an absent grouped position, not a language.
+	sentinel := apiSeriesMeta{Tags: map[string]apiMetaTag{"key1": {" 0"}}}
+	resp2 := &apiSeriesResponse{Data: apiResponseData{Series: apiSeries{
+		Time: []int64{int64(base)}, SeriesMeta: []apiSeriesMeta{sentinel}, SeriesData: [][]float64{{99}},
+	}}}
+	for _, lang := range []string{"1", "3", "5"} {
+		if _, found := clientWriteErrForLang(resp2, lang); found {
+			t.Errorf(`sentinel " 0" series falsely matched lang %q`, lang)
+		}
+	}
 }

@@ -6,62 +6,92 @@ import (
 	"time"
 )
 
-// TestGenerateCounterStream exercises the single source of truth shared by every
-// client driver and the assertions: the invariants the whole harness leans on —
-// the 70-bucket window anchored at floor(now)−120, fully-populated series, the
-// runID name prefix, all-positive counts, and the rendered full-key cap.
-func TestGenerateCounterStream(t *testing.T) {
+// TestGenerateStream exercises the single source of truth shared by every client
+// driver and the assertions: the invariants the whole harness leans on across the
+// full spec §5 metric matrix — the bucket window anchored at floor(now)−120s,
+// every kind present, fully-populated series, the runID name prefix, kind-correct
+// payloads, the rendered full-key cap, and one write per (series, bucket).
+func TestGenerateStream(t *testing.T) {
 	const runID = "testrun"
 	const clientTag = "go"
 	now := time.Unix(1_700_000_000, 0) // second-granular, so floor(now) == now.Unix()
-	s := generateCounterStream(runID, clientTag, now)
+	s := generateStream(runID, clientTag, now)
 
-	// Base anchors the 70 buckets at floor(now) − 120s.
+	// Base anchors the buckets at floor(now) − 120s.
 	if wantBase := uint32(now.Unix()) - 120; s.Base != wantBase {
 		t.Fatalf("Base = %d, want %d (floor(now)−120)", s.Base, wantBase)
 	}
 
-	// One metric per builder in the spec (ones, tagged, multi, empty, unicode, many).
-	if len(s.Metrics) != 6 {
-		t.Fatalf("len(Metrics) = %d, want 6", len(s.Metrics))
+	// Every spec §5 kind is generated (counter/value/value_p/unique/stag). This
+	// catches a generator that silently drops a whole kind.
+	kinds := map[string]bool{}
+	for _, m := range s.Metrics {
+		kinds[m.Kind] = true
+	}
+	for _, k := range []string{kindCounter, kindValue, kindValueP, kindUnique, kindStag} {
+		if !kinds[k] {
+			t.Errorf("kind %q not generated (metrics: %v)", k, metricKinds(s))
+		}
 	}
 
 	prefix := "e2e_" + runID + "_" + clientTag + "_"
+
+	// bucketCountOf returns how many buckets one series of this metric fills (all
+	// series of a metric fill the same count): counter/stag/value/value_p fill
+	// numBuckets; the big-unique stress metric fills bigUniqueBuckets.
+	bucketCountOf := func(m metricModel) int {
+		if len(m.Series) == 0 {
+			return 0
+		}
+		switch m.Kind {
+		case kindCounter, kindStag:
+			return len(m.Series[0].Counts)
+		case kindValue, kindValueP:
+			return len(m.Series[0].Values)
+		case kindUnique:
+			return len(m.Series[0].Uniques)
+		}
+		return 0
+	}
+
+	// Recompute the expected write count from the model: one write per
+	// (series, bucket) for every metric.
+	wantWrites := 0
 	var totalSeries int
 	for _, m := range s.Metrics {
 		if !strings.HasPrefix(m.Name, prefix) {
 			t.Errorf("metric %q missing prefix %q", m.Name, prefix)
 		}
-		totalSeries += len(m.Series)
+		// validMetricName (format.go) rejects hyphens; the runID is sanitized
+		// (→ underscores) so the value_p POST path accepts the name. Pin it.
+		if strings.Contains(m.Name, "-") {
+			t.Errorf("metric %q contains a hyphen (not a valid StatsHouse name)", m.Name)
+		}
+		nb := bucketCountOf(m)
+		if nb == 0 {
+			t.Errorf("metric %s (%s): no populated buckets in its model", m.Name, m.Kind)
+		}
 		for si, ser := range m.Series {
-			// Every series fully populates all 70 buckets (a missing/null point back
-			// from /api/query is then an unambiguous failure).
-			if len(ser.Counts) != numBuckets {
-				t.Errorf("%s series %d: %d counts, want %d", m.Name, si, len(ser.Counts), numBuckets)
-			}
-			for i := 0; i < numBuckets; i++ {
-				ts := s.Base + uint32(i)
-				c, ok := ser.Counts[ts]
-				if !ok {
-					t.Errorf("%s series %d: bucket %d (ts=%d) missing", m.Name, si, i, ts)
-					continue
-				}
-				if c <= 0 {
-					t.Errorf("%s series %d bucket %d: count %g, want > 0", m.Name, si, i, c)
+			totalSeries++
+			// Every populated bucket timestamps inside the asserted window.
+			for ts := range populatedBuckets(m.Kind, ser) {
+				if ts < s.Base || ts >= s.Base+numBuckets {
+					t.Errorf("%s series %d: bucket ts=%d outside [%d,%d)", m.Name, si, ts, s.Base, s.Base+numBuckets)
 				}
 			}
 		}
+		wantWrites += len(m.Series) * nb
+	}
+	if totalSeries == 0 {
+		t.Fatal("no series generated")
 	}
 
-	// The Writes slice is the "pinned seed" every driver renders: exactly one write
-	// per (series, bucket).
-	if len(s.Writes) != totalSeries*numBuckets {
-		t.Errorf("len(Writes) = %d, want %d (series=%d × buckets=%d)",
-			len(s.Writes), totalSeries*numBuckets, totalSeries, numBuckets)
+	if len(s.Writes) != wantWrites {
+		t.Errorf("len(Writes) = %d, want %d (Σ series×buckets)", len(s.Writes), wantWrites)
 	}
 
-	// Every write timestamps inside the asserted [Base, Base+numBuckets) window,
-	// carries the prefix, and has a positive count (zero/negative is ticket 12).
+	// Every write timestamps inside the asserted window, carries the prefix, and
+	// has a kind-correct payload.
 	for _, w := range s.Writes {
 		if w.TS < s.Base || w.TS >= s.Base+numBuckets {
 			t.Errorf("write ts=%d outside [%d,%d)", w.TS, s.Base, s.Base+numBuckets)
@@ -69,8 +99,21 @@ func TestGenerateCounterStream(t *testing.T) {
 		if !strings.HasPrefix(w.Metric, prefix) {
 			t.Errorf("write metric %q missing prefix", w.Metric)
 		}
-		if w.Count <= 0 {
-			t.Errorf("write count %g, want > 0", w.Count)
+		switch w.Kind {
+		case kindCounter, kindStag:
+			if w.Count <= 0 {
+				t.Errorf("%s write count %g, want > 0 (zero/negative is ticket 12)", w.Metric, w.Count)
+			}
+		case kindValue:
+			if len(w.Values) == 0 {
+				t.Errorf("%s value write has no values", w.Metric)
+			}
+		case kindValueP, kindUnique:
+			if w.Gen == nil {
+				t.Errorf("%s %s write has no generator (Gen==nil)", w.Metric, w.Kind)
+			}
+		default:
+			t.Errorf("write %q has unknown kind %q", w.Metric, w.Kind)
 		}
 	}
 
@@ -89,4 +132,34 @@ func TestGenerateCounterStream(t *testing.T) {
 	if maxKey == 0 {
 		t.Error("maxKey = 0; expected at least one non-empty key")
 	}
+}
+
+// populatedBuckets returns the set of bucket timestamps a series filled, keyed on
+// the map its metric kind populates.
+func populatedBuckets(kind string, ser seriesModel) map[uint32]struct{} {
+	out := map[uint32]struct{}{}
+	switch kind {
+	case kindCounter, kindStag:
+		for ts := range ser.Counts {
+			out[ts] = struct{}{}
+		}
+	case kindValue, kindValueP:
+		for ts := range ser.Values {
+			out[ts] = struct{}{}
+		}
+	case kindUnique:
+		for ts := range ser.Uniques {
+			out[ts] = struct{}{}
+		}
+	}
+	return out
+}
+
+// metricKinds returns "<name>:<kind>" per metric, for readable failure output.
+func metricKinds(s metricStream) []string {
+	out := make([]string, 0, len(s.Metrics))
+	for _, m := range s.Metrics {
+		out = append(out, m.Name+":"+m.Kind)
+	}
+	return out
 }

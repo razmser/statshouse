@@ -151,6 +151,13 @@ func startDaemonStack(ctx context.Context, rt Runtime, rec *recorder, o daemonSt
 	// --receive-budget-warming=0 is MANDATORY (spec §2): the default 15m ramp
 	// starves per-metric receive budgets and agents sample even tiny payloads.
 	//
+	// --disable-receive-sample-budget (ticket 11): stops the agg from advertising
+	// per-metric receive budgets back to agents, so the big-unique bucket is sized
+	// only by the agent's own (bumped) --sample-budget. The agg's receive-budget
+	// path already skips historic writes (aggregator_handlers.go:
+	// !args.IsSetHistoric()), so this is mostly belt-and-suspenders — but it
+	// removes one variable from the sampling path.
+	//
 	// The agg must advertise its REAL run-network IP to agents, not the CH
 	// cluster's host_name ("localhost"). selectShardReplica reads host_name from
 	// system.clusters (config.xml remote_servers.statlogs2 -> <host>localhost</host>)
@@ -184,7 +191,10 @@ exec /statshouse-agg \
   --metadata-addr=%[3]s \
   --cache-dir=/cache \
   --receive-budget-warming=0 \
+  --disable-receive-sample-budget \
   --cluster-shards-addrs=${AGG_IP}:%[1]d,${AGG_IP}:%[1]d,${AGG_IP}:%[1]d \
+  --insert-budget=100000000 \
+  --min-insert-budget=100000000 \
   -u root -g root`,
 		aggPort, o.chIP, metaAggAddr)
 	if err := rt.Run(ctx, RunOpts{
@@ -284,6 +294,42 @@ exec /statshouse-agg \
 		"--agg-addr="+agg3,
 		"--cache-dir=/cache",
 		"--hardware-metric-scrape-disable",
+		// ticket 11: neutralize agent sampling so the exact per-bucket assertions
+		// are never distorted by a keep×SF multiplier. agent_shard_send.go
+		// computes the per-shard sampler budget as
+		//   remainingBudget = max(MinSampleBudget,
+		//                         min(SampleBudget/shards, MaxUncompressedBucketSize/2) − budgetSum)
+		// where budgetSum is the sum of agg-advertised per-metric budgets for the
+		// built-in statshouse_* metrics, which eats the whole shard budget; our
+		// freshly-created e2e metrics have NO advertised budget, so without
+		// intervention they are squeezed into the default MinSampleBudget=2000 floor
+		// and sampled (observed: counter values uniformly ×4.72, stag cardinality
+		// 6→2..4).
+		//
+		// Two DISTINCT root causes masqueraded as "sampling" in early runs; do not
+		// conflate them:
+		//  (1) unique 100k collapsing to EXACTLY 1024 was NOT agent sampling — it
+		//      was the go client's default per-bucket reservoir (defaultMaxBucketSize
+		//      =1024, statshouse.go; appendUnique keeps only MaxBucketSize sampled
+		//      values once a bucket overflows). Fixed DRIVER-SIDE by
+		//      ConfigureArgs{MaxBucketSize:1<<18} in drivers/go/main.go.tmpl; the
+		//      rust/cpp libraries have no such cap.
+		//  (2) the counter×4.72 / stag 6→2..4 skew above IS agent sampling — fixed
+		//      here by --min-sample-budget.
+		//
+		// Only --min-sample-budget is needed. The SampleBudget/shards term is capped
+		// to MaxUncompressedBucketSize/2 (5 MB) BEFORE the max(), so even an
+		// arbitrarily large --sample-budget yields ≤5 MB (minus budgetSum) — always
+		// below a MinSampleBudget set above MaxUncompressedBucketSize (10 MB). The
+		// cap is upstream of the min-floor, so --min-sample-budget is unbounded
+		// there: 11 MB means sampler.Run() keeps every item with SF=1. --sample-budget
+		// is therefore DEAD in this configuration (its term can never win the max)
+		// and is omitted.
+		// (The agg receive budget is already skipped twice over: historic writes
+		// bypass it AND we pass --disable-receive-sample-budget.) Only LOOSENS
+		// sampling → the small counter metrics stay green and the sampling-factor
+		// tripwire stays 0.
+		"--min-sample-budget=11000000",
 		// Same 'kitten' setuid reason as the agg: the agent runs as root in the
 		// container and would fatally fail to drop to the missing 'kitten' user.
 		"-u", "root", "-g", "root",

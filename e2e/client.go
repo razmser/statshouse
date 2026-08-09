@@ -58,7 +58,7 @@ type clientSpec struct {
 // main loop can dispatch on the client name. cache is the shared e2e cache root
 // (~/.cache/statshouse-e2e); each client derives its own sub-caches from it.
 type clientRunOpts struct {
-	stream    counterStream
+	stream    metricStream
 	network   string // run network
 	agentAddr string // <agent-ip>:13337 the driver writes to (STATSHOUSE_ADDR)
 	apiAddr   string // <api-ip>:10888 the driver polls to confirm mappings (STATSHOUSE_API_ADDR); "" → fixed fallback
@@ -261,12 +261,12 @@ func gitResolveRef(ctx context.Context, dir, ref string) (string, error) {
 }
 
 // renderGoDriver parses the go driver text/template and renders the generated
-// counter stream into <outDir>/main.go. Only the writes are injected; the program
-// shape (TCP client, Historic writes, Close flush) is fixed in the template. The
-// rendered source is run through go/format so the artifact is gofmt-clean and a
-// template bug surfaces here (parse failure) rather than later in the container
-// build.
-func renderGoDriver(tmplPath string, stream counterStream, outDir string) error {
+// metric stream into <outDir>/main.go. Only the writes (and the kind-aware seeds)
+// are injected; the program shape (TCP client, Historic writes, Close flush) is
+// fixed in the template. The rendered source is run through go/format so the
+// artifact is gofmt-clean and a template bug surfaces here (parse failure) rather
+// than later in the container build.
+func renderGoDriver(tmplPath string, stream metricStream, outDir string) error {
 	tmplText, err := os.ReadFile(tmplPath)
 	if err != nil {
 		return fmt.Errorf("read driver template %s: %w", tmplPath, err)
@@ -278,20 +278,21 @@ func renderGoDriver(tmplPath string, stream counterStream, outDir string) error 
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return err
 	}
-	// Metric names feed the driver's cold-start pre-warm (one seed per metric);
-	// SeedTS is a bucket outside the asserted [Base, Base+numBuckets] window the
-	// seed writes into so it never perturbs an assertion (see the template header).
-	names := make([]string, 0, len(stream.Metrics))
-	for _, m := range stream.Metrics {
-		names = append(names, m.Name)
-	}
+	// Seeds drive the cold-start pre-warm: one KIND-MATCHING write per metric so
+	// auto-create derives the right kind (value/unique) rather than the counter
+	// default. Metrics is the name list the driver polls metrics-list for. SeedTS
+	// is a bucket outside the asserted [Base, Base+numBuckets] window the seed
+	// writes into so it never perturbs an assertion (see the template header).
+	seeds, names := streamSeeds(stream)
 	var raw bytes.Buffer
 	if err := t.Execute(&raw, struct {
-		Writes  []counterWrite
+		Writes  []metricWrite
+		Seeds   []seedDef
 		Metrics []string
 		SeedTS  uint32
 	}{
 		Writes:  stream.Writes,
+		Seeds:   seeds,
 		Metrics: names,
 		SeedTS:  stream.Base - 60,
 	}); err != nil {
@@ -306,11 +307,11 @@ func renderGoDriver(tmplPath string, stream counterStream, outDir string) error 
 
 // renderDriver is the shared core of the rust/cpp renderers: parse a driver
 // text/template (binding the language-specific escapers in funcs), inject the
-// counter stream, and write <outDir>/<outFile>. The escapers mean an injected
+// metric stream, and write <outDir>/<outFile>. The escapers mean an injected
 // value carrying a quote, backslash, or non-ASCII byte can never break the
 // rendered source. renderGoDriver stays separate — it gofmt's its output and
 // binds no escapers. name is the template's internal name (cosmetic).
-func renderDriver(tmplPath, name string, funcs template.FuncMap, stream counterStream, outDir, outFile string) error {
+func renderDriver(tmplPath, name string, funcs template.FuncMap, stream metricStream, outDir, outFile string) error {
 	tmplText, err := os.ReadFile(tmplPath)
 	if err != nil {
 		return fmt.Errorf("read driver template %s: %w", tmplPath, err)
@@ -322,17 +323,16 @@ func renderDriver(tmplPath, name string, funcs template.FuncMap, stream counterS
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return err
 	}
-	names := make([]string, 0, len(stream.Metrics))
-	for _, m := range stream.Metrics {
-		names = append(names, m.Name)
-	}
+	seeds, names := streamSeeds(stream)
 	var raw bytes.Buffer
 	if err := t.Execute(&raw, struct {
-		Writes  []counterWrite
+		Writes  []metricWrite
+		Seeds   []seedDef
 		Metrics []string
 		SeedTS  uint32
 	}{
 		Writes:  stream.Writes,
+		Seeds:   seeds,
 		Metrics: names,
 		SeedTS:  stream.Base - 60,
 	}); err != nil {

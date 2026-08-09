@@ -2,9 +2,11 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"go/format"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -28,12 +30,12 @@ func TestRenderGoDriverQuoting(t *testing.T) {
 		trickyVal    = "v\"with quote and a \\ backslash"
 	)
 	base := uint32(1_700_000_000)
-	stream := counterStream{
+	stream := metricStream{
 		Base: base,
-		Writes: []counterWrite{
-			{Metric: trickyMetric, Tags: []tag{{"0", trickyVal}}, Count: 1, TS: base},
+		Writes: []metricWrite{
+			{Kind: kindCounter, Metric: trickyMetric, Tags: []tag{{"0", trickyVal}}, Count: 1, TS: base},
 		},
-		Metrics: []counterMetric{{Name: trickyMetric}},
+		Metrics: []metricModel{{Name: trickyMetric, Kind: kindCounter}},
 	}
 
 	out := t.TempDir()
@@ -102,5 +104,69 @@ func TestClassifyCloneCache(t *testing.T) {
 			t.Errorf("%s: classifyCloneCache(%q,%v,%q,%v,%v) = %v, want %v",
 				tc.name, tc.head, tc.headErr, tc.resolved, tc.resolveErr, tc.ctxCancel, got, tc.want)
 		}
+	}
+}
+
+// TestDriverLCGIdentity pins the "pinned seed" invariant: the skewed-value LCG
+// constants live ONCE in quantile.go (lcgMul/lcgAdd/lcgSeed/skewedRange) but are
+// hand-copied as numeric literals into all THREE driver templates (go/rust/cpp)
+// so each language reproduces the exact same value sequence bit-for-bit. A
+// unilateral edit to either side silently desyncs the clients from the harness's
+// expected model (the assertions would then mismatch with no obvious cause).
+// This renders every template with a valueSkewed value_p write — the only path
+// that emits the LCG block — and asserts each rendered source carries the
+// seed/mul/add/modulus tokens derived FROM the quantile.go constants, so a drift
+// in either direction fails here.
+func TestDriverLCGIdentity(t *testing.T) {
+	root, err := repoRoot()
+	if err != nil {
+		t.Fatalf("repoRoot: %v", err)
+	}
+	// The exact numeric tokens every template MUST render, derived from the single
+	// source of truth in quantile.go so a change THERE is caught here too.
+	tokens := map[string]string{
+		"seed":    fmt.Sprintf("%x", lcgSeed), // hex form used verbatim in all three
+		"mul":     strconv.FormatUint(lcgMul, 10),
+		"add":     strconv.FormatUint(lcgAdd, 10),
+		"modulus": strconv.Itoa(skewedRange),
+	}
+	base := uint32(1_700_000_000)
+	// One valueSkewed value_p write forces each template's LCG block to render.
+	stream := metricStream{
+		Base: base,
+		Writes: []metricWrite{{
+			Kind: kindValueP, Metric: "e2e_lcg_probe_v", Tags: []tag{{"0", "s"}}, TS: base,
+			Gen: &genSpec{Kind: genKindValueSkewed, N: 4},
+		}},
+		Metrics: []metricModel{{Name: "e2e_lcg_probe_v", Kind: kindValueP, QBKeys: []string{"0"}}},
+	}
+
+	drivers := []struct {
+		name   string
+		render func(tmplPath string, stream metricStream, outDir string) error
+		tmpl   string // template dir+file, relative to e2e/
+		out    string // rendered output file name
+	}{
+		{"go", renderGoDriver, filepath.Join(driverGoDir, "main.go.tmpl"), "main.go"},
+		{"rust", renderRustDriver, filepath.Join(driverRustDir, "main.rs.tmpl"), "main.rs"},
+		{"cpp", renderCppDriver, filepath.Join(driverCppDir, "main.cpp.tmpl"), "main.cpp"},
+	}
+	for _, d := range drivers {
+		t.Run(d.name, func(t *testing.T) {
+			out := t.TempDir()
+			if err := d.render(filepath.Join(root, "e2e", d.tmpl), stream, out); err != nil {
+				t.Fatalf("render %s driver: %v", d.name, err)
+			}
+			src, err := os.ReadFile(filepath.Join(out, d.out))
+			if err != nil {
+				t.Fatalf("read rendered %s driver: %v", d.name, err)
+			}
+			s := string(src)
+			for what, tok := range tokens {
+				if !strings.Contains(s, tok) {
+					t.Errorf("%s driver: rendered source missing LCG %s token %q — desynced from quantile.go", d.name, what, tok)
+				}
+			}
+		})
 	}
 }

@@ -14,7 +14,7 @@
 # text/template that renders the generated stream into a client program.
 #
 # Active clients. Ticket 09 wired the go client end-to-end; ticket 10 adds rust
-# and cpp on the same path. All three are driven by the same generated counter
+# and cpp on the same path. All three are driven by the same generated metric
 # stream (per-client metric-name prefix isolates their writes — see stream.go).
 statshouse-go   https://github.com/VKCOM/statshouse-go   8c034cab32b42d41d213280760370b290f28b9f4  drivers/go
 statshouse-rs   https://github.com/VKCOM/statshouse-rs   43b4a629                                 drivers/rust

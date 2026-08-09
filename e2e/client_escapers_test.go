@@ -200,10 +200,10 @@ func TestRenderRustDriverQuoting(t *testing.T) {
 	}
 	const tricky = "e2e_\"q\"_\\_café_東京"
 	base := uint32(1_700_000_000)
-	stream := counterStream{
+	stream := metricStream{
 		Base:    base,
-		Writes:  []counterWrite{{Metric: tricky, Tags: []tag{{"0", tricky}}, Count: 1, TS: base}},
-		Metrics: []counterMetric{{Name: tricky}},
+		Writes:  []metricWrite{{Kind: kindCounter, Metric: tricky, Tags: []tag{{"0", tricky}}, Count: 1, TS: base}},
+		Metrics: []metricModel{{Name: tricky, Kind: kindCounter}},
 	}
 	out := t.TempDir()
 	if err := renderRustDriver(filepath.Join(root, "e2e", driverRustDir, "main.rs.tmpl"), stream, out); err != nil {
@@ -233,10 +233,10 @@ func TestRenderCppDriverQuoting(t *testing.T) {
 	}
 	const tricky = "e2e_\"q\"_\\_café_東京"
 	base := uint32(1_700_000_000)
-	stream := counterStream{
+	stream := metricStream{
 		Base:    base,
-		Writes:  []counterWrite{{Metric: tricky, Tags: []tag{{"0", tricky}}, Count: 1, TS: base}},
-		Metrics: []counterMetric{{Name: tricky}},
+		Writes:  []metricWrite{{Kind: kindCounter, Metric: tricky, Tags: []tag{{"0", tricky}}, Count: 1, TS: base}},
+		Metrics: []metricModel{{Name: tricky, Kind: kindCounter}},
 	}
 	out := t.TempDir()
 	if err := renderCppDriver(filepath.Join(root, "e2e", driverCppDir, "main.cpp.tmpl"), stream, out); err != nil {

@@ -318,11 +318,13 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeo
 	}
 	rec.logf("agent↔agg conveyor live (recent %s point)", queryMetric)
 
-	// --- client phase (tickets 09/10): drive each selected client over TCP with
-	// explicit historic timestamps, wait for its clean exit, then assert exact
-	// per-bucket/per-series equality. go came first (ticket 09); ticket 10 adds
-	// rust and cpp on the same path. The three are isolated by per-client metric
-	// prefixes so their counts never collide on the shared stack. ---
+	// --- client phase (tickets 09/10/11): drive each selected client over TCP
+	// with explicit historic timestamps, wait for its clean exit, then assert
+	// per-kind per-bucket/per-series equality across the full §5 metric matrix
+	// (counter/value/value_p/unique/stag). go came first (ticket 09); ticket 10
+	// adds rust and cpp on the same path; ticket 11 extends the stream + the
+	// assertions to all metric kinds. The three are isolated by per-client metric
+	// prefixes so their values never collide on the shared stack. ---
 	drivers, err := selectDrivers(clientSel)
 	if err != nil {
 		return fail(rec, artifactsDir, rt, containers, err)
@@ -367,7 +369,7 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeo
 	for _, d := range drivers {
 		names = append(names, d.tag)
 	}
-	summary := fmt.Sprintf("PASS: client(s) [%s] drove the full pipeline, %d counter metric assertion(s) exact-matched, runtime=%s, runid=%s",
+	summary := fmt.Sprintf("PASS: client(s) [%s] drove the full pipeline, %d metric/func assertion(s) passed, runtime=%s, runid=%s",
 		strings.Join(names, " "), totalPass, rt.Name(), runID)
 	rec.logf("%s", summary)
 	writeSummary(artifactsDir, rec.lines)
@@ -390,17 +392,26 @@ type clientPhaseOpts struct {
 	cache            string // e2e cache root (~/.cache/statshouse-e2e)
 }
 
-// runClientPhase drives one client: generate its per-client counter stream,
-// build+run its driver in the foreground, wait for the clean exit, then assert
-// exact per-bucket/per-series equality. Returns pass/fail counts for this
-// client. A build/run launch error or a non-zero driver exit is reported as a
-// single FAIL line for the client (all its metrics fail). The harness waits for
-// the driver process to exit before asserting because rust/cpp flush only on
-// destruction.
+// runClientPhase drives one client: generate its per-client metric stream,
+// pre-create the value_p metrics (which never auto-create), build+run its driver
+// in the foreground, wait for the clean exit, then assert per-kind per-bucket/
+// per-series equality. Returns pass/fail counts for this client. A build/run
+// launch error or a non-zero driver exit is reported as a single FAIL line for
+// the client (all its metrics fail). The harness waits for the driver process to
+// exit before asserting because rust/cpp flush only on destruction.
 func runClientPhase(ctx context.Context, rt Runtime, rec *recorder, d clientDriver, o clientPhaseOpts) (passed, failed int) {
-	stream := generateCounterStream(o.runID, d.tag, time.Now())
-	rec.logf("%s: generated counter stream: base=%d buckets=%d metrics=%d writes=%d",
+	stream := generateStream(o.runID, d.tag, time.Now())
+	rec.logf("%s: generated stream: base=%d buckets=%d metrics=%d writes=%d",
 		d.name, stream.Base, numBuckets, len(stream.Metrics), len(stream.Writes))
+
+	// value_p never auto-creates from a wire payload (autocreate derives only
+	// counter/value/unique), so pre-create its mapping before the driver runs.
+	// Metric names embed the unique runID, so each POST creates a fresh metric.
+	if err := createValuePMetrics(ctx, rec, o.apiAddr, stream); err != nil {
+		rec.logf("FAIL %s: pre-create value_p metrics: %v", d.name, err)
+		fmt.Printf("FAIL %s: pre-create value_p metrics: %v\n", d.tag, err)
+		return 0, len(stream.Metrics)
+	}
 
 	agentAddr := net.JoinHostPort(o.agentIP, strconv.Itoa(agentPort))
 	clientContainer := e2ePrefix + o.runID + "-client-" + d.tag
@@ -424,7 +435,7 @@ func runClientPhase(ctx context.Context, rt Runtime, rec *recorder, d clientDriv
 	if exitCode != 0 {
 		// A pre-warm timeout (drivers exit preWarmExit) is the common infra
 		// failure: the agent↔agg path is down so metrics were never created.
-		// Surface it by name up front rather than letting 6 cryptic per-metric
+		// Surface it by name up front rather than letting N cryptic per-metric
 		// "series absent" failures bury the real cause.
 		if exitCode == preWarmExit {
 			rec.logf("FAIL %s: pre-warm timed out (metrics never created — agent/agg path down?)\n%s", d.name, indent(output))
@@ -437,10 +448,25 @@ func runClientPhase(ctx context.Context, rt Runtime, rec *recorder, d clientDriv
 	}
 	rec.logf("%s: driver exited 0\n%s", d.name, indent(truncate(strings.TrimSpace(output), 1200)))
 
-	passed, failed = assertCounters(ctx, rec, o.apiAddr, stream)
-	rec.logf("%s: counter assertions: %d PASS, %d FAIL", d.name, passed, failed)
+	// Silent-loss tripwire (spec §4): query __src_client_write_err for this
+	// client's run window BEFORE the value assertions, so a TCP-backpressure drop
+	// is reported as one labelled failure rather than N mysterious "count too low"
+	// mismatches whose real cause (bytes never reached the agent) is otherwise
+	// invisible. ok=true also covers clients that do not emit the metric.
+	werrOK, werrDetail := assertNoClientWriteErr(ctx, o.apiAddr, d.tag, stream.Base)
+	if !werrOK {
+		const werrLabel = "client write-error (silent data loss)"
+		rec.logf("FAIL %s: %s\n%s", d.name, werrLabel, indent(werrDetail))
+		fmt.Printf("FAIL %s: %s\n", d.tag, werrLabel)
+	}
+
+	passed, failed = assertStream(ctx, rec, o.apiAddr, d.tag, stream)
+	if !werrOK {
+		failed++ // count the silent-loss failure alongside any value mismatches
+	}
+	rec.logf("%s: assertions: %d PASS, %d FAIL", d.name, passed, failed)
 	if failed == 0 {
-		fmt.Printf("PASS %s: %d metric(s) exact-matched\n", d.tag, passed)
+		fmt.Printf("PASS %s: %d metric/func assertion(s) matched\n", d.tag, passed)
 	} else {
 		fmt.Printf("FAIL %s: %d PASS, %d FAIL\n", d.tag, passed, failed)
 	}
