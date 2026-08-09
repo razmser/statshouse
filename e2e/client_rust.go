@@ -76,14 +76,21 @@ func rustFloatLit(f float64) string {
 	return s
 }
 
+// rustDriverFuncs binds the rust escapers for the rust driver template. Shared by
+// renderRustDriver (disk write) and the clientDriver.renderSource closure (pure
+// re-render for the --skip-client-build cache hash).
+func rustDriverFuncs() template.FuncMap {
+	return template.FuncMap{
+		"rustBytes": rustByteStringLit,
+		"rustFloat": rustFloatLit,
+	}
+}
+
 // renderRustDriver renders the metric stream into <outDir>/main.rs via the rust
 // driver template, binding the rustBytes/rustFloat escapers. See renderDriver for
 // the shared parse/execute contract.
 func renderRustDriver(tmplPath string, stream metricStream, outDir string) error {
-	return renderDriver(tmplPath, "rust-driver", template.FuncMap{
-		"rustBytes": rustByteStringLit,
-		"rustFloat": rustFloatLit,
-	}, stream, outDir, "main.rs")
+	return renderDriver(tmplPath, "rust-driver", rustDriverFuncs(), stream, outDir, "main.rs")
 }
 
 // buildAndRunRustClient is the spec §4 rust path: clone → render → offline
@@ -91,6 +98,10 @@ func renderRustDriver(tmplPath string, stream metricStream, outDir string) error
 // process exit code, combined stdout+stderr, and a launch error (nil for a clean
 // non-zero exit).
 func buildAndRunRustClient(ctx context.Context, rt Runtime, rec *recorder, o clientRunOpts) (int, string, error) {
+	// --skip-client-build: run the cached driver binary without clone+render+build.
+	if o.skipBuild {
+		return runCachedDriver(ctx, rt, rec, o, rustBaseImage)
+	}
 	clients, err := parseClientsTxt(filepath.Join(o.repoRoot, "e2e", "clients.txt"))
 	if err != nil {
 		return 0, "", fmt.Errorf("parse e2e/clients.txt: %w", err)
@@ -112,22 +123,26 @@ func buildAndRunRustClient(ctx context.Context, rt Runtime, rec *recorder, o cli
 	rec.logf("rendered rust driver: %s (%d writes)", filepath.Join(o.workDir, "main.rs"), len(o.stream.Writes))
 
 	// Host-mounted rlib cache so the (sub-second) rlib build is skipped on a re-run
-	// whose pinned source is unchanged.
+	// whose pinned source is unchanged. buildCache holds the cached driver binary
+	// for --skip-client-build (a host bind mount needs the dir to exist first).
 	targetCache := filepath.Join(o.cache, "rust-target")
-	if err := os.MkdirAll(targetCache, 0o755); err != nil {
-		return 0, "", fmt.Errorf("create rust target cache %s: %w", targetCache, err)
+	for _, d := range []string{targetCache, o.buildCache} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			return 0, "", fmt.Errorf("create cache %s: %w", d, err)
+		}
 	}
 
 	libPath := clientMount + "/" + rustLibRel
 	rlibPath := rustTargetMount + "/libstatshouse.rlib"
+	driverPath := driverBinMount + "/" + driverBinName
 	// Rebuild the rlib only when the pinned source is newer than the cached copy.
 	buildRlib := fmt.Sprintf(
 		`if [ ! -f %[1]s ] || [ %[2]s -nt %[1]s ]; then rustc --edition 2021 --crate-type rlib --crate-name statshouse %[2]s -o %[1]s && echo "e2e: built statshouse rlib"; else echo "e2e: reused cached statshouse rlib"; fi`,
 		rlibPath, libPath,
 	)
 	buildRun := "set -e; " + buildRlib +
-		`; rustc --edition 2021 --extern statshouse="` + rlibPath + `" ` + workMount + `/main.rs -o /tmp/driver` +
-		`; /tmp/driver`
+		`; rustc --edition 2021 --extern statshouse="` + rlibPath + `" ` + workMount + `/main.rs -o ` + driverPath +
+		`; ` + driverPath
 
 	opts := RunOpts{
 		Name:    o.container,
@@ -141,6 +156,7 @@ func buildAndRunRustClient(ctx context.Context, rt Runtime, rec *recorder, o cli
 			o.workDir + ":" + workMount,
 			clonePath + ":" + clientMount + ":ro",
 			targetCache + ":" + rustTargetMount,
+			o.buildCache + ":" + driverBinMount, // build output → cached driver binary (--skip-client-build)
 		},
 		Cmd:    []string{"/bin/sh", "-c", buildRun},
 		AutoRm: true,

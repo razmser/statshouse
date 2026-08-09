@@ -117,11 +117,17 @@ func qwFor(kind string) string {
 // assertStream polls and asserts every metric in the stream across all of its
 // query functions. Returns pass/fail counts; each (metric, func) yields exactly
 // one PASS or FAIL line labelled with the client tag (the per-client metric-name
-// prefix already isolates clients; the tag makes the line readable).
+// prefix already isolates clients; the tag makes the line readable). want is the
+// per-metric sentWrites the conservation ledger balances against (precomputed by
+// ledgerWriteCounts); it lets a FAILED value assertion also print that metric's
+// ledger state, so a value mismatch and its likely cause (silent loss vs double-
+// count) are visible in one place (spec §6: "the conservation ledger for that
+// metric").
 func assertStream(ctx context.Context, rec *recorder, apiAddr, clientTag string, stream metricStream) (passed, failed int) {
+	want := ledgerWriteCounts(stream)
 	for _, m := range stream.Metrics {
 		for _, qf := range funcsFor(m.Kind) {
-			ok, detail := pollMetricFunc(ctx, apiAddr, m, stream.Base, qf)
+			ok, detail := pollMetricFunc(ctx, rec, apiAddr, clientTag, m, stream.Base, want[m.Name], qf)
 			switch {
 			case ok:
 				passed++
@@ -139,11 +145,21 @@ func assertStream(ctx context.Context, rec *recorder, apiAddr, clientTag string,
 
 // pollMetricFunc queries one (metric, func) repeatedly until it matches the
 // expected model or assertTimeout elapses. detail is the last observed failure.
-func pollMetricFunc(ctx context.Context, apiAddr string, m metricModel, base uint32, qf queryFunc) (bool, string) {
+// On failure it ALSO records the raw /api/query response on the recorder (so the
+// run artifacts carry the verbatim JSON of every failed query — spec §6), writes
+// the final response to artifacts under -v, and appends the metric's conservation
+// ledger state (sentWrites drives the balance verdict) so a mismatch and its
+// probable cause read together.
+func pollMetricFunc(ctx context.Context, rec *recorder, apiAddr, clientTag string, m metricModel, base uint32, sentWrites int, qf queryFunc) (bool, string) {
 	qurl := metricQueryURL(apiAddr, m.Name, m.QBKeys, qf.qw, base)
-	var lastDetail string
+	var (
+		lastDetail string
+		lastBody   string
+		lastStatus int
+	)
 	if err := poll(ctx, assertTimeout, 2*time.Second, func() (bool, error) {
-		resp, qerr := queryCounter(ctx, qurl)
+		resp, body, status, qerr := queryCounterRaw(ctx, qurl)
+		lastBody, lastStatus = body, status
 		if qerr != nil {
 			lastDetail = fmt.Sprintf("query error: %v\nurl: %s", qerr, qurl)
 			return false, nil
@@ -158,9 +174,74 @@ func pollMetricFunc(ctx context.Context, apiAddr string, m metricModel, base uin
 		lastDetail = formatFail(m.Name, qurl, qf, mismatches, missing, extras, sampling)
 		return false, nil
 	}); err != nil {
+		// A cancelled context (the run deadline or a signal) is not a value
+		// mismatch: bail BEFORE recording a spurious failed-query or fetching the
+		// ledger (which would itself error under the cancelled ctx and emit a
+		// misleading "ledger: unavailable" line). The run is already tearing down.
+		if ctx.Err() != nil {
+			return false, ""
+		}
+		// Timed out still mismatched → record the verbatim response and annotate
+		// with the metric's ledger state, then surface the detail.
+		if rec != nil {
+			rec.recordFailedQuery(failedQuery{
+				Label: "value", Client: clientTag, Metric: m.Name, Func: qf.label,
+				URL: qurl, HTTPStatus: lastStatus, Body: lastBody,
+			})
+			if rec.verbose {
+				rec.dumpQueryResponse(clientTag, m.Name, qf.label, lastBody)
+			}
+		}
+		lastDetail += "\n" + metricLedgerLine(ctx, apiAddr, base, m.Name, sentWrites)
 		return false, lastDetail
 	}
+	// Matched: under -v keep the verbatim response that satisfied the assertion.
+	if rec != nil && rec.verbose {
+		rec.dumpQueryResponse(clientTag, m.Name, qf.label, lastBody)
+	}
 	return true, ""
+}
+
+// metricLedgerLine returns a one-line snapshot of one metric's conservation
+// ledger state for embedding in a value-assertion failure. It is a DIAGNOSTIC
+// aid (the authoritative balance check is assertConservationLedger): the values
+// are whatever has landed so far, so a "silent loss" verdict here is a strong
+// hint, not a final ruling. sentWrites==0 marks a metric outside the ledger's
+// exact scope (multi-value kinds, where item count ≠ write count). Pure callers
+// (tests) use formatLedgerLine; this wrapper does the live fetch.
+func metricLedgerLine(ctx context.Context, apiAddr string, base uint32, name string, sentWrites int) string {
+	if sentWrites == 0 {
+		return "ledger: not balance-checked (multi-value metric / no ledger-eligible writes)"
+	}
+	bd, _, err := fetchIngestionBreakdown(ctx, apiAddr, base+numBuckets, map[string]bool{name: true})
+	if err != nil {
+		return fmt.Sprintf("ledger: unavailable (%v)", err)
+	}
+	okCached, errSum, _, _ := ledgerBalance(bd[name])
+	return formatLedgerLine(sentWrites, okCached, errSum)
+}
+
+// ledgerSnapshotCaveat is appended to a NON-balanced inline ledger line. That line
+// is embedded in a VALUE-assertion failure by metricLedgerLine, which runs BEFORE
+// the authoritative assertConservationLedger poll converges — so its "silent loss"
+// / "over-counted" verdict is a point-in-time snapshot, not a final ruling (the
+// ledger assertion is authoritative). A balanced line needs no caveat.
+const ledgerSnapshotCaveat = " (snapshot at assertion time; the ledger assertion is authoritative)"
+
+// formatLedgerLine renders the conservation equation verdict for one metric.
+// Pure → unit-tested (TestFormatLedgerLine).
+func formatLedgerLine(sentWrites int, okCached, errSum float64) string {
+	got := okCached + errSum
+	switch {
+	case got == float64(sentWrites):
+		return fmt.Sprintf("ledger: ok_cached=%g + Σerr=%g = %g == sentWrites=%d (balanced)", okCached, errSum, got, sentWrites)
+	case got < float64(sentWrites):
+		return fmt.Sprintf("ledger: ok_cached=%g + Σerr=%g = %g < sentWrites=%d → %g unaccounted (silent loss)%s",
+			okCached, errSum, got, sentWrites, float64(sentWrites)-got, ledgerSnapshotCaveat)
+	default:
+		return fmt.Sprintf("ledger: ok_cached=%g + Σerr=%g = %g > sentWrites=%d → %g over-counted (double-counting)%s",
+			okCached, errSum, got, sentWrites, got-float64(sentWrites), ledgerSnapshotCaveat)
+	}
 }
 
 // metricQueryURL builds GET /api/query for one metric at 1s LOD over its buckets.
@@ -184,19 +265,30 @@ func metricQueryURL(apiAddr, name string, qb []string, qw string, base uint32) s
 	return "http://" + apiAddr + "/api/query?" + q.Encode()
 }
 
-func queryCounter(ctx context.Context, qurl string) (*apiSeriesResponse, error) {
-	body, code, err := httpGet(ctx, qurl)
+// queryCounterRaw is queryCounter that ALSO returns the raw response body and
+// HTTP status. The raw body is what the diagnostics artifacts (failed-queries
+// JSON, the -v per-query response dump) need: a re-formatted struct loses the
+// exact bytes the API returned, which is precisely what a human diagnosing a
+// mismatch wants verbatim. status/body are populated even on a parse error so
+// the failure dump carries the offending payload. Pure callers use queryCounter.
+func queryCounterRaw(ctx context.Context, qurl string) (resp *apiSeriesResponse, body string, status int, err error) {
+	body, status, err = httpGet(ctx, qurl)
 	if err != nil {
-		return nil, err
+		return nil, body, status, err
 	}
-	if code != 200 {
-		return nil, fmt.Errorf("HTTP %d: %s", code, truncate(strings.TrimSpace(body), 300))
+	if status != 200 {
+		return nil, body, status, fmt.Errorf("HTTP %d: %s", status, truncate(strings.TrimSpace(body), 300))
 	}
-	var resp apiSeriesResponse
-	if err := json.Unmarshal([]byte(body), &resp); err != nil {
-		return nil, fmt.Errorf("parse response: %w; body: %s", err, truncate(body, 300))
+	var r apiSeriesResponse
+	if jerr := json.Unmarshal([]byte(body), &r); jerr != nil {
+		return nil, body, status, fmt.Errorf("parse response: %w; body: %s", jerr, truncate(body, 300))
 	}
-	return &resp, nil
+	return &r, body, status, nil
+}
+
+func queryCounter(ctx context.Context, qurl string) (*apiSeriesResponse, error) {
+	resp, _, _, err := queryCounterRaw(ctx, qurl)
+	return resp, err
 }
 
 // indexResponse turns the API's per-series arrays into map[signature]map[bucket]value,
@@ -643,23 +735,24 @@ func pollAbsenceTripwire(ctx context.Context, timeout, interval time.Duration, q
 // __src_client_write_err for the client's language over this run's window and
 // fail (ok=false, with a labelled detail) the moment a non-zero point appears.
 // ok=true means a clean query confirmed no loss within writeErrTimeout. The window
-// starts at the END of the asserted e2e window (the dropped-bytes ts ≈ base+120,
-// well after base+numBuckets) and runs 200s forward — wide enough to absorb
-// client/host clock skew, and anchored on the per-client base so a prior client's
-// loss (its base is much older) is excluded. Returns ok=true at once for a client
-// whose language is unknown (it does not emit the metric, so there is nothing to
-// assert). FAILS CLOSED: if every query errors over the whole window (api down /
-// wrong address), ok=false — a down stack can never pass for "no loss" (see
-// pollAbsenceTripwire).
-func assertNoClientWriteErr(ctx context.Context, apiAddr, clientTag string, base uint32) (ok bool, detail string) {
+// is [statusAnchor, statusAnchor+200]: __src_client_write_err is a REALTIME builtin
+// recorded at the driver's wall-clock write, so it anchors at client-phase start
+// (statusAnchor), NOT the historic base — a --skip-client-build replay keeps an OLD
+// base while the dropped bytes land at replay-now (F1). 200s absorbs build+run+the
+// historic conveyor with clock-skew headroom, and the run-unique metric names
+// exclude other runs. Returns ok=true at once for a client whose language is
+// unknown (it does not emit the metric, so there is nothing to assert). FAILS
+// CLOSED: if every query errors over the whole window (api down / wrong address),
+// ok=false — a down stack can never pass for "no loss" (see pollAbsenceTripwire).
+func assertNoClientWriteErr(ctx context.Context, rec *recorder, apiAddr, clientTag string, statusAnchor uint32) (ok bool, detail string) {
 	lang, knows := clientWriteErrLang[clientTag]
 	if !knows {
 		return true, "" // this client's library does not emit the metric; nothing to assert
 	}
 	q := url.Values{}
 	q.Set("s", clientWriteErrMetric)
-	q.Set("f", strconv.FormatUint(uint64(base+numBuckets), 10))
-	q.Set("t", strconv.FormatUint(uint64(base+numBuckets+200), 10))
+	q.Set("f", strconv.FormatUint(uint64(statusAnchor), 10))
+	q.Set("t", strconv.FormatUint(uint64(statusAnchor+200), 10))
 	q.Set("w", "1s")
 	q.Set("ac", "1")
 	q.Set("qw", "sum")
@@ -670,12 +763,19 @@ func assertNoClientWriteErr(ctx context.Context, apiAddr, clientTag string, base
 	// the language's series is absent (clientWriteErrForLang returns found=false → 0).
 	// pollAbsenceTripwire fails CLOSED: if every query errors for the whole window it
 	// returns ok=false, so a down/misconfigured api can never masquerade as "no loss".
+	var (
+		violBody   string // raw reply of the first query that surfaced a non-zero point
+		violStatus int
+	)
 	query := func(ctx context.Context) (float64, error) {
-		resp, qerr := queryCounter(ctx, qurl)
+		resp, body, status, qerr := queryCounterRaw(ctx, qurl)
 		if qerr != nil {
 			return 0, qerr
 		}
 		maxLost, _ := clientWriteErrForLang(resp, lang)
+		if maxLost > 0 && violBody == "" { // capture the violating payload once
+			violBody, violStatus = body, status
+		}
 		return maxLost, nil
 	}
 	o := pollAbsenceTripwire(ctx, writeErrTimeout, 3*time.Second, query)
@@ -683,10 +783,20 @@ func assertNoClientWriteErr(ctx context.Context, apiAddr, clientTag string, base
 		return true, ""
 	}
 	if !o.confirmed {
+		// recordFailedQuery is nil-safe (a nil recorder is a no-op), so the other
+		// tripwire/assertion paths call it without a rec != nil guard too.
+		rec.recordFailedQuery(failedQuery{
+			Label: "write_err", Client: clientTag, Metric: clientWriteErrMetric,
+			URL: qurl, HTTPStatus: 0, Body: "",
+		})
 		return false, fmt.Sprintf("client=%s lang=%s could not confirm absence of %s — every query failed over %s: %v\nurl: %s",
 			clientTag, lang, clientWriteErrMetric, writeErrTimeout, o.queryErr, qurl)
 	}
 	// A non-zero point surfaced → a dropped-bytes loss was recorded.
+	rec.recordFailedQuery(failedQuery{
+		Label: "write_err", Client: clientTag, Metric: clientWriteErrMetric,
+		URL: qurl, HTTPStatus: violStatus, Body: violBody,
+	})
 	return false, fmt.Sprintf("client=%s lang=%s lost_bytes≈%g (silent TCP-backpressure drop; __src_client_write_err non-zero)\nurl: %s",
 		clientTag, lang, o.worst, qurl)
 }
@@ -757,13 +867,17 @@ func seriesMetaHasLang(tags map[string]apiMetaTag, lang string) bool {
 // ok_cached in -11 — an over-count, which is why value_p is out of the ledger
 // (see ledgerEligibleKind).
 
-// ingestionStatusTail widens the ledger/status query window past the asserted
-// historic window. __src_ingestion_status is a REALTIME builtin: the agent accounts
-// each event at RECEIVE time (≈ the driver's wall-clock write, base+120..base+200
-// after the driver build + pre-warm), NOT at the event's historic ts. The historic
-// conveyor then adds ~24s before a point is queryable. [base+numBuckets,
-// base+numBuckets+ingestionStatusTail] comfortably contains that range with build/
-// clock-skew headroom. Metric names are run-unique, so the wide window cannot pick
+// ingestionStatusTail widens the realtime ledger/status query window. The caller
+// passes statusAnchor (client-phase start, ≈ wall-clock now); the window is
+// [statusAnchor, statusAnchor+ingestionStatusTail]. __src_ingestion_status is a
+// REALTIME builtin: the agent accounts each event at RECEIVE time (≈ the driver's
+// wall-clock write, statusAnchor..statusAnchor+(build+run duration)), NOT at the
+// event's historic ts. The historic conveyor then adds ~24s before a point is
+// queryable. On a normal run statusAnchor≈base+120 so the OLD base-derived window
+// happened to cover the events — but a --skip-client-build REPLAY keeps the
+// descriptor's OLD base while the agent records THIS run's events at replay-now, so
+// the window must anchor at statusAnchor, not base (F1). The tail gives the conveyor
+// + clock-skew headroom; metric names are run-unique, so the wide window cannot pick
 // up another run's statuses.
 const ingestionStatusTail = 400
 
@@ -794,11 +908,18 @@ const samplingTimeout = 30 * time.Second
 // increment summed per bucket). qw=count returns Σ counter value = total events
 // for that (metric, status) over the window — 1 per accepted event into ok_cached,
 // 1 per rejected event into its err_*.
-func ingestionStatusURL(apiAddr string, base uint32) string {
+//
+// anchor is the REALTIME window start: __src_ingestion_status is recorded by the
+// agent at RECEIVE time (≈ the driver's wall-clock write), NOT at the event's
+// historic ts, so the window is [anchor, anchor+ingestionStatusTail]. The caller
+// passes statusAnchor (client-phase start) so a --skip-client-build replay — which
+// keeps the descriptor's OLD historic base while the agent records THIS run's
+// events at replay-now — still queries the right window (F1).
+func ingestionStatusURL(apiAddr string, anchor uint32) string {
 	q := url.Values{}
 	q.Set("s", ingestionStatusMetric)
-	q.Set("f", strconv.FormatUint(uint64(base+numBuckets), 10))
-	q.Set("t", strconv.FormatUint(uint64(base+numBuckets+ingestionStatusTail), 10))
+	q.Set("f", strconv.FormatUint(uint64(anchor), 10))
+	q.Set("t", strconv.FormatUint(uint64(anchor+ingestionStatusTail), 10))
 	q.Set("w", "1s")
 	q.Set("ac", "1")
 	q.Set("qw", "count")
@@ -813,10 +934,16 @@ func ingestionStatusURL(apiAddr string, base uint32) string {
 // client generated (known). classifyIngestionSeries identifies the metric (key1, the
 // metric NAME, pinned to `known`) and the status (key2, a numeric VALUE ID) of each
 // series; both are read by their rendered key (confirmed against the live API).
-func fetchIngestionBreakdown(ctx context.Context, apiAddr string, base uint32, known map[string]bool) (map[string]map[int32]float64, error) {
-	resp, err := queryCounter(ctx, ingestionStatusURL(apiAddr, base))
+//
+// anchor is the REALTIME window start (see ingestionStatusURL). The verbatim
+// response body of the LAST successful query is also returned so a ledger/rejection
+// failure can record the raw JSON in the artifacts (F4). metricLedgerLine (the
+// diagnostic inline line) ignores the body and passes anchor=base+numBuckets to
+// preserve its historic-relative window.
+func fetchIngestionBreakdown(ctx context.Context, apiAddr string, anchor uint32, known map[string]bool) (map[string]map[int32]float64, string, error) {
+	resp, body, _, err := queryCounterRaw(ctx, ingestionStatusURL(apiAddr, anchor))
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	out := make(map[string]map[int32]float64)
 	for i, meta := range resp.Data.Series.SeriesMeta {
@@ -833,7 +960,7 @@ func fetchIngestionBreakdown(ctx context.Context, apiAddr string, base uint32, k
 		}
 		out[metric][statusID] += sum
 	}
-	return out, nil
+	return out, body, nil
 }
 
 // seriesSum sums every bucket value in one series' data array. The query window
@@ -1046,18 +1173,24 @@ func knownMetricNames(stream metricStream) map[string]bool {
 // the input never entered the pipeline, so there is no server status to assert and
 // the case is a documented SKIP — not a silent disappearance. Returns pass/fail
 // counts (one per rejection metric).
-func assertRejections(ctx context.Context, rec *recorder, apiAddr, clientTag string, stream metricStream) (passed, failed int) {
+func assertRejections(ctx context.Context, rec *recorder, apiAddr, clientTag string, stream metricStream, statusAnchor uint32) (passed, failed int) {
 	if len(stream.Rejections) == 0 {
 		return 0, 0
 	}
 	known := knownMetricNames(stream)
-	var last map[string]map[int32]float64
+	// statusAnchor anchors the REALTIME __src_ingestion_status window (F1); qurl is
+	// reused for every failure's failed-query record + the detail builder's url line.
+	qurl := ingestionStatusURL(apiAddr, statusAnchor)
+	var (
+		last     map[string]map[int32]float64
+		lastBody string
+	)
 	_ = poll(ctx, ledgerTimeout, 3*time.Second, func() (bool, error) {
-		bd, err := fetchIngestionBreakdown(ctx, apiAddr, stream.Base, known)
+		bd, body, err := fetchIngestionBreakdown(ctx, apiAddr, statusAnchor, known)
 		if err != nil {
 			return false, nil // transient query error → keep polling (absence is only trustworthy once clean)
 		}
-		last = bd
+		last, lastBody = bd, body
 		return rejectionsConverged(stream.Rejections, bd), nil
 	})
 	for _, r := range stream.Rejections {
@@ -1075,7 +1208,11 @@ func assertRejections(ctx context.Context, rec *recorder, apiAddr, clientTag str
 			continue
 		}
 		failed++
-		det := rejectionFailDetail(r, last[r.Name])
+		det := rejectionFailDetail(r, last[r.Name], qurl)
+		rec.recordFailedQuery(failedQuery{
+			Label: "rejection", Client: clientTag, Metric: r.Name,
+			URL: qurl, Body: lastBody,
+		})
 		rec.logf("FAIL client=%s rejection=%s status=%s(%d)\n%s", clientTag, r.Name, r.StatusName, r.StatusID, indent(det))
 		fmt.Printf("FAIL client=%s rejection=%s status=%s(%d)\n%s\n", clientTag, r.Name, r.StatusName, r.StatusID, indent(det))
 	}
@@ -1117,17 +1254,23 @@ func statusCount(breakdown map[int32]float64, statusID int32) float64 {
 // < sentWrites) or double-counting (>). On failure it prints the FULL breakdown
 // (sentWrites, okCached, every err_* status with its count) so the imbalance is
 // diagnosed at a glance. Returns pass/fail counts (one per metric).
-func assertConservationLedger(ctx context.Context, rec *recorder, apiAddr, clientTag string, stream metricStream) (passed, failed int) {
+func assertConservationLedger(ctx context.Context, rec *recorder, apiAddr, clientTag string, stream metricStream, statusAnchor uint32) (passed, failed int) {
 	want := ledgerWriteCounts(stream)
 	known := knownMetricNames(stream)
 	excluded := ledgerExcludedMetricNames(stream) // multi-value metrics outside the exact 1:1 scope (see ledgerEligibleKind)
-	var last map[string]map[int32]float64
+	// statusAnchor anchors the REALTIME __src_ingestion_status window (F1); qurl is
+	// reused for every failure's failed-query record + the detail builder's url line.
+	qurl := ingestionStatusURL(apiAddr, statusAnchor)
+	var (
+		last     map[string]map[int32]float64
+		lastBody string
+	)
 	_ = poll(ctx, ledgerTimeout, 3*time.Second, func() (bool, error) {
-		bd, err := fetchIngestionBreakdown(ctx, apiAddr, stream.Base, known)
+		bd, body, err := fetchIngestionBreakdown(ctx, apiAddr, statusAnchor, known)
 		if err != nil {
 			return false, nil
 		}
-		last = bd
+		last, lastBody = bd, body
 		return ledgerConverged(want, bd), nil
 	})
 	// Sorted iteration for stable, readable output.
@@ -1144,7 +1287,11 @@ func assertConservationLedger(ctx context.Context, rec *recorder, apiAddr, clien
 			continue
 		}
 		failed++
-		det := ledgerFailDetail(name, sentWrites, okCached, errSum, errs, warns)
+		det := ledgerFailDetail(name, sentWrites, okCached, errSum, errs, warns, qurl)
+		rec.recordFailedQuery(failedQuery{
+			Label: "ledger", Client: clientTag, Metric: name,
+			URL: qurl, Body: lastBody,
+		})
 		rec.logf("FAIL client=%s ledger metric=%s\n%s", clientTag, name, indent(det))
 		fmt.Printf("FAIL client=%s ledger metric=%s\n%s\n", clientTag, name, indent(det))
 	}
@@ -1210,14 +1357,15 @@ const aggSamplingFactorMetric = "__agg_sampling_factor"
 // whole-run confirmation over __agg_sampling_factor itself. ok=true means no sampling
 // point appeared within samplingTimeout (absent), confirmed by at least one CLEAN
 // query. Polls until a non-zero point shows (fails fast) or the window elapses clean.
-// FAILS CLOSED: if every query errors over the whole window (api down / wrong
-// address), ok=false — an unobservable stack can never pass for "no sampling" (see
-// pollAbsenceTripwire).
-func assertNoAggSampling(ctx context.Context, apiAddr, clientTag string, base uint32) (ok bool, detail string) {
+// The window is [statusAnchor, statusAnchor+ingestionStatusTail] — a REALTIME builtin
+// anchored at client-phase start, NOT the historic base (F1). FAILS CLOSED: if every
+// query errors over the whole window (api down / wrong address), ok=false — an
+// unobservable stack can never pass for "no sampling" (see pollAbsenceTripwire).
+func assertNoAggSampling(ctx context.Context, rec *recorder, apiAddr, clientTag string, statusAnchor uint32) (ok bool, detail string) {
 	q := url.Values{}
 	q.Set("s", aggSamplingFactorMetric)
-	q.Set("f", strconv.FormatUint(uint64(base+numBuckets), 10))
-	q.Set("t", strconv.FormatUint(uint64(base+numBuckets+ingestionStatusTail), 10))
+	q.Set("f", strconv.FormatUint(uint64(statusAnchor), 10))
+	q.Set("t", strconv.FormatUint(uint64(statusAnchor+ingestionStatusTail), 10))
 	q.Set("w", "1s")
 	q.Set("ac", "1")
 	q.Set("qw", "count")
@@ -1226,12 +1374,20 @@ func assertNoAggSampling(ctx context.Context, apiAddr, clientTag string, base ui
 	// pollAbsenceTripwire fails CLOSED: if every query errors for the whole window
 	// (api down / wrong address / schema drift) it returns ok=false, so a sampling
 	// event is never hidden behind a stack that could not be queried.
+	var (
+		violBody   string // raw reply of the first query that surfaced a non-zero point
+		violStatus int
+	)
 	query := func(ctx context.Context) (float64, error) {
-		resp, qerr := queryCounter(ctx, qurl)
+		resp, body, status, qerr := queryCounterRaw(ctx, qurl)
 		if qerr != nil {
 			return 0, qerr
 		}
-		return maxSeriesValue(resp), nil
+		mx := maxSeriesValue(resp)
+		if mx > 0 && violBody == "" { // capture the violating payload once
+			violBody, violStatus = body, status
+		}
+		return mx, nil
 	}
 	o := pollAbsenceTripwire(ctx, samplingTimeout, 3*time.Second, query)
 	if o.ok {
@@ -1239,10 +1395,18 @@ func assertNoAggSampling(ctx context.Context, apiAddr, clientTag string, base ui
 		return true, ""
 	}
 	if !o.confirmed {
+		rec.recordFailedQuery(failedQuery{
+			Label: "sampling", Client: clientTag, Metric: aggSamplingFactorMetric,
+			URL: qurl, HTTPStatus: 0, Body: "",
+		})
 		return false, fmt.Sprintf("client=%s could not confirm absence of %s — every query failed over %s: %v\nurl: %s",
 			clientTag, aggSamplingFactorMetric, samplingTimeout, o.queryErr, qurl)
 	}
 	// A non-zero point surfaced → an insert was sampled during the run.
+	rec.recordFailedQuery(failedQuery{
+		Label: "sampling", Client: clientTag, Metric: aggSamplingFactorMetric,
+		URL: qurl, HTTPStatus: violStatus, Body: violBody,
+	})
 	return false, fmt.Sprintf("client=%s %s non-zero (max=%g) — an insert was sampled during the run\nurl: %s",
 		clientTag, aggSamplingFactorMetric, o.worst, qurl)
 }
@@ -1277,8 +1441,9 @@ func sortedStatusIDs(m map[int32]float64) []int32 {
 // metric: the equation that failed, then every status→count the pipeline recorded
 // for it (status name + ID) — including warn_* rows (marked as warnings, not losses)
 // for diagnostic context — so a loss vs a double-count vs an unexpected status is
-// visible at once.
-func ledgerFailDetail(name string, sentWrites int, okCached, errSum float64, errs, warns map[int32]float64) string {
+// visible at once. qurl (the __src_ingestion_status query) is appended so the
+// failing query is pinpointed alongside the breakdown (F4).
+func ledgerFailDetail(name string, sentWrites int, okCached, errSum float64, errs, warns map[int32]float64, qurl string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "conservation imbalance: ok_cached(%g) + Σerr(%g) = %g ≠ sentWrites=%d\n",
 		okCached, errSum, okCached+errSum, sentWrites)
@@ -1301,24 +1466,28 @@ func ledgerFailDetail(name string, sentWrites int, okCached, errSum float64, err
 	for _, id := range sortedStatusIDs(warns) {
 		fmt.Fprintf(&b, "    %s(%d)=%g (warning — accepted, not a loss)\n", ingestionStatusName(id), id, warns[id])
 	}
+	fmt.Fprintf(&b, "url: %s", qurl)
 	return b.String()
 }
 
 // rejectionFailDetail renders the status breakdown for one rejection that did not
 // produce its exact status count: what was expected vs got, then every status the
 // pipeline recorded for that metric (status name + ID), so a wrong status or a
-// partial rejection is visible.
-func rejectionFailDetail(r rejectionMetric, breakdown map[int32]float64) string {
+// partial rejection is visible. qurl (the __src_ingestion_status query) is appended
+// so the failing query is pinpointed alongside the breakdown (F4).
+func rejectionFailDetail(r rejectionMetric, breakdown map[int32]float64, qurl string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "expected %s(%d) count=%d, got count=%g\n",
 		r.StatusName, r.StatusID, r.Writes, statusCount(breakdown, r.StatusID))
 	if len(breakdown) == 0 {
 		fmt.Fprintf(&b, "  (no __src_ingestion_status rows for %s — metric never reached the agent, or window missed it)\n", r.Name)
+		fmt.Fprintf(&b, "url: %s", qurl)
 		return b.String()
 	}
 	fmt.Fprintf(&b, "  full breakdown for %s (status=count):\n", r.Name)
 	for _, id := range sortedStatusIDs(breakdown) {
 		fmt.Fprintf(&b, "    %s(%d)=%g\n", ingestionStatusName(id), id, breakdown[id])
 	}
+	fmt.Fprintf(&b, "url: %s", qurl)
 	return b.String()
 }

@@ -4,6 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"go/format"
 	"os"
@@ -12,6 +15,7 @@ import (
 	"regexp"
 	"strings"
 	"text/template"
+	"time"
 )
 
 // This file implements spec §4 for the go client: acquire the pinned source,
@@ -43,6 +47,19 @@ const (
 	clientMount  = "/client" // the pinned client checkout (ro)
 	modMount     = "/gomodcache"
 	gocacheMount = "/gocache"
+
+	// --skip-client-build cache. A normal build writes the driver BINARY into the
+	// host-mounted buildCache (mounted at driverBinMount) instead of the container
+	// scratch /tmp, plus a tiny stream descriptor (streamJSONName) recording the
+	// (runID, base) the binary was compiled from. A later --skip-client-build run
+	// skips clone+render+compile entirely and just runs the cached binary — but the
+	// driver embeds the metric names + the historic base, so it only matches the
+	// stream it was built against; the descriptor lets the harness REGENERATE that
+	// exact stream (generateStream is a pure function of runID+base) so the cached
+	// binary and the expected model agree bit-for-bit.
+	driverBinName  = "driver"
+	streamJSONName = "stream.json"
+	driverBinMount = "/driverbin" // in-container mount point for the buildCache
 )
 
 // clientSpec is one ACTIVE (uncommented) client parsed from e2e/clients.txt.
@@ -58,15 +75,17 @@ type clientSpec struct {
 // main loop can dispatch on the client name. cache is the shared e2e cache root
 // (~/.cache/statshouse-e2e); each client derives its own sub-caches from it.
 type clientRunOpts struct {
-	stream    metricStream
-	network   string // run network
-	agentAddr string // <agent-ip>:13337 the driver writes to (STATSHOUSE_ADDR)
-	apiAddr   string // <api-ip>:10888 the driver polls to confirm mappings (STATSHOUSE_API_ADDR); "" → fixed fallback
-	container string // client container name
-	workDir   string // host dir holding the rendered driver source (mounted at workMount)
-	repoRoot  string // statshouse checkout root (for the template + clients.txt paths)
-	arch      string // expected GOARCH for the go image's arch self-check
-	cache     string // e2e cache root: gomodcache/gocache (go), rust-target (rust)
+	stream     metricStream
+	network    string // run network
+	agentAddr  string // <agent-ip>:13337 the driver writes to (STATSHOUSE_ADDR)
+	apiAddr    string // <api-ip>:10888 the driver polls to confirm mappings (STATSHOUSE_API_ADDR); "" → fixed fallback
+	container  string // client container name
+	workDir    string // host dir holding the rendered driver source (mounted at workMount)
+	repoRoot   string // statshouse checkout root (for the template + clients.txt paths)
+	arch       string // expected GOARCH for the go image's arch self-check
+	cache      string // e2e cache root: gomodcache/gocache (go), rust-target (rust)
+	buildCache string // host dir holding the cached driver binary + stream descriptor (mounted at driverBinMount)
+	skipBuild  bool   // --skip-client-build: run the cached driver binary, skip clone+render+compile
 }
 
 // parseClientsTxt reads the active (non-comment) client lines from e2e/clients.txt.
@@ -260,23 +279,18 @@ func gitResolveRef(ctx context.Context, dir, ref string) (string, error) {
 	return strings.TrimSpace(res), nil
 }
 
-// renderGoDriver parses the go driver text/template and renders the generated
-// metric stream into <outDir>/main.go. Only the writes (and the kind-aware seeds)
-// are injected; the program shape (TCP client, Historic writes, Close flush) is
-// fixed in the template. The rendered source is run through go/format so the
-// artifact is gofmt-clean and a template bug surfaces here (parse failure) rather
-// than later in the container build.
-func renderGoDriver(tmplPath string, stream metricStream, outDir string) error {
+// renderGoDriverSource parses+executes+gofmts the go driver template into the
+// rendered source TEXT — the exact bytes renderGoDriver writes to disk. Pure (no
+// filesystem write) so the --skip-client-build cache can hash the rendered source
+// (F2) without touching disk. Seeds/Metrics/SeedTS are as in renderGoDriver.
+func renderGoDriverSource(tmplPath string, stream metricStream) (string, error) {
 	tmplText, err := os.ReadFile(tmplPath)
 	if err != nil {
-		return fmt.Errorf("read driver template %s: %w", tmplPath, err)
+		return "", fmt.Errorf("read driver template %s: %w", tmplPath, err)
 	}
 	t, err := template.New("go-driver").Parse(string(tmplText))
 	if err != nil {
-		return fmt.Errorf("parse driver template %s: %w", tmplPath, err)
-	}
-	if err := os.MkdirAll(outDir, 0o755); err != nil {
-		return err
+		return "", fmt.Errorf("parse driver template %s: %w", tmplPath, err)
 	}
 	// Seeds drive the cold-start pre-warm: one KIND-MATCHING write per metric so
 	// auto-create derives the right kind (value/unique) rather than the counter
@@ -296,32 +310,47 @@ func renderGoDriver(tmplPath string, stream metricStream, outDir string) error {
 		Metrics: names,
 		SeedTS:  stream.Base - 60,
 	}); err != nil {
-		return fmt.Errorf("render driver: %w", err)
+		return "", fmt.Errorf("render driver: %w", err)
 	}
 	formatted, err := format.Source(raw.Bytes())
 	if err != nil {
-		return fmt.Errorf("gofmt rendered driver: %w\n%s", err, raw.String())
+		return "", fmt.Errorf("gofmt rendered driver: %w\n%s", err, raw.String())
 	}
-	return os.WriteFile(filepath.Join(outDir, "main.go"), formatted, 0o644)
+	return string(formatted), nil
 }
 
-// renderDriver is the shared core of the rust/cpp renderers: parse a driver
-// text/template (binding the language-specific escapers in funcs), inject the
-// metric stream, and write <outDir>/<outFile>. The escapers mean an injected
-// value carrying a quote, backslash, or non-ASCII byte can never break the
-// rendered source. renderGoDriver stays separate — it gofmt's its output and
-// binds no escapers. name is the template's internal name (cosmetic).
-func renderDriver(tmplPath, name string, funcs template.FuncMap, stream metricStream, outDir, outFile string) error {
-	tmplText, err := os.ReadFile(tmplPath)
+// renderGoDriver parses the go driver text/template and renders the generated
+// metric stream into <outDir>/main.go. Only the writes (and the kind-aware seeds)
+// are injected; the program shape (TCP client, Historic writes, Close flush) is
+// fixed in the template. The rendered source is run through go/format so the
+// artifact is gofmt-clean and a template bug surfaces here (parse failure) rather
+// than later in the container build.
+func renderGoDriver(tmplPath string, stream metricStream, outDir string) error {
+	src, err := renderGoDriverSource(tmplPath, stream)
 	if err != nil {
-		return fmt.Errorf("read driver template %s: %w", tmplPath, err)
-	}
-	t, err := template.New(name).Funcs(funcs).Parse(string(tmplText))
-	if err != nil {
-		return fmt.Errorf("parse driver template %s: %w", tmplPath, err)
+		return err
 	}
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return err
+	}
+	return os.WriteFile(filepath.Join(outDir, "main.go"), []byte(src), 0o644)
+}
+
+// renderDriverSource is the shared, pure core of the rust/cpp renderers: parse a
+// driver text/template (binding the language-specific escapers in funcs), inject
+// the metric stream, and return the rendered source TEXT — the exact bytes
+// renderDriver writes to disk. Pure (no filesystem write) so the
+// --skip-client-build cache can hash the rendered source (F2). The escapers mean
+// an injected value carrying a quote, backslash, or non-ASCII byte can never break
+// the rendered source. name is the template's internal name (cosmetic).
+func renderDriverSource(tmplPath, name string, funcs template.FuncMap, stream metricStream) (string, error) {
+	tmplText, err := os.ReadFile(tmplPath)
+	if err != nil {
+		return "", fmt.Errorf("read driver template %s: %w", tmplPath, err)
+	}
+	t, err := template.New(name).Funcs(funcs).Parse(string(tmplText))
+	if err != nil {
+		return "", fmt.Errorf("parse driver template %s: %w", tmplPath, err)
 	}
 	seeds, names := streamSeeds(stream)
 	var raw bytes.Buffer
@@ -336,9 +365,26 @@ func renderDriver(tmplPath, name string, funcs template.FuncMap, stream metricSt
 		Metrics: names,
 		SeedTS:  stream.Base - 60,
 	}); err != nil {
-		return fmt.Errorf("render driver: %w", err)
+		return "", fmt.Errorf("render driver: %w", err)
 	}
-	return os.WriteFile(filepath.Join(outDir, outFile), raw.Bytes(), 0o644)
+	return raw.String(), nil
+}
+
+// renderDriver is the shared core of the rust/cpp renderers: parse a driver
+// text/template (binding the language-specific escapers in funcs), inject the
+// metric stream, and write <outDir>/<outFile>. The escapers mean an injected
+// value carrying a quote, backslash, or non-ASCII byte can never break the
+// rendered source. renderGoDriver stays separate — it gofmt's its output and
+// binds no escapers. name is the template's internal name (cosmetic).
+func renderDriver(tmplPath, name string, funcs template.FuncMap, stream metricStream, outDir, outFile string) error {
+	src, err := renderDriverSource(tmplPath, name, funcs, stream)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(outDir, outFile), []byte(src), 0o644)
 }
 
 // writeGoMod writes the synthetic driver module's go.mod with a replace directive
@@ -430,11 +476,241 @@ func assertGoModReplace(workDir string) error {
 	return nil
 }
 
+// clientBuildCacheDir is the per-(client,ref,arch) directory a normal build
+// writes the driver binary + stream descriptor into, and --skip-client-build
+// later reads back. It is keyed on the pinned ref + arch so a stale binary from
+// a different client version or build arch can never be replayed by accident.
+func clientBuildCacheDir(cache, clientTag, ref, arch string) string {
+	return filepath.Join(cache, "clientbuilds", clientTag+"@"+ref+"__"+arch)
+}
+
+// clientBuildCacheFor resolves a client's pinned spec (from e2e/clients.txt) and
+// its build-cache directory. runClientPhase needs the cache path up front (to pass
+// to the build step and to decide whether a cached stream exists), independent of
+// the build step's own spec lookup.
+func clientBuildCacheFor(repoRoot, cache, clientName, clientTag, arch string) (clientSpec, string, error) {
+	clients, err := parseClientsTxt(filepath.Join(repoRoot, "e2e", "clients.txt"))
+	if err != nil {
+		return clientSpec{}, "", fmt.Errorf("parse e2e/clients.txt: %w", err)
+	}
+	spec, ok := findClient(clients, clientName)
+	if !ok {
+		return clientSpec{}, "", fmt.Errorf("no %q entry in e2e/clients.txt", clientName)
+	}
+	return spec, clientBuildCacheDir(cache, clientTag, spec.Ref, arch), nil
+}
+
+// streamCacheMeta is the tiny descriptor cached alongside a built driver binary:
+// the (runID, base) the driver was compiled from. The driver embeds the metric
+// names (runID-prefixed) and the historic bucket timestamps (base-derived), so it
+// only matches the ONE stream it was built against. Caching runID+base lets a
+// --skip-client-build run REGENERATE that exact stream (generateStream is a pure
+// function of runID+base) instead of serializing the multi-thousand-point value_p
+// / unique expected models (which would also risk NaN/Inf round-trips). ClientTag
+// and Arch guard against replaying a binary built for a different client or arch.
+//
+// SourceHash (sha256 of the rendered driver source) and BaseImage (the pinned
+// toolchain tag the binary was built in) were added by ticket 13's cache-
+// invalidation fix: a later --skip-client-build re-renders the source from the
+// descriptor and REFUSES if either changed, so a template/generator edit or a
+// toolchain bump can never replay a stale binary against a freshly-rendered
+// (different) model. Empty fields (descriptors from before the guard) skip the
+// matching check for backward compatibility.
+type streamCacheMeta struct {
+	RunID      string `json:"run_id"`
+	Base       uint32 `json:"base"`
+	ClientTag  string `json:"client_tag"`
+	Arch       string `json:"arch"`
+	SourceHash string `json:"source_hash,omitempty"`
+	BaseImage  string `json:"base_image,omitempty"`
+}
+
+// sourceHash returns the lowercase hex sha256 of a rendered driver source — the
+// fingerprint stored in streamCacheMeta so a --skip-client-build replay can
+// detect that the template or generator changed since the cached binary was built.
+func sourceHash(src string) string {
+	h := sha256.Sum256([]byte(src))
+	return hex.EncodeToString(h[:])
+}
+
+// saveStreamCacheMeta writes the stream descriptor into buildCache as stream.json.
+// Called once after a normal build has produced the driver binary.
+func saveStreamCacheMeta(buildCache, runID string, base uint32, clientTag, arch, srcHash, baseImage string) error {
+	meta := streamCacheMeta{RunID: runID, Base: base, ClientTag: clientTag, Arch: arch, SourceHash: srcHash, BaseImage: baseImage}
+	data, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal stream cache descriptor: %w", err)
+	}
+	if err := os.MkdirAll(buildCache, 0o755); err != nil {
+		return fmt.Errorf("create build cache %s: %w", buildCache, err)
+	}
+	return os.WriteFile(filepath.Join(buildCache, streamJSONName), append(data, '\n'), 0o644)
+}
+
+// removeStreamCacheDescriptor deletes the stream descriptor from buildCache. Called
+// when a build/run FAILS so the next --skip-client-build does not pair a stale or
+// absent binary with the descriptor just written at build time (F7): the compiler
+// leaves the OLD binary on a compile failure, so a NEW descriptor would desync from
+// it, and a successful build whose driver run failed leaves a binary that was never
+// validated end-to-end. Removing the descriptor forces a rebuild — correctness over
+// cache preservation. A missing file is a no-op (first run, nothing cached).
+func removeStreamCacheDescriptor(rec *recorder, clientName, buildCache string) {
+	if err := os.Remove(filepath.Join(buildCache, streamJSONName)); err != nil && !os.IsNotExist(err) {
+		rec.logf("%s: could not remove stale stream descriptor after failed run: %v", clientName, err)
+	}
+}
+
+// loadStreamCacheMeta reads the stream descriptor from buildCache. A missing file
+// is surfaced as an error the caller phrases into an actionable "no cached build"
+// message.
+func loadStreamCacheMeta(buildCache string) (streamCacheMeta, error) {
+	data, err := os.ReadFile(filepath.Join(buildCache, streamJSONName))
+	if err != nil {
+		return streamCacheMeta{}, fmt.Errorf("read stream cache descriptor: %w", err)
+	}
+	var meta streamCacheMeta
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return streamCacheMeta{}, fmt.Errorf("parse stream cache descriptor: %w", err)
+	}
+	return meta, nil
+}
+
+// validateSkipClientBuildCache performs the PURE host-side --skip-client-build
+// validation for one driver: the stream descriptor is present and loadable, its
+// ClientTag/Arch match this driver+arch, the cached driver binary exists, and —
+// for descriptors written after the cache-invalidation guard (ticket 13) — the
+// pinned base image and the sha256 of the re-rendered driver source still match.
+// A missing/mismatched cache fails with actionable text (run once WITHOUT
+// --skip-client-build). Pure (file reads + a re-render only) so it is also called
+// eagerly, before the ~1min stack bring-up, to fail a bad skip-run in <1s (F6).
+func validateSkipClientBuildCache(d clientDriver, repoRoot, buildCache, arch string) error {
+	descPath := filepath.Join(buildCache, streamJSONName)
+	if !fileExists(descPath) {
+		return fmt.Errorf(
+			"--skip-client-build: %s: no cached build in %s — run once WITHOUT --skip-client-build to build and cache the driver",
+			d.name, buildCache)
+	}
+	meta, err := loadStreamCacheMeta(buildCache)
+	if err != nil {
+		return fmt.Errorf("--skip-client-build: %s: %w", d.name, err)
+	}
+	if meta.ClientTag != d.tag {
+		return fmt.Errorf(
+			"--skip-client-build: %s: cached build is for client %q, not %q — remove %s and rebuild",
+			d.name, meta.ClientTag, d.tag, buildCache)
+	}
+	if meta.Arch != arch {
+		return fmt.Errorf(
+			"--skip-client-build: %s: cached driver is arch %q, not %q — remove %s and rebuild",
+			d.name, meta.Arch, arch, buildCache)
+	}
+	if !fileExists(filepath.Join(buildCache, driverBinName)) {
+		return fmt.Errorf(
+			"--skip-client-build: %s: stream descriptor present but no cached driver binary in %s — run once WITHOUT --skip-client-build",
+			d.name, buildCache)
+	}
+	// Refuse to replay a binary whose base image or rendered source no longer
+	// matches: a toolchain bump or a template/generator edit would run a stale
+	// binary against a freshly-rendered (different) model. Descriptors written
+	// before this guard (empty fields) skip the check for backward compat, so an
+	// existing cache is not invalidated retroactively.
+	if meta.BaseImage != "" && meta.BaseImage != d.baseImage {
+		return fmt.Errorf(
+			"--skip-client-build: %s: base image changed since this binary was built (cached %q, now %q) — run once WITHOUT --skip-client-build",
+			d.name, meta.BaseImage, d.baseImage)
+	}
+	if meta.SourceHash != "" {
+		// Reconstruct the exact stream the cached binary was compiled from and
+		// re-render it: generateStream is a pure function of (runID, base), so the
+		// rendered source is bit-identical iff neither the template nor the
+		// generator changed.
+		stream := generateStream(meta.RunID, meta.ClientTag, time.Unix(int64(meta.Base)+120, 0))
+		src, err := d.renderSource(repoRoot, stream)
+		if err != nil {
+			return fmt.Errorf("--skip-client-build: %s: re-render driver to verify cache: %w", d.name, err)
+		}
+		if hash := sourceHash(src); hash != meta.SourceHash {
+			return fmt.Errorf(
+				"--skip-client-build: %s: template changed since this binary was built — run once WITHOUT --skip-client-build",
+				d.name)
+		}
+	}
+	return nil
+}
+
+// streamForClientPhase picks the stream source for one client:
+//   - normal run: a fresh stream (base = now − 120); cached=false.
+//   - --skip-client-build: REPLAY the exact stream the cached driver binary was
+//     compiled from — validate the cache (validateSkipClientBuildCache), then load
+//     the (runID, base) descriptor and regenerate the stream from it (generateStream
+//     is a pure function of runID+base, so reconstructing now = base+120 reproduces
+//     base bit-for-bit). cached=true.
+//
+// A missing or mismatched cache fails with actionable text (run once WITHOUT
+// --skip-client-build) rather than silently regenerating a stream the cached
+// binary cannot match.
+func streamForClientPhase(d clientDriver, o clientPhaseOpts, buildCache string) (metricStream, bool, error) {
+	if !o.skipClientBuild {
+		return generateStream(o.runID, d.tag, time.Now()), false, nil
+	}
+	if err := validateSkipClientBuildCache(d, o.repoRoot, buildCache, o.arch); err != nil {
+		return metricStream{}, false, err
+	}
+	meta, err := loadStreamCacheMeta(buildCache)
+	if err != nil {
+		return metricStream{}, false, fmt.Errorf("--skip-client-build: %s: %w", d.name, err)
+	}
+	// Reconstruct the exact `now` the original build derived base from: base+120.
+	// now.Unix() = base+120 → generateStream computes base = (base+120)−120 = base.
+	now := time.Unix(int64(meta.Base)+120, 0)
+	return generateStream(meta.RunID, meta.ClientTag, now), true, nil
+}
+
+// streamSourceLabel renders the provenance line logged before each client phase
+// ("generated" vs "replayed (cached build)").
+func streamSourceLabel(cached bool) string {
+	if cached {
+		return "replayed (cached build)"
+	}
+	return "generated"
+}
+
+// runCachedDriver runs a previously-built driver binary out of its host-mounted
+// buildCache (--skip-client-build), skipping clone+render+compile entirely. The
+// binary runs in the SAME pinned base image it was built in so its runtime libc
+// / libstdc++ / libgcc_s dependencies match (go's CGO_ENABLED=0 binary is static,
+// but rust/cpp link glibc dynamically). Only the buildCache volume is needed — no
+// source, no checkout.
+func runCachedDriver(ctx context.Context, rt Runtime, rec *recorder, o clientRunOpts, image string) (int, string, error) {
+	opts := RunOpts{
+		Name:    o.container,
+		Image:   image,
+		Network: o.network,
+		Env: []string{
+			"STATSHOUSE_ADDR=" + o.agentAddr,
+			"STATSHOUSE_API_ADDR=" + o.apiAddr,
+		},
+		Volumes: []string{
+			o.buildCache + ":" + driverBinMount,
+		},
+		Cmd:    []string{"/bin/sh", "-c", "set -e; echo \"e2e: running cached driver from " + driverBinMount + "\"; " + driverBinMount + "/" + driverBinName},
+		AutoRm: true,
+	}
+	rec.logf("%s: --skip-client-build: running cached driver from %s (%s)", o.container, o.buildCache, image)
+	res, runErr := run(ctx, rt.Name(), buildRunArgs(opts)...)
+	output := res.stdout + res.stderr
+	return res.exitCode, output, runErr
+}
+
 // buildAndRunGoClient is the full spec §4 go-client path: clone → render → host
 // module resolve → offline container build → foreground run. Returns the driver
 // process exit code, its combined stdout+stderr, and a launch error (if any). A
 // non-zero exit is reported via exitCode, not err.
 func buildAndRunGoClient(ctx context.Context, rt Runtime, rec *recorder, o clientRunOpts) (int, string, error) {
+	// --skip-client-build: run the cached driver binary without clone+render+build.
+	if o.skipBuild {
+		return runCachedDriver(ctx, rt, rec, o, goBaseImage)
+	}
 	clients, err := parseClientsTxt(filepath.Join(o.repoRoot, "e2e", "clients.txt"))
 	if err != nil {
 		return 0, "", fmt.Errorf("parse e2e/clients.txt: %w", err)
@@ -465,7 +741,7 @@ func buildAndRunGoClient(ctx context.Context, rt Runtime, rec *recorder, o clien
 	}
 	gomodcache := filepath.Join(o.cache, "gomodcache")
 	gocache := filepath.Join(o.cache, "gocache")
-	for _, d := range []string{gomodcache, gocache} {
+	for _, d := range []string{gomodcache, gocache, o.buildCache} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			return 0, "", fmt.Errorf("create cache %s: %w", d, err)
 		}
@@ -488,8 +764,8 @@ func buildAndRunGoClient(ctx context.Context, rt Runtime, rec *recorder, o clien
 	buildRun := "set -e; cd " + workMount +
 		`; echo "e2e: GOARCH=$(go env GOARCH) GOOS=$(go env GOOS) GOVERSION=$(go version)"` +
 		`; test "$(go env GOARCH)" = "` + o.arch + `" || { echo "e2e: golang image GOARCH does not match runtime arch '""" + o.arch + """'"; exit 2; }` +
-		"; go build -o /tmp/driver ." +
-		"; /tmp/driver"
+		"; go build -o " + driverBinMount + "/" + driverBinName + " ." +
+		"; " + driverBinMount + "/" + driverBinName
 
 	opts := RunOpts{
 		Name:    o.container,
@@ -509,6 +785,7 @@ func buildAndRunGoClient(ctx context.Context, rt Runtime, rec *recorder, o clien
 			clonePath + ":" + clientMount + ":ro", // the pinned client checkout
 			gomodcache + ":" + modMount,           // host-resolved modules
 			gocache + ":" + gocacheMount,          // repeat-build compile cache
+			o.buildCache + ":" + driverBinMount,   // build output → cached driver binary (--skip-client-build)
 		},
 		Cmd:    []string{"/bin/sh", "-c", buildRun},
 		AutoRm: true, // one-shot: remove on exit

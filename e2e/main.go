@@ -14,6 +14,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -26,6 +27,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -43,18 +45,20 @@ var runIDRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
 
 func main() {
 	var (
-		runtimeFlag = flag.String("runtime", "", "container runtime: \"container\" (apple, default on macOS) or \"docker\" (default on Linux); auto-detected if empty")
-		runIDFlag   = flag.String("run-id", "", "run identifier (default: local datetime 20060102-150405)")
-		archFlag    = flag.String("arch", "", "GOARCH to cross-compile daemons for (default arm64; the apple/container + lima/arm64 verification path)")
-		keep        = flag.Bool("keep", false, "keep containers+network after the run for debugging")
-		verbose     = flag.Bool("v", false, "verbose: print extra detail")
-		timeout     = flag.Duration("timeout", 10*time.Minute, "overall run timeout")
-		clientSel   clientFlag
+		runtimeFlag     = flag.String("runtime", "", "container runtime: \"container\" (apple, default on macOS) or \"docker\" (default on Linux); auto-detected if empty")
+		runIDFlag       = flag.String("run-id", "", "run identifier (default: local datetime 20060102-150405)")
+		archFlag        = flag.String("arch", "", "GOARCH to cross-compile daemons for (default arm64; the apple/container + lima/arm64 verification path)")
+		keep            = flag.Bool("keep", false, "keep containers+network after the run for debugging")
+		verbose         = flag.Bool("v", false, "verbose: stream container logs live and dump raw API responses to artifacts")
+		timeout         = flag.Duration("timeout", 10*time.Minute, "overall run timeout")
+		skipClientBuild = flag.Bool("skip-client-build", false, "reuse previously-built client driver binaries + cached stream (skip the in-container compile); fails if no cached build exists for a selected client")
+		withUI          = flag.Bool("with-ui", false, "build+serve the npm UI (ticket 15 — not yet implemented; accepted so it does not conflict)")
+		clientSel       clientFlag
 	)
 	flag.Var(&clientSel, "client", "client(s) to drive (repeatable; one of: go, rust, cpp). Default: all three")
 	flag.Parse()
 
-	os.Exit(realMain(*runtimeFlag, *runIDFlag, *archFlag, *keep, *verbose, *timeout, clientSel))
+	os.Exit(realMain(*runtimeFlag, *runIDFlag, *archFlag, *keep, *verbose, *timeout, clientSel, *skipClientBuild, *withUI))
 }
 
 // clientFlag is a repeatable --client selector (flag.Var). Each Set appends, so
@@ -78,19 +82,39 @@ func (c *clientFlag) Set(v string) error {
 // active entry in e2e/clients.txt; tag is the short --client selector AND the
 // per-client metric-name prefix that isolates one client's writes from another's
 // (stream.go); buildRun is the language-specific clone→render→build→run.
+// baseImage is the pinned toolchain tag the driver builds+runs in (used by the
+// --skip-client-build cache guard). renderSource renders the stream to driver
+// source TEXT (pure, host-side) so the cache guard can hash it without a build.
 type clientDriver struct {
-	name     string // e.g. "statshouse-go"
-	tag      string // e.g. "go"
-	buildRun func(ctx context.Context, rt Runtime, rec *recorder, o clientRunOpts) (int, string, error)
+	name         string // e.g. "statshouse-go"
+	tag          string // e.g. "go"
+	baseImage    string // pinned toolchain tag (goBaseImage / rustBaseImage / cppBaseImage)
+	buildRun     func(ctx context.Context, rt Runtime, rec *recorder, o clientRunOpts) (int, string, error)
+	renderSource func(repoRoot string, stream metricStream) (string, error)
 }
 
 // clientDrivers is the registry of every client the harness can drive, in the
 // order a default (no --client) run executes them. Adding a client here (and to
 // e2e/clients.txt) is all the wiring the main loop needs.
 var clientDrivers = []clientDriver{
-	{name: goClientName, tag: goClientTag, buildRun: buildAndRunGoClient},
-	{name: rustClientName, tag: rustClientTag, buildRun: buildAndRunRustClient},
-	{name: cppClientName, tag: cppClientTag, buildRun: buildAndRunCppClient},
+	{
+		name: goClientName, tag: goClientTag, baseImage: goBaseImage, buildRun: buildAndRunGoClient,
+		renderSource: func(root string, s metricStream) (string, error) {
+			return renderGoDriverSource(filepath.Join(root, "e2e", driverGoDir, "main.go.tmpl"), s)
+		},
+	},
+	{
+		name: rustClientName, tag: rustClientTag, baseImage: rustBaseImage, buildRun: buildAndRunRustClient,
+		renderSource: func(root string, s metricStream) (string, error) {
+			return renderDriverSource(filepath.Join(root, "e2e", driverRustDir, "main.rs.tmpl"), "rust-driver", rustDriverFuncs(), s)
+		},
+	},
+	{
+		name: cppClientName, tag: cppClientTag, baseImage: cppBaseImage, buildRun: buildAndRunCppClient,
+		renderSource: func(root string, s metricStream) (string, error) {
+			return renderDriverSource(filepath.Join(root, "e2e", driverCppDir, "main.cpp.tmpl"), "cpp-driver", cppDriverFuncs(), s)
+		},
+	},
 }
 
 // selectDrivers resolves the repeatable --client selectors to the drivers to
@@ -121,7 +145,39 @@ func selectDrivers(sels []string) ([]clientDriver, error) {
 	return out, nil
 }
 
-func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeout time.Duration, clientSel clientFlag) int {
+// validateSkipClientBuild runs the PURE host-side --skip-client-build validation
+// for every selected driver: each one's cached build must be present, match the
+// client+arch, carry a driver binary, and (for new descriptors) match the current
+// base image + rendered-source hash. It is called eagerly — right after driver
+// selection, BEFORE the ~1min ClickHouse/daemon stack bring-up — so a bad skip-run
+// (no cache, stale cache, template/toolchain drift) fails in <1s instead of after
+// the full stack is up (F6). repoRoot/cache mirror the per-client build-cache
+// resolution runClientPhase does, so the early check sees exactly what the phase
+// will see.
+func validateSkipClientBuild(drivers []clientDriver, repoRoot, cache, arch string) error {
+	for _, d := range drivers {
+		_, buildCache, err := clientBuildCacheFor(repoRoot, cache, d.name, d.tag, arch)
+		if err != nil {
+			return fmt.Errorf("%s: resolve build cache: %w", d.name, err)
+		}
+		if err := validateSkipClientBuildCache(d, repoRoot, buildCache, arch); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// driverTags returns the comma-joined tags of the selected drivers (e.g. "go,
+// rust, cpp") for the progress log.
+func driverTags(drivers []clientDriver) string {
+	tags := make([]string, 0, len(drivers))
+	for _, d := range drivers {
+		tags = append(tags, d.tag)
+	}
+	return strings.Join(tags, ", ")
+}
+
+func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeout time.Duration, clientSel clientFlag, skipClientBuild, withUI bool) int {
 	runID := runIDFlag
 	if runID == "" {
 		runID = time.Now().Format("20060102-150405")
@@ -143,7 +199,14 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeo
 		return 2
 	}
 
-	rec := &recorder{}
+	// --with-ui is reserved for ticket 15 (the npm UI build). Parsing it here keeps
+	// a script/UI-aware invocation from erroring on an unknown flag; the build is
+	// NOT implemented, so we warn and run UI-less rather than silently ignoring it.
+	if withUI {
+		fmt.Fprintln(os.Stderr, "[e2e] note: --with-ui is reserved for ticket 15 (npm UI build) and is not yet implemented; running without the UI")
+	}
+
+	rec := &recorder{verbose: verbose, artifactsDir: artifactsDir}
 	rec.logf("runid=%s artifacts=%s", runID, artifactsDir)
 
 	network := e2ePrefix + runID
@@ -172,6 +235,26 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeo
 	}
 	rec.logf("preflight ok (%s)", rt.Name())
 
+	// --- resolve selected drivers + e2e cache + arch early ---
+	// All three are pure host-side resolutions; doing them here (before any container
+	// is created) lets --skip-client-build fail FAST on a missing/stale/drifted cache
+	// instead of after the ~1min stack bring-up (F6).
+	arch := resolveArch(archFlag)
+	drivers, err := selectDrivers(clientSel)
+	if err != nil {
+		return fail(rec, artifactsDir, rt, nil, err)
+	}
+	cache, err := e2eCacheDir()
+	if err != nil {
+		return fail(rec, artifactsDir, rt, nil, fmt.Errorf("resolve e2e cache dir: %w", err))
+	}
+	if skipClientBuild {
+		if err := validateSkipClientBuild(drivers, root, cache, arch); err != nil {
+			return fail(rec, artifactsDir, rt, nil, err)
+		}
+		rec.logf("--skip-client-build: cached build validated for client(s) %s", driverTags(drivers))
+	}
+
 	// --- prune leftovers from prior runs (before creating this run's resources) ---
 	prunedC, prunedN := pruneStale(ctx, rt)
 	if prunedC+prunedN > 0 {
@@ -184,12 +267,46 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeo
 	// and fail() can clean/capture them uniformly (even on partial starts).
 	var containers []string
 
+	// Pre-declared so the --keep branch of the teardown closure (below) can read
+	// them: both are assigned further down (after loadConfig / startDaemonStack)
+	// and stay nil/empty on an early abort, which is exactly the case where the
+	// closure must NOT try to print a reachable api address.
+	var (
+		cfg publishConfig // loaded after the published-port preflight
+		ds  *daemonStack  // started after the daemons build
+	)
+
 	// --- teardown unless --keep ---
 	// Uses a fresh context (not the run ctx, which the --timeout deadline or a
 	// signal may have cancelled) so cleanup still runs after the run deadline fires.
 	teardown := func() {
 		if keep {
-			rec.logf("keeping resources (--keep): containers=%v network=%s", containers, network)
+			// Print how to reach the kept stack so a human can poke it without
+			// re-deriving addresses (spec §6: "--keep leaves the stack running and
+			// the harness prints how to reach it"). The api is the only published
+			// port by default; when it is not published the container IP is reachable
+			// only from inside the run network. cfg/ds are nil on an early abort.
+			rec.logf("keeping resources (--keep): %d container(s) %v on network %s", len(containers), containers, network)
+			addr := ""
+			if cfg != nil {
+				addr = cfg.hostAddr("api")
+			}
+			if addr == "" && ds != nil && ds.api != nil {
+				addr = net.JoinHostPort(ds.api.ip, strconv.Itoa(apiPort)) + "  (container IP — reachable from the run network)"
+			}
+			if addr != "" {
+				now := time.Now()
+				rec.logf("  reach the api:  curl 'http://%s/api/query?s=__agg_bucket_receive_delay_sec&f=%d&t=%d&w=1s&qw=count&ac=1'",
+					addr, now.Add(-5*time.Minute).Unix(), now.Unix())
+			}
+			rec.logf("  container logs: %s logs <name>   (names: %s)", rt.Name(), strings.Join(containers, " "))
+			rec.logf("  tear it down:   %s rm -f %s   &&   %s network rm %s",
+				rt.Name(), strings.Join(containers, " "), rt.Name(), network)
+			rec.logf("  note: the next `go run ./e2e` prunes this stack.")
+			// These keep lines are logged in the DEFERRED teardown, which runs AFTER
+			// writeRunArtifacts already wrote summary.txt — re-write the summary so the
+			// --keep reachability/note lines are captured in the artifact too (F5).
+			writeSummary(artifactsDir, rec.lines)
 			return
 		}
 		tctx, tcancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -223,7 +340,7 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeo
 	// publish port mean one run's assertions silently query the other's api.
 	// Bail before the expensive ClickHouse/daemon setup if a configured host
 	// port already answers.
-	cfg, err := loadConfig(filepath.Join(root, "e2e", "config.yaml"))
+	cfg, err = loadConfig(filepath.Join(root, "e2e", "config.yaml"))
 	if err != nil {
 		return fail(rec, artifactsDir, rt, containers, fmt.Errorf("load e2e/config.yaml: %w", err))
 	}
@@ -266,7 +383,6 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeo
 	}
 
 	// --- build the four daemons (cached across runs) ---
-	arch := resolveArch(archFlag)
 	binDir, err := buildDaemons(ctx, root, arch, rec.logf)
 	if err != nil {
 		return fail(rec, artifactsDir, rt, containers, fmt.Errorf("build daemons: %w", err))
@@ -282,7 +398,7 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeo
 	}
 	defer os.Remove(rpcKeyPath)
 	start = time.Now()
-	ds, err := startDaemonStack(ctx, rt, rec, daemonStackOpts{
+	ds, err = startDaemonStack(ctx, rt, rec, daemonStackOpts{
 		network:      network,
 		chIP:         ch.ip,
 		binDir:       binDir,
@@ -318,6 +434,21 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeo
 	}
 	rec.logf("agent↔agg conveyor live (recent %s point)", queryMetric)
 
+	// Under -v, stream each daemon container's logs to stderr LIVE while the run
+	// proceeds (spec §6: "-v streams logs live"). Stopped before teardown (the stop
+	// defer is registered after teardown's, so it runs first — LIFO) so the tail
+	// goroutine never races the container Rm. containers holds clickhouse + the four
+	// daemons by now; client containers run foreground (their stdout already streams).
+	var stopStreamer func()
+	if verbose {
+		stopStreamer = startLogStreamer(ctx, rt, containers)
+	}
+	defer func() {
+		if stopStreamer != nil {
+			stopStreamer()
+		}
+	}()
+
 	// --- client phase (tickets 09/10/11): drive each selected client over TCP
 	// with explicit historic timestamps, wait for its clean exit, then assert
 	// per-kind per-bucket/per-series equality across the full §5 metric matrix
@@ -325,14 +456,6 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeo
 	// adds rust and cpp on the same path; ticket 11 extends the stream + the
 	// assertions to all metric kinds. The three are isolated by per-client metric
 	// prefixes so their values never collide on the shared stack. ---
-	drivers, err := selectDrivers(clientSel)
-	if err != nil {
-		return fail(rec, artifactsDir, rt, containers, err)
-	}
-	cache, err := e2eCacheDir()
-	if err != nil {
-		return fail(rec, artifactsDir, rt, containers, fmt.Errorf("resolve e2e cache dir: %w", err))
-	}
 	phaseOpts := clientPhaseOpts{
 		network:          network,
 		agentIP:          ds.agent.ip,
@@ -343,6 +466,7 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeo
 		repoRoot:         root,
 		artifactsDir:     artifactsDir,
 		cache:            cache,
+		skipClientBuild:  skipClientBuild,
 	}
 	var totalPass, totalFail int
 	for _, d := range drivers {
@@ -354,7 +478,7 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeo
 	// though the stack came up. Service logs are dumped on failure for diagnosis.
 	if totalFail > 0 {
 		dumpServiceLogs(rec, rt, containers, artifactsDir)
-		writeSummary(artifactsDir, rec.lines)
+		writeRunArtifacts(artifactsDir, rec)
 		return 1
 	}
 
@@ -372,7 +496,7 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeo
 	summary := fmt.Sprintf("PASS: client(s) [%s] drove the full pipeline, %d metric/func assertion(s) passed, runtime=%s, runid=%s",
 		strings.Join(names, " "), totalPass, rt.Name(), runID)
 	rec.logf("%s", summary)
-	writeSummary(artifactsDir, rec.lines)
+	writeRunArtifacts(artifactsDir, rec)
 	fmt.Println(summary)
 	fmt.Printf("/api/query response: %s\n", truncate(strings.TrimSpace(body), 400))
 	return 0
@@ -390,6 +514,7 @@ type clientPhaseOpts struct {
 	repoRoot         string
 	artifactsDir     string
 	cache            string // e2e cache root (~/.cache/statshouse-e2e)
+	skipClientBuild  bool   // --skip-client-build: replay the cached driver binary + stream
 }
 
 // runClientPhase drives one client: generate its per-client metric stream,
@@ -400,9 +525,41 @@ type clientPhaseOpts struct {
 // the client (all its metrics fail). The harness waits for the driver process to
 // exit before asserting because rust/cpp flush only on destruction.
 func runClientPhase(ctx context.Context, rt Runtime, rec *recorder, d clientDriver, o clientPhaseOpts) (passed, failed int) {
-	stream := generateStream(o.runID, d.tag, time.Now())
-	rec.logf("%s: generated stream: base=%d buckets=%d metrics=%d writes=%d",
-		d.name, stream.Base, numBuckets, len(stream.Metrics), len(stream.Writes))
+	// Resolve this client's pinned ref (e2e/clients.txt) → its per-(tag,ref,arch)
+	// build-cache dir. The dir is where a normal build writes the driver binary +
+	// stream descriptor, and where --skip-client-build later reads them back.
+	_, buildCache, err := clientBuildCacheFor(o.repoRoot, o.cache, d.name, d.tag, o.arch)
+	if err != nil {
+		rec.logf("FAIL %s: resolve build cache: %v", d.name, err)
+		fmt.Printf("FAIL %s: resolve build cache: %v\n", d.tag, err)
+		return 0, 1
+	}
+
+	// statusAnchor is the wall-clock unix time at client-phase start. The realtime
+	// builtins (__src_ingestion_status / __src_client_write_err / __agg_sampling_factor)
+	// are recorded by the agent at RECEIVE time (≈ now during the driver run), NOT at
+	// the events' historic ts. On a normal run base≈now−120 so the historic base
+	// "happens to" cover them, but a --skip-client-build REPLAY keeps the descriptor's
+	// OLD base while the agent records THIS run's events at replay-now — so the
+	// ledger/rejection/tripwire windows must anchor at statusAnchor, not stream.Base
+	// (the matrix alone keeps stream.Base; its historic ts are embedded in the binary).
+	statusAnchor := uint32(time.Now().Unix())
+
+	// Stream source. --skip-client-build replays the EXACT stream a cached driver
+	// binary was compiled from: the driver embeds the metric names + the historic
+	// base, so it only matches the stream it was built against. We cache a tiny
+	// descriptor (runID+base) and REGENERATE the deterministic stream from it
+	// (generateStream is a pure function of runID+base), so the cached binary and
+	// the expected model agree bit-for-bit. A normal run generates a fresh stream,
+	// renders+compiles the driver into buildCache, and writes the descriptor.
+	stream, cached, err := streamForClientPhase(d, o, buildCache)
+	if err != nil {
+		rec.logf("FAIL %s: %v", d.name, err)
+		fmt.Printf("FAIL %s: %v\n", d.tag, err)
+		return 0, 1
+	}
+	rec.logf("%s: stream %s: base=%d buckets=%d metrics=%d writes=%d",
+		d.name, streamSourceLabel(cached), stream.Base, numBuckets, len(stream.Metrics), len(stream.Writes))
 
 	// value_p never auto-creates from a wire payload (autocreate derives only
 	// counter/value/unique), so pre-create its mapping before the driver runs.
@@ -416,20 +573,46 @@ func runClientPhase(ctx context.Context, rt Runtime, rec *recorder, d clientDriv
 	agentAddr := net.JoinHostPort(o.agentIP, strconv.Itoa(agentPort))
 	clientContainer := e2ePrefix + o.runID + "-client-" + d.tag
 
+	// F7: write the stream descriptor at BUILD time (before the build runs) so a
+	// successful build pairs it with the binary EVEN IF the driver run later fails.
+	// The old code wrote it only after a clean exit, so a build-succeed/run-fail left
+	// a NEW binary paired with an OLD descriptor → the next --skip-client-build
+	// replayed a stale model and failed all-absent. A failed build/run deletes the
+	// descriptor below (the compiler leaves the OLD binary on a compile failure, so
+	// the just-written NEW descriptor would otherwise desync from it). Skipped on the
+	// replay path (cached), which already has a matching descriptor.
+	if !cached {
+		src, rerr := d.renderSource(o.repoRoot, stream)
+		var srcHash string
+		if rerr != nil {
+			// A render failure here will also fail inside buildRun; log and proceed
+			// with an empty hash (the descriptor is deleted if the run then fails).
+			rec.logf("%s: could not hash driver source for cache descriptor: %v", d.name, rerr)
+		} else {
+			srcHash = sourceHash(src)
+		}
+		if err := saveStreamCacheMeta(buildCache, o.runID, stream.Base, d.tag, o.arch, srcHash, d.baseImage); err != nil {
+			rec.logf("%s: could not write build descriptor: %v", d.name, err)
+		}
+	}
+
 	exitCode, output, runErr := d.buildRun(ctx, rt, rec, clientRunOpts{
-		stream:    stream,
-		network:   o.network,
-		agentAddr: agentAddr,
-		apiAddr:   o.apiContainerAddr,
-		container: clientContainer,
-		workDir:   filepath.Join(o.artifactsDir, "driver-"+d.tag),
-		repoRoot:  o.repoRoot,
-		arch:      o.arch,
-		cache:     o.cache,
+		stream:     stream,
+		network:    o.network,
+		agentAddr:  agentAddr,
+		apiAddr:    o.apiContainerAddr,
+		container:  clientContainer,
+		workDir:    filepath.Join(o.artifactsDir, "driver-"+d.tag),
+		repoRoot:   o.repoRoot,
+		arch:       o.arch,
+		cache:      o.cache,
+		buildCache: buildCache,
+		skipBuild:  cached,
 	})
 	if runErr != nil {
 		rec.logf("FAIL %s: build/run did not launch: %v\n%s", d.name, runErr, indent(output))
 		fmt.Printf("FAIL %s build/run: %v\n", d.tag, runErr)
+		removeStreamCacheDescriptor(rec, d.name, buildCache) // F7: no valid pair from a failed run
 		return 0, len(stream.Metrics)
 	}
 	if exitCode != 0 {
@@ -444,16 +627,23 @@ func runClientPhase(ctx context.Context, rt Runtime, rec *recorder, d clientDriv
 			rec.logf("FAIL %s: driver exited %d\n%s", d.name, exitCode, indent(output))
 			fmt.Printf("FAIL %s driver exited %d\n", d.tag, exitCode)
 		}
+		removeStreamCacheDescriptor(rec, d.name, buildCache) // F7: no valid pair from a failed run
 		return 0, len(stream.Metrics)
 	}
 	rec.logf("%s: driver exited 0\n%s", d.name, indent(truncate(strings.TrimSpace(output), 1200)))
+	// The descriptor was written at build time (above). A clean exit with no cached
+	// binary means the build recipe did not target the cache — logged, not fatal (a
+	// later --skip-client-build then fails with "no driver binary", which is correct).
+	if !cached && !fileExists(filepath.Join(buildCache, driverBinName)) {
+		rec.logf("%s: build did not cache a driver binary at %s", d.name, filepath.Join(buildCache, driverBinName))
+	}
 
 	// Silent-loss tripwire (spec §4): query __src_client_write_err for this
 	// client's run window BEFORE the value assertions, so a TCP-backpressure drop
 	// is reported as one labelled failure rather than N mysterious "count too low"
 	// mismatches whose real cause (bytes never reached the agent) is otherwise
 	// invisible. ok=true also covers clients that do not emit the metric.
-	werrOK, werrDetail := assertNoClientWriteErr(ctx, o.apiAddr, d.tag, stream.Base)
+	werrOK, werrDetail := assertNoClientWriteErr(ctx, rec, o.apiAddr, d.tag, statusAnchor)
 	if !werrOK {
 		const werrLabel = "client write-error (silent data loss)"
 		rec.logf("FAIL %s: %s\n%s", d.name, werrLabel, indent(werrDetail))
@@ -471,10 +661,11 @@ func runClientPhase(ctx context.Context, rt Runtime, rec *recorder, d clientDriv
 	// prints its own labelled PASS/FAIL lines inside. Only their FAILURES fold into
 	// the client total — the matrix PASS count (passed) stays at the 17 (metric,
 	// func) pairs, so the run summary still reads "N metric/func assertion(s)"
-	// while the ledger/rejection/sampling lines stand as their own evidence.
-	rjPassed, rjFailed := assertRejections(ctx, rec, o.apiAddr, d.tag, stream)
-	ldPassed, ldFailed := assertConservationLedger(ctx, rec, o.apiAddr, d.tag, stream)
-	if ok, det := assertNoAggSampling(ctx, o.apiAddr, d.tag, stream.Base); !ok {
+	// while the ledger/rejection/sampling lines stand as their own evidence. Their
+	// windows anchor at statusAnchor (realtime builtins), NOT stream.Base.
+	rjPassed, rjFailed := assertRejections(ctx, rec, o.apiAddr, d.tag, stream, statusAnchor)
+	ldPassed, ldFailed := assertConservationLedger(ctx, rec, o.apiAddr, d.tag, stream, statusAnchor)
+	if ok, det := assertNoAggSampling(ctx, rec, o.apiAddr, d.tag, statusAnchor); !ok {
 		failed++
 		const samplingTripwire = "agg sampling tripwire (__agg_sampling_factor non-zero)"
 		rec.logf("FAIL %s: %s\n%s", d.name, samplingTripwire, indent(det))
@@ -584,15 +775,139 @@ func repoRoot() (string, error) {
 }
 
 // recorder captures every progress line for the artifacts summary and prints it
-// to stderr (so PASS/FAIL stdout stays clean for scripting).
+// to stderr (so PASS/FAIL stdout stays clean for scripting). It also accumulates
+// the raw JSON of every FAILED /api/query (spec §6: "raw JSON of failed queries"
+// in the artifacts on every run), and — under -v — the raw JSON of every
+// assertion query (pass or fail), so a verbose run leaves a complete response
+// trail. verbose/artifactsDir are set once in realMain; the failed-query list is
+// guarded by a mutex so the assertion path's appends and the artifact writer's
+// snapshot are safe regardless of how they are scheduled. (The live log streamer
+// does NOT touch this list — it writes daemon log lines straight to stderr — so it
+// is not part of that concurrency.)
 type recorder struct {
-	lines []string
+	lines        []string
+	verbose      bool
+	artifactsDir string
+
+	fqMu          sync.Mutex
+	failedQueries []failedQuery
+}
+
+// failedQuery is one /api/query whose result did not satisfy an assertion, with
+// the verbatim response bytes (the exact payload a human needs to diagnose a
+// mismatch without rerunning). Serialized into e2e/artifacts/<runid>/failed-
+// queries.json. Body is "" when the query itself errored before any body (e.g.
+// a connection refused); the Label/URL still pinpoints it.
+type failedQuery struct {
+	Label      string `json:"label"`       // "value" / "write_err" / "sampling"
+	Client     string `json:"client"`      // driver tag (go/rust/cpp)
+	Metric     string `json:"metric"`      // metric name (or builtin)
+	Func       string `json:"func"`        // qw (count/sum/p50/…) for value assertions
+	URL        string `json:"url"`         // the exact /api/query URL
+	HTTPStatus int    `json:"http_status"` // 0 when the request itself failed
+	Body       string `json:"body"`        // raw response JSON (verbatim)
 }
 
 func (r *recorder) logf(format string, args ...any) {
 	line := fmt.Sprintf(format, args...)
 	r.lines = append(r.lines, line)
 	fmt.Fprintln(os.Stderr, "[e2e] "+line)
+}
+
+// recordFailedQuery appends one failed query for the artifacts dump. Safe for
+// concurrent use (the assertion polls and the live streamer run concurrently).
+func (r *recorder) recordFailedQuery(fq failedQuery) {
+	if r == nil {
+		return
+	}
+	r.fqMu.Lock()
+	r.failedQueries = append(r.failedQueries, fq)
+	r.fqMu.Unlock()
+}
+
+// snapshotFailedQueries returns a copy of the recorded failed queries (nil if
+// none), so the writer can serialize without holding the lock across file I/O.
+func (r *recorder) snapshotFailedQueries() []failedQuery {
+	if r == nil {
+		return nil
+	}
+	r.fqMu.Lock()
+	defer r.fqMu.Unlock()
+	if len(r.failedQueries) == 0 {
+		return nil
+	}
+	out := make([]failedQuery, len(r.failedQueries))
+	copy(out, r.failedQueries)
+	return out
+}
+
+// dumpQueryResponse writes one assertion query's raw response to
+// artifacts/queries/<client>__<metric>__<qw>.json. Used under -v so a verbose
+// run leaves the verbatim reply to EVERY assertion query (pass or fail), not
+// only the failing ones. Best-effort: a write error is logged, never fatal.
+func (r *recorder) dumpQueryResponse(clientTag, metric, qw, body string) {
+	if r == nil || r.artifactsDir == "" {
+		return
+	}
+	name := sanitizeFileName(clientTag) + "__" + sanitizeFileName(metric) + "__" + sanitizeFileName(qw) + ".json"
+	dir := filepath.Join(r.artifactsDir, "queries")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		r.logf("could not create queries dir %s: %v", dir, err)
+		return
+	}
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		r.logf("could not write query response %s: %v", path, err)
+		return
+	}
+}
+
+// writeFailedQueries writes the recorded failed queries as a JSON array to
+// <artifacts>/failed-queries.json. Called on every run (pass and fail): a clean
+// PASS has no failed queries, so the file is written only when there is at least
+// one (an empty array on a green run would be noise). Always returns nil — a
+// dump failure is logged but must not mask the run result.
+func writeFailedQueries(artifactsDir string, fqs []failedQuery, rec *recorder) {
+	if len(fqs) == 0 {
+		return
+	}
+	data, err := json.MarshalIndent(fqs, "", "  ")
+	if err != nil {
+		if rec != nil {
+			rec.logf("could not marshal failed-query dump: %v", err)
+		}
+		return
+	}
+	path := filepath.Join(artifactsDir, "failed-queries.json")
+	if err := os.WriteFile(path, append(data, '\n'), 0o644); err != nil {
+		if rec != nil {
+			rec.logf("could not write %s: %v", path, err)
+		}
+		return
+	}
+	if rec != nil {
+		rec.logf("wrote failed-queries.json (%d failed query/queries)", len(fqs))
+	}
+}
+
+// sanitizeFileName reduces a string to a filename-safe form (the metric name
+// already restricts itself to [A-Za-z0-9_], but the builtin names carry a "__"
+// prefix and the qw/client values are short words; this keeps the dump path
+// predictable on any platform). Path separators and spaces collapse to "_".
+func sanitizeFileName(s string) string {
+	if s == "" {
+		return "_"
+	}
+	var b strings.Builder
+	for _, c := range s {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '_', c == '-':
+			b.WriteRune(c)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	return b.String()
 }
 
 // fail records the failure, dumps every started container's logs to artifacts
@@ -604,7 +919,7 @@ func fail(rec *recorder, artifactsDir string, rt Runtime, containers []string, e
 	rec.lines = append(rec.lines, msg)
 	fmt.Fprintln(os.Stderr, "[e2e] "+msg)
 	dumpServiceLogs(rec, rt, containers, artifactsDir)
-	writeSummary(artifactsDir, rec.lines)
+	writeRunArtifacts(artifactsDir, rec)
 	fmt.Fprintln(os.Stderr, msg)
 	return 1
 }
@@ -659,4 +974,56 @@ func writeSummary(artifactsDir string, lines []string) {
 	path := filepath.Join(artifactsDir, "summary.txt")
 	// Best-effort; a failure to write the summary must not mask the real result.
 	_ = os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644)
+}
+
+// writeRunArtifacts writes BOTH diagnostics artifacts the spec §6 requires on
+// every run: the PASS/FAIL summary (always) and the raw JSON of failed queries
+// (when any — a clean PASS has none). Called on the pass path, the fail() path,
+// and the assertion-failure path, so the artifacts dir is complete regardless of
+// where the run stopped.
+func writeRunArtifacts(artifactsDir string, rec *recorder) {
+	writeFailedQueries(artifactsDir, rec.snapshotFailedQueries(), rec)
+	writeSummary(artifactsDir, rec.lines)
+}
+
+// startLogStreamer tails every container's logs to stderr while the run proceeds
+// (spec §6: "-v streams logs live"). apple/container's `logs` is a one-shot fetch
+// (no -f follow), so this polls each container on an interval and writes the bytes
+// appended since the last fetch, each line prefixed [<service>] to distinguish a
+// daemon log line from the harness's own [e2e] progress lines. Best-effort: any
+// fetch error is swallowed (a transient CLI hiccup must not abort the run). Returns
+// a stop func that cancels the tail goroutine; the caller stops it before teardown.
+func startLogStreamer(ctx context.Context, rt Runtime, containers []string) (stop func()) {
+	sctx, cancel := context.WithCancel(ctx)
+	var once sync.Once
+	stop = func() { once.Do(cancel) }
+	go func() {
+		t := time.NewTicker(5 * time.Second)
+		defer t.Stop()
+		last := make(map[string]int, len(containers))
+		for {
+			select {
+			case <-sctx.Done():
+				return
+			case <-t.C:
+				for _, c := range containers {
+					tctx, tcancel := context.WithTimeout(sctx, 10*time.Second)
+					logs, err := rt.Logs(tctx, c)
+					tcancel()
+					if err != nil || len(logs) <= last[c] {
+						continue
+					}
+					delta := logs[last[c]:]
+					last[c] = len(logs)
+					svc := serviceLogName(c)
+					for _, line := range strings.Split(strings.TrimRight(delta, "\n"), "\n") {
+						if line != "" {
+							fmt.Fprintf(os.Stderr, "[%s] %s\n", svc, line)
+						}
+					}
+				}
+			}
+		}
+	}()
+	return stop
 }

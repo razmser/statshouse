@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -79,14 +80,21 @@ func cFloatLit(f float64) string {
 	return s
 }
 
+// cppDriverFuncs binds the cpp escapers for the cpp driver template. Shared by
+// renderCppDriver (disk write) and the clientDriver.renderSource closure (pure
+// re-render for the --skip-client-build cache hash).
+func cppDriverFuncs() template.FuncMap {
+	return template.FuncMap{
+		"cString": cStringLit,
+		"cFloat":  cFloatLit,
+	}
+}
+
 // renderCppDriver renders the metric stream into <outDir>/main.cpp via the cpp
 // driver template, binding the cString/cFloat escapers. See renderDriver for the
 // shared parse/execute contract.
 func renderCppDriver(tmplPath string, stream metricStream, outDir string) error {
-	return renderDriver(tmplPath, "cpp-driver", template.FuncMap{
-		"cString": cStringLit,
-		"cFloat":  cFloatLit,
-	}, stream, outDir, "main.cpp")
+	return renderDriver(tmplPath, "cpp-driver", cppDriverFuncs(), stream, outDir, "main.cpp")
 }
 
 // buildAndRunCppClient is the spec §4 cpp path: clone → render → offline
@@ -94,6 +102,10 @@ func renderCppDriver(tmplPath string, stream metricStream, outDir string) error 
 // Returns the driver process exit code, combined stdout+stderr, and a launch
 // error (nil for a clean non-zero exit).
 func buildAndRunCppClient(ctx context.Context, rt Runtime, rec *recorder, o clientRunOpts) (int, string, error) {
+	// --skip-client-build: run the cached driver binary without clone+render+build.
+	if o.skipBuild {
+		return runCachedDriver(ctx, rt, rec, o, cppBaseImage)
+	}
 	clients, err := parseClientsTxt(filepath.Join(o.repoRoot, "e2e", "clients.txt"))
 	if err != nil {
 		return 0, "", fmt.Errorf("parse e2e/clients.txt: %w", err)
@@ -114,11 +126,18 @@ func buildAndRunCppClient(ctx context.Context, rt Runtime, rec *recorder, o clie
 	}
 	rec.logf("rendered cpp driver: %s (%d writes)", filepath.Join(o.workDir, "main.cpp"), len(o.stream.Writes))
 
+	// buildCache holds the cached driver binary for --skip-client-build (a host
+	// bind mount needs the dir to exist first).
+	if err := os.MkdirAll(o.buildCache, 0o755); err != nil {
+		return 0, "", fmt.Errorf("create build cache %s: %w", o.buildCache, err)
+	}
+
+	driverPath := driverBinMount + "/" + driverBinName
 	// Header-only: a single compile of main.cpp with the client checkout on the
 	// include path. -pthread because TransportTCP spawns worker threads.
 	buildRun := "set -e; g++ --version | head -1" +
-		`; g++ -std=c++17 -pthread -I ` + clientMount + " " + workMount + `/main.cpp -o /tmp/driver` +
-		`; /tmp/driver`
+		`; g++ -std=c++17 -pthread -I ` + clientMount + " " + workMount + `/main.cpp -o ` + driverPath +
+		`; ` + driverPath
 
 	opts := RunOpts{
 		Name:    o.container,
@@ -131,6 +150,7 @@ func buildAndRunCppClient(ctx context.Context, rt Runtime, rec *recorder, o clie
 		Volumes: []string{
 			o.workDir + ":" + workMount,
 			clonePath + ":" + clientMount + ":ro",
+			o.buildCache + ":" + driverBinMount, // build output → cached driver binary (--skip-client-build)
 		},
 		Cmd:    []string{"/bin/sh", "-c", buildRun},
 		AutoRm: true,

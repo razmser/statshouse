@@ -204,7 +204,8 @@ func TestLedgerBalance(t *testing.T) {
 func TestLedgerFailDetailWarns(t *testing.T) {
 	errs := map[int32]float64{statusIDZeroCounter: 5, 36: 2} // 62, 36
 	warns := map[int32]float64{55: 100, 33: 12}              // warn_*; 33 sorts before 55
-	got := ledgerFailDetail("m", 70, 60, 7, errs, warns)
+	const qurl = "http://api:10888/api/query?s=__src_ingestion_status&n=1000"
+	got := ledgerFailDetail("m", 70, 60, 7, errs, warns, qurl)
 
 	// ok_cached line and both err rows present.
 	assertContains(t, got, "ok_cached(10)=60")
@@ -214,6 +215,10 @@ func TestLedgerFailDetailWarns(t *testing.T) {
 	// Both warn rows present, marked as warnings (not losses), sorted 33 then 55.
 	assertContains(t, got, "warn_tag_not_found(33)=12 (warning — accepted, not a loss)")
 	assertContains(t, got, "warn_timestamp_clamped_past(55)=100 (warning — accepted, not a loss)")
+
+	// The failing __src_ingestion_status query URL is appended (F4) so the breakdown
+	// and the query it came from read together.
+	assertContains(t, got, "url: "+qurl)
 
 	// Warn rows must come AFTER every err row (errs printed first, then warns).
 	errPos := strings.Index(got, "err_zero_counter(62)=5")
