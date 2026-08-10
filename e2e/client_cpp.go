@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
-	"strings"
 	"text/template"
 )
 
@@ -33,51 +31,26 @@ const (
 	driverCppDir  = "drivers/cpp"    // driver template dir, relative to e2e/
 )
 
-// cStringLit renders a Go string as the BODY of a C/C++ string literal (the
-// bytes between the "…"). C/C++ string literals:
-//   - " and \ are escaped as \" and \\;
-//   - printable ASCII (0x20..0x7e) passes through verbatim; '?' is safe because
-//     trigraphs are removed in C++17 and gcc does not process them;
-//   - every other byte (control chars, and each byte of a UTF-8 multibyte
-//     sequence such as 東京/café) is emitted as a 3-digit OCTAL escape \NNN.
-//     Octal escapes consume up to 3 digits, so a fixed width-3 form is
-//     unambiguous: \003 followed by the literal '3' is two bytes, not one. (\x
-//     is avoided — it is greedy over all following hex digits, so \x056 would be
-//     one value, not \x05 then '6'.)
-//
+// cStringLit renders a Go string as the BODY of a C/C++ string literal. Every
+// non-(printable-ASCII) byte is emitted as a 3-digit OCTAL escape \NNN: octal
+// escapes consume up to 3 digits, so a fixed width-3 form is unambiguous (\003
+// followed by the literal '3' is two bytes, not one), and \x is avoided because
+// it is greedy over all following hex digits. '?' is safe — trigraphs are removed
+// in C++17 and gcc does not process them. The shared escapeLitBody does the work;
+// only the non-ASCII format (3-digit octal) is C/C++-specific.
 // Pure → unit-tested (TestCStringLit).
 func cStringLit(s string) string {
-	var b strings.Builder
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		switch {
-		case c == '"':
-			b.WriteString(`\"`)
-		case c == '\\':
-			b.WriteString(`\\`)
-		case c >= 0x20 && c <= 0x7e:
-			b.WriteByte(c)
-		default:
-			fmt.Fprintf(&b, `\%03o`, c)
-		}
-	}
-	return b.String()
+	return escapeLitBody(s, `\%03o`)
 }
 
-// cFloatLit renders a float64 as a C++ double literal with FULL precision,
-// mirroring rustFloatLit: strconv.FormatFloat(-1) preserves every significant
-// digit (the prior {{printf "%.1f" .Count}} truncated future fractional counts
-// and large values to one decimal place), and a trailing ".0" makes a whole
-// number render as a double literal (5 → 5.0). An int literal would implicitly
-// convert to write_count's double parameter anyway, but ".0" keeps the rendered
-// source uniform with the rust/go drivers and self-documents the type. Pure →
-// unit-tested (TestCFloatLit).
+// cFloatLit renders a float64 as a C++ double literal with FULL precision
+// (strconv.FormatFloat(-1) preserves every significant digit; the prior
+// {{printf "%.1f" .Count}} truncated future fractional counts and large values to
+// one decimal place) and a trailing ".0" so a whole number renders as a double
+// literal, keeping the rendered source uniform with the rust/go drivers. floatLit
+// does the work. Pure → unit-tested (TestCFloatLit).
 func cFloatLit(f float64) string {
-	s := strconv.FormatFloat(f, 'f', -1, 64)
-	if !strings.ContainsAny(s, ".eE") {
-		s += ".0"
-	}
-	return s
+	return floatLit(f)
 }
 
 // cppDriverFuncs binds the cpp escapers for the cpp driver template. Shared by
@@ -106,16 +79,8 @@ func buildAndRunCppClient(ctx context.Context, rt Runtime, rec *recorder, o clie
 	if o.skipBuild {
 		return runCachedDriver(ctx, rt, rec, o, cppBaseImage)
 	}
-	clients, err := parseClientsTxt(filepath.Join(o.repoRoot, "e2e", "clients.txt"))
-	if err != nil {
-		return 0, "", fmt.Errorf("parse e2e/clients.txt: %w", err)
-	}
-	spec, ok := findClient(clients, cppClientName)
-	if !ok {
-		return 0, "", fmt.Errorf("no %q entry in e2e/clients.txt", cppClientName)
-	}
 
-	clonePath, err := spec.ensureCloned(ctx, rec.logf)
+	clonePath, err := o.spec.ensureCloned(ctx, rec.logf)
 	if err != nil {
 		return 0, "", err
 	}

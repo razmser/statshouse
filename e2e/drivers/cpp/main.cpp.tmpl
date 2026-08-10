@@ -229,11 +229,11 @@ int main() {
         split_host_port(api_env, api_host, api_port);
         if (!wait_metrics_exist(api_host, api_port)) {
             // Pre-warm timed out: metrics were never created, so the agent↔agg
-            // path is down. Fail fast with a distinct exit code (preWarmExit=3)
+            // path is down. Fail fast with a distinct exit code (preWarmExit)
             // BEFORE any real write. Returning from main runs ~TransportTCP
             // (force-flush + join), which is harmless here — the seeds were
             // already flushed and no real write happened.
-            return 3;
+            return {{.PreWarmExit}};
         }
         // Settle so the agent's longpoll mapping-cache subscription catches up to
         // metadata before the real (counted) writes begin.

@@ -118,11 +118,11 @@ func main() {
 		time.Sleep(5 * time.Second)
 	} else if !waitMetricsExist("http://"+apiAddr+"/api/metrics-list", metrics) {
 		// Pre-warm timed out: metrics were never created, so the agent↔agg path
-		// is down. Fail fast with preWarmExit=3 BEFORE the real writes so the
+		// is down. Fail fast with preWarmExit BEFORE the real writes so the
 		// harness reports one clear cause, not N "series absent" failures. The
 		// seeds were written ~60s ago and the client's 1s flush fired many times
 		// during the poll, so there is no tail batch to lose by skipping Close.
-		os.Exit(3)
+		os.Exit({{.PreWarmExit}})
 	} else {
 		// Settle so the agent's longpoll mapping-cache subscription catches up to
 		// metadata before the real (counted) writes begin.

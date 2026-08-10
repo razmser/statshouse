@@ -18,6 +18,11 @@ const pinnedContainerVersion = "1.2.0"
 
 func (r *containerRuntime) Name() string { return "container" }
 
+// HasNetworkEgress: apple/container has no in-container network, so the --with-ui
+// build is driven from a host-populated offline cache rather than an online npm
+// install. See Runtime.HasNetworkEgress.
+func (r *containerRuntime) HasNetworkEgress() bool { return false }
+
 func (r *containerRuntime) EnsureSystem(ctx context.Context) error {
 	out, err := runOK(ctx, "container", "system", "status")
 	if err != nil {

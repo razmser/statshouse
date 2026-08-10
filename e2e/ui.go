@@ -111,7 +111,7 @@ func buildUI(ctx context.Context, rt Runtime, repoRoot, cache, containerName str
 		return "", fmt.Errorf("create ui cache %s: %w", outRoot, err)
 	}
 
-	online := rt.Name() == "docker"
+	online := rt.HasNetworkEgress()
 
 	fingerprint, err := uiSourceFingerprint(uiDir)
 	if err != nil {

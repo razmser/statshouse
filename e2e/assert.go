@@ -1165,22 +1165,18 @@ func knownMetricNames(stream metricStream) map[string]bool {
 	return out
 }
 
-// assertRejections is criterion 2: each rejected input must surface its
-// EXACT __src_ingestion_status status with count == sentWrites. It polls the shared
-// breakdown until every generated rejection converges or ledgerTimeout elapses, then
-// reports one PASS/FAIL per rejection metric. A rejection with Sent==false is a
-// documented client-side drop (go/rust refuse a non-positive count before the wire):
-// the input never entered the pipeline, so there is no server status to assert and
-// the case is a documented SKIP — not a silent disappearance. Returns pass/fail
-// counts (one per rejection metric).
-func assertRejections(ctx context.Context, rec *recorder, apiAddr, clientTag string, stream metricStream, statusAnchor uint32) (passed, failed int) {
-	if len(stream.Rejections) == 0 {
-		return 0, 0
-	}
+// pollIngestionLedger polls the shared __src_ingestion_status breakdown (one query
+// per tick) until BOTH the rejection-status and conservation-ledger criteria
+// converge — or ledgerTimeout elapses — then returns the last clean breakdown and
+// its raw response body. assertRejections and assertConservationLedger consumed the
+// SAME breakdown via the SAME query, so a single shared poll replaces the two
+// serial polls they used to run: one ledgerTimeout budget instead of two (halving
+// worst-case wall-clock) and one converged snapshot serves both renderers. Each
+// render function recomputes its own derived view (rejection statuses / write
+// counts) from `last` — they are cheap, pure folds over the stream.
+func pollIngestionLedger(ctx context.Context, apiAddr string, stream metricStream, statusAnchor uint32) (map[string]map[int32]float64, string) {
 	known := knownMetricNames(stream)
-	// statusAnchor anchors the REALTIME __src_ingestion_status window (F1); qurl is
-	// reused for every failure's failed-query record + the detail builder's url line.
-	qurl := ingestionStatusURL(apiAddr, statusAnchor)
+	want := ledgerWriteCounts(stream)
 	var (
 		last     map[string]map[int32]float64
 		lastBody string
@@ -1191,8 +1187,26 @@ func assertRejections(ctx context.Context, rec *recorder, apiAddr, clientTag str
 			return false, nil // transient query error → keep polling (absence is only trustworthy once clean)
 		}
 		last, lastBody = bd, body
-		return rejectionsConverged(stream.Rejections, bd), nil
+		return rejectionsConverged(stream.Rejections, bd) && ledgerConverged(want, bd), nil
 	})
+	return last, lastBody
+}
+
+// assertRejections is criterion 2: each rejected input must surface its
+// EXACT __src_ingestion_status status with count == sentWrites. It renders one
+// PASS/FAIL per rejection metric from the converged breakdown pollIngestionLedger
+// returned. A rejection with Sent==false is a documented client-side drop (go/rust
+// refuse a non-positive count before the wire): the input never entered the
+// pipeline, so there is no server status to assert and the case is a documented
+// SKIP — not a silent disappearance. Returns pass/fail counts (one per rejection
+// metric).
+func assertRejections(rec *recorder, apiAddr, clientTag string, stream metricStream, statusAnchor uint32, last map[string]map[int32]float64, lastBody string) (passed, failed int) {
+	if len(stream.Rejections) == 0 {
+		return 0, 0
+	}
+	// statusAnchor anchors the REALTIME __src_ingestion_status window (F1); qurl is
+	// reused for every failure's failed-query record + the detail builder's url line.
+	qurl := ingestionStatusURL(apiAddr, statusAnchor)
 	for _, r := range stream.Rejections {
 		if !r.Sent {
 			passed++
@@ -1246,33 +1260,22 @@ func statusCount(breakdown map[int32]float64, statusID int32) float64 {
 //
 //	sentWrites(M) == okCached(M) + Σ err_*(M)
 //
-// for EVERY metric the client generated (normal + rejection). sentWrites is the
-// harness's true input cardinality; okCached is Σ __src_ingestion_status{M,ok_cached};
-// err_* is the sum of all rejection statuses. Warnings are excluded (they accompany
-// accepted events). Under the no-sampling config (assertNoAggSampling) the equation
-// is exact; any drift is a real conservation violation — silent loss (okCached+err
-// < sentWrites) or double-counting (>). On failure it prints the FULL breakdown
-// (sentWrites, okCached, every err_* status with its count) so the imbalance is
-// diagnosed at a glance. Returns pass/fail counts (one per metric).
-func assertConservationLedger(ctx context.Context, rec *recorder, apiAddr, clientTag string, stream metricStream, statusAnchor uint32) (passed, failed int) {
+// for EVERY metric the client generated (normal + rejection). It renders the
+// balance from the converged breakdown pollIngestionLedger returned. sentWrites is
+// the harness's true input cardinality; okCached is Σ
+// __src_ingestion_status{M,ok_cached}; err_* is the sum of all rejection statuses.
+// Warnings are excluded (they accompany accepted events). Under the no-sampling
+// config (assertNoAggSampling) the equation is exact; any drift is a real
+// conservation violation — silent loss (okCached+err < sentWrites) or
+// double-counting (>). On failure it prints the FULL breakdown (sentWrites,
+// okCached, every err_* status with its count) so the imbalance is diagnosed at a
+// glance. Returns pass/fail counts (one per metric).
+func assertConservationLedger(rec *recorder, apiAddr, clientTag string, stream metricStream, statusAnchor uint32, last map[string]map[int32]float64, lastBody string) (passed, failed int) {
 	want := ledgerWriteCounts(stream)
-	known := knownMetricNames(stream)
 	excluded := ledgerExcludedMetricNames(stream) // multi-value metrics outside the exact 1:1 scope (see ledgerEligibleKind)
 	// statusAnchor anchors the REALTIME __src_ingestion_status window (F1); qurl is
 	// reused for every failure's failed-query record + the detail builder's url line.
 	qurl := ingestionStatusURL(apiAddr, statusAnchor)
-	var (
-		last     map[string]map[int32]float64
-		lastBody string
-	)
-	_ = poll(ctx, ledgerTimeout, 3*time.Second, func() (bool, error) {
-		bd, body, err := fetchIngestionBreakdown(ctx, apiAddr, statusAnchor, known)
-		if err != nil {
-			return false, nil
-		}
-		last, lastBody = bd, body
-		return ledgerConverged(want, bd), nil
-	})
 	// Sorted iteration for stable, readable output.
 	names := make([]string, 0, len(want))
 	for n := range want {

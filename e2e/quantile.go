@@ -22,12 +22,14 @@ import (
 // Everything here is deterministic and side-effect-free → unit-tested
 // (quantile_test.go).
 
-// lcgMul / lcgAdd are the Knuth MMIX LCG constants (also PCG's multiplier). The
-// skewed-distribution generator advances a uint64 state with `x = x*lcgMul +
-// lcgAdd` (mod 2^64). Go wraps uint64 implicitly; the templates render the
-// exact same constants as wrapping_mul/wrapping_add (Rust) and ULL overflow
-// (C++, which is defined to wrap for unsigned). Keep these in sync with the
-// generator blocks in drivers/{go,rust,cpp}/main.*.tmpl.
+// lcgMul / lcgAdd / lcgSeed are the Knuth MMIX LCG constants (also PCG's
+// multiplier). The skewed-distribution generator advances a uint64 state with
+// `x = x*lcgMul + lcgAdd` (mod 2^64). Go wraps uint64 implicitly; each driver
+// template carries the exact same constants as numeric literals (wrapping_mul /
+// wrapping_add in Rust, ULL overflow — defined to wrap for unsigned — in C++).
+// The three copies are pinned to these by TestDriverLCGIdentity, which renders
+// each template and asserts the seed/mul/add tokens derived here appear verbatim,
+// so a unilateral edit in either direction fails the test.
 const (
 	lcgMul  uint64 = 6364136223846793005
 	lcgAdd  uint64 = 1442695040888963407

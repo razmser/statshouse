@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -54,18 +55,43 @@ func buildDaemons(ctx context.Context, repoRoot, arch string, log func(string, .
 		return "", fmt.Errorf("scan daemon source mtimes: %w", err)
 	}
 	start := time.Now()
-	built := 0
+	// Collect the stale binaries first (the stat is cheap; only the rebuilds
+	// overlap). A cached copy newer than the newest source is reused verbatim.
+	type pending struct {
+		d   daemonSpec
+		out string
+	}
+	var stale []pending
 	for _, d := range daemonCmds {
 		out := filepath.Join(binDir, d.bin)
 		if fi, statErr := os.Stat(out); statErr == nil && fi.ModTime().After(newest) {
 			continue // cached copy is fresher than any source
 		}
-		if err := buildOneDaemon(ctx, repoRoot, arch, d, out); err != nil {
-			return "", err
-		}
-		built++
+		stale = append(stale, pending{d, out})
 	}
-	log("daemon binaries: %s (arch=%s, built %d/%d, %.1fs)", binDir, arch, built, len(daemonCmds), time.Since(start).Seconds())
+	// Fan the stale builds out concurrently. Each writes a distinct output binary
+	// and compiles a distinct command package, so the builds are independent; the
+	// slow CGO metadata build (sqlite3.c) overlaps with the pure-Go daemons instead
+	// of gating them. `go build` serializes its own GOCACHE access, so concurrent
+	// invocations are safe.
+	results := make([]error, len(stale))
+	var wg sync.WaitGroup
+	for i := range stale {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			results[i] = buildOneDaemon(ctx, repoRoot, arch, stale[i].d, stale[i].out)
+		}(i)
+	}
+	wg.Wait()
+	// Report the first error in declaration order so a multi-failure surfaces a
+	// deterministic cause (metadata before agg/api/agent).
+	for i := range stale {
+		if results[i] != nil {
+			return "", results[i]
+		}
+	}
+	log("daemon binaries: %s (arch=%s, built %d/%d, %.1fs)", binDir, arch, len(stale), len(daemonCmds), time.Since(start).Seconds())
 	return binDir, nil
 }
 

@@ -1,7 +1,7 @@
 # Pinned client sources for the e2e harness.
 #
 # One line per client, whitespace-separated fields:
-#   <name> <repo-url> <git-ref> <driver-template-dir>
+#   <name> <repo-url> <git-ref>
 #
 # First run clones <git-ref> into ~/.cache/statshouse-e2e/clients/<name>@<ref>/
 # on the HOST (containers have no internet) and reuses the checkout across runs.
@@ -9,9 +9,6 @@
 # client's wire behavior; cmd/statshouse-client-test clones unpinned HEAD, the
 # harness must not. The initial refs are the commits the behavior analysis
 # verified (HEADs at 2026-08).
-#
-# driver-template-dir is relative to e2e/ and holds the harness-owned Go
-# text/template that renders the generated stream into a client program.
 #
 # Active clients. The go client is wired end-to-end; rust and cpp follow
 # and cpp on the same path. All three are driven by the same generated metric
@@ -25,6 +22,6 @@
 # change alone — so on a host with a pre-existing cache the go/cpp upstream
 # checkouts are reused (identical source), while a fresh host or CI clones from
 # the forks. Bumping a ref (as rust did) always forces a fresh clone from the URL.
-statshouse-go   https://github.com/razmser/statshouse-go  8c034cab32b42d41d213280760370b290f28b9f4  drivers/go
-statshouse-rs   https://github.com/razmser/statshouse-rs  c34da37f5d8a7d9ef92a36b3cc1814ed4f12e24e drivers/rust
-statshouse-cpp  https://github.com/razmser/statshouse-cpp  112a449                                  drivers/cpp
+statshouse-go   https://github.com/razmser/statshouse-go  8c034cab32b42d41d213280760370b290f28b9f4
+statshouse-rs   https://github.com/razmser/statshouse-rs  c34da37f5d8a7d9ef92a36b3cc1814ed4f12e24e
+statshouse-cpp  https://github.com/razmser/statshouse-cpp  112a449

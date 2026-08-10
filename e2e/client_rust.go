@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
-	"strings"
 	"text/template"
 )
 
@@ -36,44 +34,23 @@ const (
 	rustTargetMount = "/target" // host-mounted rlib cache (rw)
 )
 
-// rustByteStringLit renders a Go string as the BODY of a Rust byte-string literal
-// (the bytes between the b"…"). Rust byte strings:
-//   - cannot hold raw non-ASCII bytes (a UTF-8 é in b"…" is a compile error), so
-//     every non-ASCII byte is emitted as a 2-digit \xHH escape (Rust's \x in byte
-//     strings requires exactly two hex digits and is NOT greedy, so \xc3\xa9 is
-//     unambiguous);
-//   - " and \ are escaped as \" and \\;
-//   - printable ASCII (0x20..0x7e) passes through verbatim.
-//
+// rustByteStringLit renders a Go string as the BODY of a Rust byte-string literal.
+// Rust byte strings cannot hold raw non-ASCII bytes (a UTF-8 é in b"…" is a compile
+// error), so every non-ASCII byte is emitted as a 2-digit \xHH escape (Rust's \x in
+// byte strings requires exactly two hex digits and is NOT greedy, so \xc3\xa9 is
+// unambiguous); " and \ are \" and \\; printable ASCII (0x20..0x7e) passes through.
+// The shared escapeLitBody does the work; only the non-ASCII format is Rust-specific.
 // Pure → unit-tested (TestRustByteStringLit).
 func rustByteStringLit(s string) string {
-	var b strings.Builder
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		switch {
-		case c == '"':
-			b.WriteString(`\"`)
-		case c == '\\':
-			b.WriteString(`\\`)
-		case c >= 0x20 && c <= 0x7e:
-			b.WriteByte(c)
-		default:
-			fmt.Fprintf(&b, `\x%02x`, c)
-		}
-	}
-	return b.String()
+	return escapeLitBody(s, `\x%02x`)
 }
 
-// rustFloatLit renders a float64 as a Rust f64 literal. strconv may emit "1" for
-// 1.0 (no decimal point), but a bare integer literal is typed i32 by default and
-// won't satisfy write_count's f64 parameter — so a trailing ".0" is added when the
-// rendered form has neither '.' nor an exponent. Pure → unit-tested.
+// rustFloatLit renders a float64 as a Rust f64 literal. A bare integer literal is
+// typed i32 by default and won't satisfy write_count's f64 parameter, so floatLit
+// appends ".0" when the rendered form has no decimal point or exponent.
+// Pure → unit-tested (TestRustFloatLit).
 func rustFloatLit(f float64) string {
-	s := strconv.FormatFloat(f, 'f', -1, 64)
-	if !strings.ContainsAny(s, ".eE") {
-		s += ".0"
-	}
-	return s
+	return floatLit(f)
 }
 
 // rustDriverFuncs binds the rust escapers for the rust driver template. Shared by
@@ -102,16 +79,8 @@ func buildAndRunRustClient(ctx context.Context, rt Runtime, rec *recorder, o cli
 	if o.skipBuild {
 		return runCachedDriver(ctx, rt, rec, o, rustBaseImage)
 	}
-	clients, err := parseClientsTxt(filepath.Join(o.repoRoot, "e2e", "clients.txt"))
-	if err != nil {
-		return 0, "", fmt.Errorf("parse e2e/clients.txt: %w", err)
-	}
-	spec, ok := findClient(clients, rustClientName)
-	if !ok {
-		return 0, "", fmt.Errorf("no %q entry in e2e/clients.txt", rustClientName)
-	}
 
-	clonePath, err := spec.ensureCloned(ctx, rec.logf)
+	clonePath, err := o.spec.ensureCloned(ctx, rec.logf)
 	if err != nil {
 		return 0, "", err
 	}

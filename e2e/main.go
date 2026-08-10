@@ -241,7 +241,7 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeo
 	// missing/old npm fails before any container or network is created. The docker
 	// runtime installs online in the node container (NAT egress), so host npm is not
 	// required there. Strictly opt-in: default runs do none of this.
-	if withUI && rt.Name() != "docker" {
+	if withUI && !rt.HasNetworkEgress() {
 		if !lookPath("npm") {
 			return fail(rec, artifactsDir, rt, nil, fmt.Errorf("--with-ui needs npm on the host to warm the build cache (apple/container has no in-container network); install Node/npm or use the docker runtime"))
 		}
@@ -609,8 +609,10 @@ const preWarmRetryBackoff = 20 * time.Second
 func runClientPhase(ctx context.Context, rt Runtime, rec *recorder, d clientDriver, o clientPhaseOpts) (passed, failed int) {
 	// Resolve this client's pinned ref (e2e/clients.txt) → its per-(tag,ref,arch)
 	// build-cache dir. The dir is where a normal build writes the driver binary +
-	// stream descriptor, and where --skip-client-build later reads them back.
-	_, buildCache, err := clientBuildCacheFor(o.repoRoot, o.cache, d.name, d.tag, o.arch)
+	// stream descriptor, and where --skip-client-build later reads them back. spec
+	// is the resolved client handed to the build+run step so it need not re-parse
+	// clients.txt itself.
+	spec, buildCache, err := clientBuildCacheFor(o.repoRoot, o.cache, d.name, d.tag, o.arch)
 	if err != nil {
 		rec.logf("FAIL %s: resolve build cache: %v", d.name, err)
 		fmt.Printf("FAIL %s: resolve build cache: %v\n", d.tag, err)
@@ -700,6 +702,7 @@ func runClientPhase(ctx context.Context, rt Runtime, rec *recorder, d clientDriv
 	for attempt := 1; ; attempt++ {
 		exitCode, output, runErr = d.buildRun(ctx, rt, rec, clientRunOpts{
 			stream:     stream,
+			spec:       spec,
 			network:    o.network,
 			agentAddr:  agentAddr,
 			apiAddr:    o.apiContainerAddr,
@@ -775,8 +778,14 @@ func runClientPhase(ctx context.Context, rt Runtime, rec *recorder, d clientDriv
 	// func) pairs, so the run summary still reads "N metric/func assertion(s)"
 	// while the ledger/rejection/sampling lines stand as their own evidence. Their
 	// windows anchor at statusAnchor (realtime builtins), NOT stream.Base.
-	rjPassed, rjFailed := assertRejections(ctx, rec, o.apiAddr, d.tag, stream, statusAnchor)
-	ldPassed, ldFailed := assertConservationLedger(ctx, rec, o.apiAddr, d.tag, stream, statusAnchor)
+	// Poll the shared __src_ingestion_status breakdown ONCE until both the rejection
+	// statuses and the conservation ledger converge (or ledgerTimeout), then render
+	// each criterion from that single converged snapshot. The two used to poll
+	// separately with identical queries; sharing one poll halves the worst-case
+	// wall-clock (one ledgerTimeout budget, not two serial ones).
+	ledgerBD, ledgerBody := pollIngestionLedger(ctx, o.apiAddr, stream, statusAnchor)
+	rjPassed, rjFailed := assertRejections(rec, o.apiAddr, d.tag, stream, statusAnchor, ledgerBD, ledgerBody)
+	ldPassed, ldFailed := assertConservationLedger(rec, o.apiAddr, d.tag, stream, statusAnchor, ledgerBD, ledgerBody)
 	if ok, det := assertNoAggSampling(ctx, rec, o.apiAddr, d.tag, statusAnchor); !ok {
 		failed++
 		const samplingTripwire = "agg sampling tripwire (__agg_sampling_factor non-zero)"

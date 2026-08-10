@@ -16,6 +16,12 @@ type Runtime interface {
 	// Name returns "container" or "docker".
 	Name() string
 
+	// HasNetworkEgress reports whether containers can reach the public network.
+	// docker (NAT egress) → true; apple/container (no in-container network) → false.
+	// The --with-ui build relies on this to decide between an online container
+	// npm install (docker) and a host-populated offline cache (apple/container).
+	HasNetworkEgress() bool
+
 	// EnsureSystem makes the runtime ready to run containers. On apple/container
 	// it runs `container system status` and auto-starts the services if needed;
 	// on docker it verifies the daemon responds to `docker info`.

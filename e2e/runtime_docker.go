@@ -12,6 +12,11 @@ type dockerRuntime struct{}
 
 func (r *dockerRuntime) Name() string { return "docker" }
 
+// HasNetworkEgress: docker containers have NAT egress, so the --with-ui build can
+// run npm online inside the node container (no host npm needed). See
+// Runtime.HasNetworkEgress.
+func (r *dockerRuntime) HasNetworkEgress() bool { return true }
+
 func (r *dockerRuntime) EnsureSystem(ctx context.Context) error {
 	// `docker info` fails fast if the daemon is down.
 	if _, err := runOK(ctx, "docker", "info"); err != nil {

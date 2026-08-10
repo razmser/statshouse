@@ -142,20 +142,14 @@ func startDaemonStack(ctx context.Context, rt Runtime, rec *recorder, o daemonSt
 	}); err != nil {
 		return ds, fmt.Errorf("start metadata: %w", err)
 	}
-	// Track the container before InspectIP: if the inspect errors the container is
-	// already running, and an untracked service is skipped by teardown (and blocks
-	// NetworkRemove while it stays attached). Fill ip only once known.
-	ds.metadata = &service{name: metaC}
-	metaIP, err := rt.InspectIP(ctx, metaC, o.network)
-	if err != nil {
-		return ds, fmt.Errorf("inspect metadata IP: %w", err)
-	}
-	ds.metadata.ip = metaIP
-	rec.logf("metadata container=%s ip=%s", metaC, metaIP)
-	if err := waitTCP(ctx, rt, rec, "metadata", metaC, metaIP, metaPort); err != nil {
+	// Track+inspect+probe in one step (shared with agg/api/agent). The helper tracks
+	// the container on the stack BEFORE the inspect so a mid-probe failure still
+	// tears down the already-running container (an untracked service blocks
+	// NetworkRemove while it stays attached). ds.metadata.ip is the canonical IP;
+	// later blocks read it from there.
+	if err := startServiceProbe(ctx, rt, rec, &ds.metadata, "metadata", metaC, o.network, metaPort, ""); err != nil {
 		return ds, err
 	}
-	rec.logf("metadata ready (tcp :%d)", metaPort)
 
 	// --- aggregator ---
 	// --receive-budget-warming=0 is MANDATORY: the default 15m ramp
@@ -186,7 +180,7 @@ func startDaemonStack(ctx context.Context, rt Runtime, rec *recorder, o daemonSt
 	// ChangeUserGroup only no-ops for non-root, so it would fatally setuid to the
 	// missing user otherwise (see the agent block for the full rationale).
 	aggC := o.cname("agg")
-	metaAggAddr := net.JoinHostPort(metaIP, strconv.Itoa(metaPort))
+	metaAggAddr := net.JoinHostPort(ds.metadata.ip, strconv.Itoa(metaPort))
 	aggScript := fmt.Sprintf(`set -e
 mkdir -p /cache
 AGG_IP=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
@@ -220,17 +214,9 @@ exec /statshouse-agg \
 	}); err != nil {
 		return ds, fmt.Errorf("start agg: %w", err)
 	}
-	ds.agg = &service{name: aggC} // track before inspect; see metadata
-	aggIP, err := rt.InspectIP(ctx, aggC, o.network)
-	if err != nil {
-		return ds, fmt.Errorf("inspect agg IP: %w", err)
-	}
-	ds.agg.ip = aggIP
-	rec.logf("agg container=%s ip=%s", aggC, aggIP)
-	if err := waitTCP(ctx, rt, rec, "agg", aggC, aggIP, aggPort); err != nil {
+	if err := startServiceProbe(ctx, rt, rec, &ds.agg, "agg", aggC, o.network, aggPort, ""); err != nil {
 		return ds, err
 	}
-	rec.logf("agg ready (tcp :%d)", aggPort)
 
 	// --- api (+ published port from config) ---
 	apiC := o.cname("api")
@@ -249,7 +235,7 @@ exec /statshouse-agg \
 		"--clickhouse-v2-addrs="+chV2,
 		"--listen-addr=0.0.0.0:"+strconv.Itoa(apiPort),
 		"--listen-rpc-addr=0.0.0.0:"+strconv.Itoa(apiRPCPort),
-		"--metadata-addr="+net.JoinHostPort(metaIP, strconv.Itoa(metaPort)),
+		"--metadata-addr="+net.JoinHostPort(ds.metadata.ip, strconv.Itoa(metaPort)),
 		"--available-shards=1",
 		"--cache-dir=/cache",
 		"--rpc-crypto-path="+rpcKeyMount,
@@ -277,25 +263,19 @@ exec /statshouse-agg \
 	if err := rt.Run(ctx, apiRun); err != nil {
 		return ds, fmt.Errorf("start api: %w", err)
 	}
-	ds.api = &service{name: apiC} // track before inspect; see metadata
-	apiIP, err := rt.InspectIP(ctx, apiC, o.network)
-	if err != nil {
-		return ds, fmt.Errorf("inspect api IP: %w", err)
-	}
-	ds.api.ip = apiIP
+	// The api logs its published-port spec (or "(not published)") via the probe's
+	// extra log suffix; the other daemons pass "".
+	apiExtra := " (not published)"
 	if apiPublished {
-		rec.logf("api container=%s ip=%s publish=%s", apiC, apiIP, apiPortSpec)
-	} else {
-		rec.logf("api container=%s ip=%s (not published)", apiC, apiIP)
+		apiExtra = " publish=" + apiPortSpec
 	}
-	if err := waitTCP(ctx, rt, rec, "api", apiC, apiIP, apiPort); err != nil {
+	if err := startServiceProbe(ctx, rt, rec, &ds.api, "api", apiC, o.network, apiPort, apiExtra); err != nil {
 		return ds, err
 	}
-	rec.logf("api ready (tcp :%d)", apiPort)
 
 	// --- agent ---
 	agentC := o.cname("agent")
-	agg3 := strings.TrimSuffix(strings.Repeat(net.JoinHostPort(aggIP, strconv.Itoa(aggPort))+",", 3), ",")
+	agg3 := strings.TrimSuffix(strings.Repeat(net.JoinHostPort(ds.agg.ip, strconv.Itoa(aggPort))+",", 3), ",")
 	agentCmd := joinSh(
 		"mkdir -p /cache",
 		"/statshouse",
@@ -358,19 +338,34 @@ exec /statshouse-agg \
 	}); err != nil {
 		return ds, fmt.Errorf("start agent: %w", err)
 	}
-	ds.agent = &service{name: agentC} // track before inspect; see metadata
-	agentIP, err := rt.InspectIP(ctx, agentC, o.network)
-	if err != nil {
-		return ds, fmt.Errorf("inspect agent IP: %w", err)
-	}
-	ds.agent.ip = agentIP
-	rec.logf("agent container=%s ip=%s", agentC, agentIP)
-	if err := waitTCP(ctx, rt, rec, "agent", agentC, agentIP, agentPort); err != nil {
+	if err := startServiceProbe(ctx, rt, rec, &ds.agent, "agent", agentC, o.network, agentPort, ""); err != nil {
 		return ds, err
 	}
-	rec.logf("agent ready (tcp :%d)", agentPort)
 
 	return ds, nil
+}
+
+// startServiceProbe is the repeated tail of every daemon start: track the freshly-
+// started container on the stack via slot, inspect its run-network IP, log it, and
+// wait on the TCP readiness probe. The container is tracked (slot filled) BEFORE the
+// inspect, so a mid-probe failure still tears down the already-running container —
+// an untracked service is skipped by teardown and blocks NetworkRemove while it
+// stays attached. label is the human-readable role for log lines and error context;
+// port is the readiness-probe port. extra (the api's published-port spec) is
+// appended to the IP log line.
+func startServiceProbe(ctx context.Context, rt Runtime, rec *recorder, slot **service, label, container, network string, port int, extra string) error {
+	*slot = &service{name: container}
+	ip, err := rt.InspectIP(ctx, container, network)
+	if err != nil {
+		return fmt.Errorf("inspect %s IP: %w", label, err)
+	}
+	(*slot).ip = ip
+	rec.logf("%s container=%s ip=%s%s", label, container, ip, extra)
+	if err := waitTCP(ctx, rt, rec, label, container, ip, port); err != nil {
+		return err
+	}
+	rec.logf("%s ready (tcp :%d)", label, port)
+	return nil
 }
 
 // joinSh builds a /bin/sh -c argv that runs `prep` (e.g. "mkdir -p /cache") then

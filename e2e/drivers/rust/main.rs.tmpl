@@ -111,13 +111,13 @@ fn driver_main() {
     } else {
         if !wait_metrics_exist(&format!("http://{}/api/metrics-list", api_addr), metrics) {
             // Pre-warm timed out: metrics were never created, so the agent↔agg
-            // path is down. Fail fast with a distinct exit code (preWarmExit=3)
+            // path is down. Fail fast with a distinct exit code (preWarmExit)
             // BEFORE any real write — there is no tail batch to lose yet (the
             // seeds were flushed above), so an immediate exit is safe and
             // surfaces the real cause rather than N "series absent" failures.
             // (process::exit is normally forbidden because it skips Drop, but at
             // this point nothing is buffered and `t` owns only an idle socket.)
-            std::process::exit(3);
+            std::process::exit({{.PreWarmExit}});
         }
         // Settle so the agent's longpoll mapping-cache subscription catches up to
         // metadata before the real (counted) writes begin.

@@ -1,6 +1,9 @@
 package main
 
-import "sort"
+import (
+	"sort"
+	"strings"
+)
 
 // This file adds the non-counter generators to streamBuilder: value,
 // value_p (percentile), unique (exact + approximate), and stag (cardinality).
@@ -129,7 +132,7 @@ func (b *streamBuilder) addStag() {
 	// Distinct values: plain, unicode (valid UTF-8 → distinct series), empty
 	// (→ absent-tag row), and a long string under the 128 B receiver cap. Long
 	// but unique within the first 128 bytes so it never merges with another.
-	longVal := "L" + repeatChar('x', 120)
+	longVal := "L" + strings.Repeat("x", 120)
 	values := []string{"alpha", "beta", "café", "東京", "", longVal}
 	m := metricModel{Name: name, Kind: kindStag}
 	// Stag asserts cardinality (no group-by); QBKeys stays empty so metricQueryURL
@@ -176,15 +179,6 @@ func expectedUnique(g genSpec) int {
 		return g.N
 	}
 	return 0
-}
-
-// repeatChar returns a string of n copies of c (used for the long stag value).
-func repeatChar(c byte, n int) string {
-	buf := make([]byte, n)
-	for i := range buf {
-		buf[i] = c
-	}
-	return string(buf)
 }
 
 // --- rejection cases ----------------------------------------------------------

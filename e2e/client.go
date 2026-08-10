@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"text/template"
 	"time"
@@ -38,8 +39,9 @@ const (
 	// down). It is distinct from 1 (the go client's close-error exit) and 2 (the
 	// go image's GOARCH-mismatch exit) so runClientPhase can single it out and
 	// print one clear cause instead of the 6 cryptic per-metric "series absent"
-	// failures a silent exit-0 used to produce. The literal 3 appears in all
-	// three driver templates (go/rust/cpp) — keep them in sync with this const.
+	// failures a silent exit-0 used to produce. Wired into every driver template
+	// as {{.PreWarmExit}} (see driverTemplateData), so the rendered sources agree
+	// with this const by construction.
 	preWarmExit = 3
 
 	// In-container mount points.
@@ -64,10 +66,9 @@ const (
 
 // clientSpec is one ACTIVE (uncommented) client parsed from e2e/clients.txt.
 type clientSpec struct {
-	Name      string
-	URL       string
-	Ref       string
-	DriverDir string // template dir, relative to e2e/
+	Name string
+	URL  string
+	Ref  string
 }
 
 // clientRunOpts configures buildAndRunGoClient / buildAndRunRustClient /
@@ -76,20 +77,21 @@ type clientSpec struct {
 // (~/.cache/statshouse-e2e); each client derives its own sub-caches from it.
 type clientRunOpts struct {
 	stream     metricStream
-	network    string // run network
-	agentAddr  string // <agent-ip>:13337 the driver writes to (STATSHOUSE_ADDR)
-	apiAddr    string // <api-ip>:10888 the driver polls to confirm mappings (STATSHOUSE_API_ADDR); "" → fixed fallback
-	container  string // client container name
-	workDir    string // host dir holding the rendered driver source (mounted at workMount)
-	repoRoot   string // statshouse checkout root (for the template + clients.txt paths)
-	arch       string // expected GOARCH for the go image's arch self-check
-	cache      string // e2e cache root: gomodcache/gocache (go), rust-target (rust)
-	buildCache string // host dir holding the cached driver binary + stream descriptor (mounted at driverBinMount)
-	skipBuild  bool   // --skip-client-build: run the cached driver binary, skip clone+render+compile
+	spec       clientSpec // the client's pinned spec (resolved once from e2e/clients.txt by runClientPhase)
+	network    string     // run network
+	agentAddr  string     // <agent-ip>:13337 the driver writes to (STATSHOUSE_ADDR)
+	apiAddr    string     // <api-ip>:10888 the driver polls to confirm mappings (STATSHOUSE_API_ADDR); "" → fixed fallback
+	container  string     // client container name
+	workDir    string     // host dir holding the rendered driver source (mounted at workMount)
+	repoRoot   string     // statshouse checkout root (for the template paths)
+	arch       string     // expected GOARCH for the go image's arch self-check
+	cache      string     // e2e cache root: gomodcache/gocache (go), rust-target (rust)
+	buildCache string     // host dir holding the cached driver binary + stream descriptor (mounted at driverBinMount)
+	skipBuild  bool       // --skip-client-build: run the cached driver binary, skip clone+render+compile
 }
 
 // parseClientsTxt reads the active (non-comment) client lines from e2e/clients.txt.
-// Each line is four whitespace-separated fields: name url ref driverdir.
+// Each line is three whitespace-separated fields: name url ref.
 func parseClientsTxt(path string) ([]clientSpec, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -104,10 +106,10 @@ func parseClientsTxt(path string) ([]clientSpec, error) {
 			continue
 		}
 		fs := strings.Fields(line)
-		if len(fs) != 4 {
-			return nil, fmt.Errorf("%s: malformed line %q (want 4 fields: name url ref driverdir)", path, line)
+		if len(fs) != 3 {
+			return nil, fmt.Errorf("%s: malformed line %q (want 3 fields: name url ref)", path, line)
 		}
-		specs = append(specs, clientSpec{Name: fs[0], URL: fs[1], Ref: fs[2], DriverDir: fs[3]})
+		specs = append(specs, clientSpec{Name: fs[0], URL: fs[1], Ref: fs[2]})
 	}
 	return specs, sc.Err()
 }
@@ -279,42 +281,38 @@ func gitResolveRef(ctx context.Context, dir, ref string) (string, error) {
 	return strings.TrimSpace(res), nil
 }
 
+// driverTemplateData is the data injected into every driver template (go/rust/
+// cpp). It carries the generated writes + kind-matching seeds, the metric-name
+// list the driver's cold-start pre-warm polls, the seed bucket (outside the
+// asserted window), and the pre-warm exit code (preWarmExit) every driver must
+// agree on with the harness. Wiring preWarmExit through the render pipeline —
+// instead of hand-copying the literal into each template — makes the rendered
+// drivers agree with the harness by construction. The deterministic-quantile LCG
+// constants are NOT injected: they are immutable Knuth-MMIX math constants
+// carried as numeric literals in each template and pinned to quantile.go by
+// TestDriverLCGIdentity.
+type driverTemplateData struct {
+	Writes      []metricWrite
+	Seeds       []seedDef
+	Metrics     []string
+	SeedTS      uint32
+	PreWarmExit int
+}
+
 // renderGoDriverSource parses+executes+gofmts the go driver template into the
 // rendered source TEXT — the exact bytes renderGoDriver writes to disk. Pure (no
 // filesystem write) so the --skip-client-build cache can hash the rendered source
-// (F2) without touching disk. Seeds/Metrics/SeedTS are as in renderGoDriver.
+// (F2) without touching disk. It delegates to renderDriverSource (the go template
+// binds no escapers → nil funcs) and then gofmts the result, so the read/parse/
+// execute contract is shared with the rust/cpp renderers rather than duplicated.
 func renderGoDriverSource(tmplPath string, stream metricStream) (string, error) {
-	tmplText, err := os.ReadFile(tmplPath)
+	src, err := renderDriverSource(tmplPath, "go-driver", nil, stream)
 	if err != nil {
-		return "", fmt.Errorf("read driver template %s: %w", tmplPath, err)
+		return "", err
 	}
-	t, err := template.New("go-driver").Parse(string(tmplText))
+	formatted, err := format.Source([]byte(src))
 	if err != nil {
-		return "", fmt.Errorf("parse driver template %s: %w", tmplPath, err)
-	}
-	// Seeds drive the cold-start pre-warm: one KIND-MATCHING write per metric so
-	// auto-create derives the right kind (value/unique) rather than the counter
-	// default. Metrics is the name list the driver polls metrics-list for. SeedTS
-	// is a bucket outside the asserted [Base, Base+numBuckets] window the seed
-	// writes into so it never perturbs an assertion (see the template header).
-	seeds, names := streamSeeds(stream)
-	var raw bytes.Buffer
-	if err := t.Execute(&raw, struct {
-		Writes  []metricWrite
-		Seeds   []seedDef
-		Metrics []string
-		SeedTS  uint32
-	}{
-		Writes:  stream.Writes,
-		Seeds:   seeds,
-		Metrics: names,
-		SeedTS:  stream.Base - 60,
-	}); err != nil {
-		return "", fmt.Errorf("render driver: %w", err)
-	}
-	formatted, err := format.Source(raw.Bytes())
-	if err != nil {
-		return "", fmt.Errorf("gofmt rendered driver: %w\n%s", err, raw.String())
+		return "", fmt.Errorf("gofmt rendered driver: %w\n%s", err, src)
 	}
 	return string(formatted), nil
 }
@@ -354,16 +352,12 @@ func renderDriverSource(tmplPath, name string, funcs template.FuncMap, stream me
 	}
 	seeds, names := streamSeeds(stream)
 	var raw bytes.Buffer
-	if err := t.Execute(&raw, struct {
-		Writes  []metricWrite
-		Seeds   []seedDef
-		Metrics []string
-		SeedTS  uint32
-	}{
-		Writes:  stream.Writes,
-		Seeds:   seeds,
-		Metrics: names,
-		SeedTS:  stream.Base - 60,
+	if err := t.Execute(&raw, driverTemplateData{
+		Writes:      stream.Writes,
+		Seeds:       seeds,
+		Metrics:     names,
+		SeedTS:      stream.Base - 60,
+		PreWarmExit: preWarmExit,
 	}); err != nil {
 		return "", fmt.Errorf("render driver: %w", err)
 	}
@@ -374,8 +368,8 @@ func renderDriverSource(tmplPath, name string, funcs template.FuncMap, stream me
 // text/template (binding the language-specific escapers in funcs), inject the
 // metric stream, and write <outDir>/<outFile>. The escapers mean an injected
 // value carrying a quote, backslash, or non-ASCII byte can never break the
-// rendered source. renderGoDriver stays separate — it gofmt's its output and
-// binds no escapers. name is the template's internal name (cosmetic).
+// rendered source. renderGoDriver reuses this via renderGoDriverSource (nil funcs)
+// and gofmts its output. name is the template's internal name (cosmetic).
 func renderDriver(tmplPath, name string, funcs template.FuncMap, stream metricStream, outDir, outFile string) error {
 	src, err := renderDriverSource(tmplPath, name, funcs, stream)
 	if err != nil {
@@ -385,6 +379,45 @@ func renderDriver(tmplPath, name string, funcs template.FuncMap, stream metricSt
 		return err
 	}
 	return os.WriteFile(filepath.Join(outDir, outFile), []byte(src), 0o644)
+}
+
+// floatLit renders a float64 as a language-neutral full-precision decimal literal
+// with a trailing ".0" when the rendered form has neither '.' nor an exponent, so
+// a whole number is typed as a float (Rust types a bare integer i32 by default;
+// the ".0" keeps the rendered C++/Rust/Go sources uniform). strconv.FormatFloat
+// with prec=-1 preserves every significant digit. The rust/cpp driver escapers
+// (rustFloatLit/cFloatLit) are thin wrappers over this; pure → unit-tested.
+func floatLit(f float64) string {
+	s := strconv.FormatFloat(f, 'f', -1, 64)
+	if !strings.ContainsAny(s, ".eE") {
+		s += ".0"
+	}
+	return s
+}
+
+// escapeLitBody renders a Go string as the BODY of a double-quoted literal (the
+// bytes between the "…"): " and \ are escaped as \" and \\, printable ASCII
+// (0x20..0x7e) passes through verbatim, and every other byte is emitted via
+// nonASCIIFormat (a fmt verb taking one byte, e.g. `\x%02x` for Rust byte strings
+// or `\%03o` for C/C++ string literals). The rust/cpp string escapers
+// (rustByteStringLit/cStringLit) are thin wrappers that supply their language's
+// non-ASCII format. Pure → unit-tested via those wrappers.
+func escapeLitBody(s, nonASCIIFormat string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '"':
+			b.WriteString(`\"`)
+		case c == '\\':
+			b.WriteString(`\\`)
+		case c >= 0x20 && c <= 0x7e:
+			b.WriteByte(c)
+		default:
+			fmt.Fprintf(&b, nonASCIIFormat, c)
+		}
+	}
+	return b.String()
 }
 
 // writeGoMod writes the synthetic driver module's go.mod with a replace directive
@@ -711,16 +744,8 @@ func buildAndRunGoClient(ctx context.Context, rt Runtime, rec *recorder, o clien
 	if o.skipBuild {
 		return runCachedDriver(ctx, rt, rec, o, goBaseImage)
 	}
-	clients, err := parseClientsTxt(filepath.Join(o.repoRoot, "e2e", "clients.txt"))
-	if err != nil {
-		return 0, "", fmt.Errorf("parse e2e/clients.txt: %w", err)
-	}
-	spec, ok := findClient(clients, goClientName)
-	if !ok {
-		return 0, "", fmt.Errorf("no %q entry in e2e/clients.txt", goClientName)
-	}
 
-	clonePath, err := spec.ensureCloned(ctx, rec.logf)
+	clonePath, err := o.spec.ensureCloned(ctx, rec.logf)
 	if err != nil {
 		return 0, "", err
 	}
