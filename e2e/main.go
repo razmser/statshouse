@@ -52,7 +52,7 @@ func main() {
 		verbose         = flag.Bool("v", false, "verbose: stream container logs live and dump raw API responses to artifacts")
 		timeout         = flag.Duration("timeout", 10*time.Minute, "overall run timeout")
 		skipClientBuild = flag.Bool("skip-client-build", false, "reuse previously-built client driver binaries + cached stream (skip the in-container compile); fails if no cached build exists for a selected client")
-		withUI          = flag.Bool("with-ui", false, "build+serve the npm UI (ticket 15 — not yet implemented; accepted so it does not conflict)")
+		withUI          = flag.Bool("with-ui", false, "build the npm UI in a pinned node container and serve it from the api's --static-dir (default off: no node, no UI build). On apple/container this needs npm on the host to warm the build cache (apple/container has no in-container network); the docker runtime installs online in the node container")
 		clientSel       clientFlag
 	)
 	flag.Var(&clientSel, "client", "client(s) to drive (repeatable; one of: go, rust, cpp). Default: all three")
@@ -199,12 +199,10 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeo
 		return 2
 	}
 
-	// --with-ui is reserved for ticket 15 (the npm UI build). Parsing it here keeps
-	// a script/UI-aware invocation from erroring on an unknown flag; the build is
-	// NOT implemented, so we warn and run UI-less rather than silently ignoring it.
-	if withUI {
-		fmt.Fprintln(os.Stderr, "[e2e] note: --with-ui is reserved for ticket 15 (npm UI build) and is not yet implemented; running without the UI")
-	}
+	// --with-ui (ticket 15) is handled early: the npm UI is built in a pinned node
+	// container (offline against a host-populated cache on apple/container; online
+	// via NAT egress on docker) and its output is mounted into the api as
+	// --static-dir=/ui. Off by default — no node, no UI build.
 
 	rec := &recorder{verbose: verbose, artifactsDir: artifactsDir}
 	rec.logf("runid=%s artifacts=%s", runID, artifactsDir)
@@ -234,6 +232,21 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeo
 		return fail(rec, artifactsDir, rt, nil, fmt.Errorf("preflight version check: %w", err))
 	}
 	rec.logf("preflight ok (%s)", rt.Name())
+
+	// --with-ui on a runtime WITHOUT in-container network (apple/container) needs host
+	// npm: the offline container build consumes a host-populated cache, and populating
+	// it passes npm --os/--cpu/--libc (npm >= npmMinMajor). Checked at preflight so a
+	// missing/old npm fails before any container or network is created. The docker
+	// runtime installs online in the node container (NAT egress), so host npm is not
+	// required there. Strictly opt-in: default runs do none of this.
+	if withUI && rt.Name() != "docker" {
+		if !lookPath("npm") {
+			return fail(rec, artifactsDir, rt, nil, fmt.Errorf("--with-ui needs npm on the host to warm the build cache (apple/container has no in-container network); install Node/npm or use the docker runtime"))
+		}
+		if m := npmMajorVersion(ctx); m < npmMinMajor {
+			return fail(rec, artifactsDir, rt, nil, fmt.Errorf("--with-ui needs npm >= %d on the host (found major %d) to populate the offline build cache with --os/--cpu/--libc; upgrade npm or use the docker runtime", npmMinMajor, m))
+		}
+	}
 
 	// --- resolve selected drivers + e2e cache + arch early ---
 	// All three are pure host-side resolutions; doing them here (before any container
@@ -298,6 +311,16 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeo
 				now := time.Now()
 				rec.logf("  reach the api:  curl 'http://%s/api/query?s=__agg_bucket_receive_delay_sec&f=%d&t=%d&w=1s&qw=count&ac=1'",
 					addr, now.Add(-5*time.Minute).Unix(), now.Unix())
+				if withUI {
+					// The built UI is served by the api from its --static-dir at /.
+					// Strip the "(container IP — …)" annotation off addr so this is a
+					// real http://host:port/ a browser can open.
+					uiAddr := addr
+					if i := strings.Index(uiAddr, "  "); i >= 0 {
+						uiAddr = uiAddr[:i]
+					}
+					rec.logf("  reach the UI:   http://%s/", uiAddr)
+				}
 			}
 			rec.logf("  container logs: %s logs <name>   (names: %s)", rt.Name(), strings.Join(containers, " "))
 			rec.logf("  tear it down:   %s rm -f %s   &&   %s network rm %s",
@@ -346,6 +369,32 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeo
 	}
 	if err := checkPublishedPortsFree(ctx, cfg); err != nil {
 		return fail(rec, artifactsDir, rt, containers, err)
+	}
+
+	// --- build the npm UI when --with-ui is set (ticket 15) ---
+	// Done EARLY — right after the published-port preflight, before ClickHouse and
+	// the daemon build — so a UI failure fails fast instead of after the ~1min stack
+	// bring-up. Defaults: the placeholder page (e2e/api-static/index.html) mounted at
+	// /static. With the flag, the built UI (statshouse-ui/build, index.html at its
+	// root) is mounted at /ui instead. The api is built WITHOUT the embed tag, so it
+	// always loads index.html from --static-dir — never an embed-tag api build.
+	apiStaticDir := filepath.Join(root, "e2e", "api-static")
+	apiMountTarget := apiStaticMount
+	if withUI {
+		// Track the one-shot build container BEFORE launching it: a context-cancelled
+		// build SIGKILLs the local CLI and may orphan the container, and this run's
+		// teardown (not just the next run's pruneStale) should reap it. Rm is idempotent
+		// (resourceInList no-op), so a normally-AutoRm'd container is a harmless no-op
+		// here, and dumpServiceLogs filters by presence. Host-npm prerequisites were
+		// already checked at preflight (above); no duplicate check here.
+		uiBuildC := e2ePrefix + runID + "-uibuild"
+		containers = append(containers, uiBuildC)
+		uiBuildDir, err := buildUI(ctx, rt, root, cache, uiBuildC, rec.logf)
+		if err != nil {
+			return fail(rec, artifactsDir, rt, containers, fmt.Errorf("build ui: %w", err))
+		}
+		apiStaticDir = uiBuildDir
+		apiMountTarget = apiUIMount
 	}
 
 	// --- ClickHouse ---
@@ -397,6 +446,7 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeo
 		return fail(rec, artifactsDir, rt, containers, err)
 	}
 	defer os.Remove(rpcKeyPath)
+
 	start = time.Now()
 	ds, err = startDaemonStack(ctx, rt, rec, daemonStackOpts{
 		network:      network,
@@ -405,7 +455,8 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeo
 		runID:        runID,
 		cfg:          cfg,
 		rpcKeyPath:   rpcKeyPath,
-		apiStaticDir: filepath.Join(root, "e2e", "api-static"),
+		apiStaticDir: apiStaticDir,
+		staticMount:  apiMountTarget,
 	})
 	containers = append(containers, ds.containerNames()...)
 	if err != nil {
@@ -423,6 +474,19 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeo
 		return fail(rec, artifactsDir, rt, containers, fmt.Errorf("api query: %w", err))
 	}
 	rec.logf("/api/query answered 200 on %s (%d bytes)", queryAddr, len(body))
+
+	// --- with-ui: prove the api serves the BUILT UI at /, not the placeholder ---
+	// The api serves the static dir's index.html on the same HTTP port as /api/query,
+	// so once /api/query answers the UI is reachable too. A positive GET of the root
+	// (200 + the built app's React mount) fails the run loudly if --with-ui did not
+	// actually wire build/ into --static-dir.
+	if withUI {
+		uiBody, err := assertUIServed(ctx, queryAddr)
+		if err != nil {
+			return fail(rec, artifactsDir, rt, containers, fmt.Errorf("ui served: %w", err))
+		}
+		rec.logf("UI served on %s (GET / -> 200, built index.html %d bytes)", queryAddr, len(uiBody))
+	}
 
 	// --- gate "stack ready" on a REAL agent→agg→api round-trip, not just TCP
 	// dials (ticket 10): the agent↔agg channel can be dead while every TCP probe

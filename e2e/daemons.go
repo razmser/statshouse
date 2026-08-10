@@ -36,11 +36,20 @@ const (
 	// are not on the same machine) succeeds for every cross-container link.
 	rpcKeyMount = "/etc/engine/pass"
 
-	// apiStaticMount is where the minimal UI index.html is mounted into the api.
-	// The api parses index.html as a Go template at startup (and refuses to start
-	// if it is missing); the harness ships a placeholder page instead of building
-	// the full npm UI. Passed to the api via --static-dir=/static.
+	// apiStaticMount is where the placeholder index.html is mounted into the api
+	// (the default, UI-less run). The api parses index.html as a Go template at
+	// startup (and refuses to start if it is missing); the harness ships a
+	// placeholder page (e2e/api-static/index.html) unless --with-ui builds the real
+	// npm UI, which is then mounted at apiUIMount instead. The actual in-container
+	// mount target for a given run is daemonStackOpts.staticMount; the api reads it
+	// via --static-dir=<mount>.
 	apiStaticMount = "/static"
+
+	// apiUIMount is where the built npm UI (statshouse-ui/build, with index.html at
+	// its root) is mounted into the api when --with-ui is set, served via
+	// --static-dir=/ui. Distinct from the placeholder /static so a UI run is
+	// unambiguous in the api's flags and logs.
+	apiUIMount = "/ui"
 
 	// queryMetric is a builtin resolved in-process by the api (no metadata
 	// mapping required), so /api/query returns 200 with empty data on a fresh
@@ -83,7 +92,8 @@ type daemonStackOpts struct {
 	runID        string
 	cfg          publishConfig
 	rpcKeyPath   string // host path to the shared RPC crypto key (mounted into all four)
-	apiStaticDir string // host dir with index.html (mounted into the api at apiStaticMount)
+	apiStaticDir string // host dir with index.html (mounted into the api at staticMount)
+	staticMount  string // in-container mount target = --static-dir value (apiStaticMount or apiUIMount)
 }
 
 func (o daemonStackOpts) cname(role string) string { return e2ePrefix + o.runID + "-" + role }
@@ -244,9 +254,10 @@ exec /statshouse-agg \
 		"--cache-dir=/cache",
 		"--rpc-crypto-path="+rpcKeyMount,
 		// The api is built without the `embed` tag, so statshouseui.FS() is nil
-		// and it loads index.html from --static-dir. We ship a placeholder page
-		// (e2e/api-static/index.html) rather than building the npm UI.
-		"--static-dir="+apiStaticMount,
+		// and it loads index.html from --static-dir. The mount target is the
+		// placeholder /static by default, or /ui when --with-ui built the npm UI;
+		// either way index.html (a valid Go template) sits at its root.
+		"--static-dir="+o.staticMount,
 	)
 	apiRun := RunOpts{
 		Name:    apiC,
@@ -255,7 +266,7 @@ exec /statshouse-agg \
 		Volumes: []string{
 			filepath.Join(o.binDir, "statshouse-api") + ":/statshouse-api:ro",
 			o.keyVol(),
-			o.apiStaticDir + ":" + apiStaticMount + ":ro",
+			o.apiStaticDir + ":" + o.staticMount + ":ro",
 		},
 		Cmd:    apiCmd,
 		Detach: true,
