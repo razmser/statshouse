@@ -4,6 +4,7 @@
 -- 1) v6_1s, v6_1m, v6_1h
 -- 2) v6_1s_dist, v6_1m_dist, v6_1h_dist
 -- 3) v6_1s_matview, v6_1m_matview, v6_1h_matview
+-- 4) statshouse_internal_log + _buffer (agg's own internal log; not v6 metric tables)
 
 -- incoming traffic
 
@@ -1597,3 +1598,45 @@ SELECT 0 as `index_type`,
 FROM statshouse_v3_incoming
 WHERE time >= now() - 3 * 86400
   AND time < now() + 3600;
+
+-- aggregator internal log (not a v6 metric table). The agg posts its own
+-- startup/insert-error diagnostics to statshouse_internal_log_buffer, a Buffer that
+-- flushes to statshouse_internal_log. The committed e2e schema previously omitted
+-- both, so every run logged a non-fatal
+-- "Table default.statshouse_internal_log_buffer does not exist (UNKNOWN_TABLE)" 404
+-- from the agg every few seconds. Mirrors build/clickhouse.sql (single-node,
+-- de-replicated); the harness never queries these — they exist only so the agg's
+-- inserts land instead of 404-ing.
+CREATE TABLE IF NOT EXISTS statshouse_internal_log
+(
+    `time`    DateTime,
+    `host`    String,
+    `type`    String,
+    `key0`    String,
+    `key1`    String,
+    `key2`    String,
+    `key3`    String,
+    `key4`    String,
+    `key5`    String,
+    `message` String
+)
+ENGINE = AggregatingMergeTree
+    PARTITION BY toYYYYMM(time)
+    ORDER BY (time, host, type, key0, key1, key2, key3, key4, key5)
+;
+
+CREATE TABLE IF NOT EXISTS statshouse_internal_log_buffer
+(
+    `time`    DateTime,
+    `host`    String,
+    `type`    String,
+    `key0`    String,
+    `key1`    String,
+    `key2`    String,
+    `key3`    String,
+    `key4`    String,
+    `key5`    String,
+    `message` String
+)
+ENGINE = Buffer(default, statshouse_internal_log, 2, 120, 120, 10000000, 10000000, 100000000, 100000000)
+;
