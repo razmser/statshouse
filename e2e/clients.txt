@@ -16,6 +16,15 @@
 # Active clients. Ticket 09 wired the go client end-to-end; ticket 10 adds rust
 # and cpp on the same path. All three are driven by the same generated metric
 # stream (per-client metric-name prefix isolates their writes — see stream.go).
-statshouse-go   https://github.com/VKCOM/statshouse-go   8c034cab32b42d41d213280760370b290f28b9f4  drivers/go
-statshouse-rs   https://github.com/VKCOM/statshouse-rs   43b4a629                                 drivers/rust
-statshouse-cpp  https://github.com/VKCOM/statshouse-cpp  112a449                                  drivers/cpp
+#
+# All three clients track the razmser forks (github.com/razmser/statshouse-{go,
+# rs,cpp}). rust's fork advanced past the old upstream pin (43b4a629 -> 8f837d03);
+# go and cpp forks sit at the SAME commits already pinned (8c034cab / 112a449), so
+# their compiled source is unchanged. The cache dir is keyed on <name>@<ref>:
+# ensureCloned reuses a checkout when HEAD == ref and does NOT re-clone on a URL
+# change alone — so on a host with a pre-existing cache the go/cpp upstream
+# checkouts are reused (identical source), while a fresh host or CI clones from
+# the forks. Bumping a ref (as rust did) always forces a fresh clone from the URL.
+statshouse-go   https://github.com/razmser/statshouse-go  8c034cab32b42d41d213280760370b290f28b9f4  drivers/go
+statshouse-rs   https://github.com/razmser/statshouse-rs  8f837d03                                 drivers/rust
+statshouse-cpp  https://github.com/razmser/statshouse-cpp  112a449                                  drivers/cpp

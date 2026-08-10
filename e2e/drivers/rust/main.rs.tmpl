@@ -5,7 +5,8 @@
    the same observations the harness asserts against — there is no per-language
    RNG. This is a harness-owned program, NOT the upstream client's test_template.txt.
 
-   WIRE BEHAVIOR of statshouse-rs @ 43b4a629 (the pinned source of truth):
+   WIRE BEHAVIOR of statshouse-rs @ 8f837d03 (the pinned source of truth; the
+   razmser fork — statshouse/src/lib.rs is byte-identical to upstream @ 43b4a629):
    - No client-side aggregation: every write serializes one TL item with the
      explicit ts passed in, so bucket assignment is exact regardless of flush jitter.
    - TCP transport sends the "statshousev1" handshake (lib.rs: TCP_HANDSHAKE). The
