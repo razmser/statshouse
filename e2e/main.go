@@ -53,12 +53,14 @@ func main() {
 		timeout         = flag.Duration("timeout", 10*time.Minute, "overall run timeout")
 		skipClientBuild = flag.Bool("skip-client-build", false, "reuse previously-built client driver binaries + cached stream (skip the in-container compile); fails if no cached build exists for a selected client")
 		withUI          = flag.Bool("with-ui", false, "build the npm UI in a pinned node container and serve it from the api's --static-dir (default off: no node, no UI build). On apple/container this needs npm on the host to warm the build cache (apple/container has no in-container network); the docker runtime installs online in the node container")
+		apiPortFlag     = flag.String("api-port", "", `override the api published host port: "" uses e2e/config.yaml (default 10888); "auto" picks a free port on 127.0.0.1; or a port number, e.g. "10889", so concurrent runs don't collide`)
+		prewarmRetries  = flag.Int("prewarm-retries", 2, "extra attempts when a client's pre-warm times out (driver exit 3, a transient journal-longpoll stall); 0 fails immediately (pre-change behavior)")
 		clientSel       clientFlag
 	)
 	flag.Var(&clientSel, "client", "client(s) to drive (repeatable; one of: go, rust, cpp). Default: all three")
 	flag.Parse()
 
-	os.Exit(realMain(*runtimeFlag, *runIDFlag, *archFlag, *keep, *verbose, *timeout, clientSel, *skipClientBuild, *withUI))
+	os.Exit(realMain(*runtimeFlag, *runIDFlag, *archFlag, *keep, *verbose, *timeout, clientSel, *skipClientBuild, *withUI, *apiPortFlag, *prewarmRetries))
 }
 
 // clientFlag is a repeatable --client selector (flag.Var). Each Set appends, so
@@ -177,7 +179,7 @@ func driverTags(drivers []clientDriver) string {
 	return strings.Join(tags, ", ")
 }
 
-func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeout time.Duration, clientSel clientFlag, skipClientBuild, withUI bool) int {
+func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeout time.Duration, clientSel clientFlag, skipClientBuild, withUI bool, apiPortFlag string, prewarmRetries int) int {
 	runID := runIDFlag
 	if runID == "" {
 		runID = time.Now().Format("20060102-150405")
@@ -367,6 +369,15 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeo
 	if err != nil {
 		return fail(rec, artifactsDir, rt, containers, fmt.Errorf("load e2e/config.yaml: %w", err))
 	}
+	// Apply --api-port BEFORE the published-port preflight so an explicit free
+	// port (or "auto") is what gets checked, and so publishSpec/hostAddr — which
+	// both read cfg["api"] — carry the resolved host port through to the -p flag
+	// and the harness's own query address.
+	cfg, err = resolveAPIPort(cfg, apiPortFlag)
+	if err != nil {
+		return fail(rec, artifactsDir, rt, containers, fmt.Errorf("--api-port: %w", err))
+	}
+	rec.logf("api published at %s", cfg.hostAddr("api"))
 	if err := checkPublishedPortsFree(ctx, cfg); err != nil {
 		return fail(rec, artifactsDir, rt, containers, err)
 	}
@@ -531,6 +542,7 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeo
 		artifactsDir:     artifactsDir,
 		cache:            cache,
 		skipClientBuild:  skipClientBuild,
+		prewarmRetries:   prewarmRetries,
 	}
 	var totalPass, totalFail int
 	for _, d := range drivers {
@@ -579,7 +591,13 @@ type clientPhaseOpts struct {
 	artifactsDir     string
 	cache            string // e2e cache root (~/.cache/statshouse-e2e)
 	skipClientBuild  bool   // --skip-client-build: replay the cached driver binary + stream
+	prewarmRetries   int    // --prewarm-retries: extra attempts on a pre-warm timeout (driver exit 3)
 }
+
+// preWarmRetryBackoff is the wait between pre-warm retries in runClientPhase:
+// long enough for a transient journal-longpoll stall to clear, short enough that
+// the default 2 retries (3 attempts) stay well inside the overall run timeout.
+const preWarmRetryBackoff = 20 * time.Second
 
 // runClientPhase drives one client: generate its per-client metric stream,
 // pre-create the value_p metrics (which never auto-create), build+run its driver
@@ -660,30 +678,60 @@ func runClientPhase(ctx context.Context, rt Runtime, rec *recorder, d clientDriv
 		}
 	}
 
-	exitCode, output, runErr := d.buildRun(ctx, rt, rec, clientRunOpts{
-		stream:     stream,
-		network:    o.network,
-		agentAddr:  agentAddr,
-		apiAddr:    o.apiContainerAddr,
-		container:  clientContainer,
-		workDir:    filepath.Join(o.artifactsDir, "driver-"+d.tag),
-		repoRoot:   o.repoRoot,
-		arch:       o.arch,
-		cache:      o.cache,
-		buildCache: buildCache,
-		skipBuild:  cached,
-	})
-	if runErr != nil {
-		rec.logf("FAIL %s: build/run did not launch: %v\n%s", d.name, runErr, indent(output))
-		fmt.Printf("FAIL %s build/run: %v\n", d.tag, runErr)
-		removeStreamCacheDescriptor(rec, d.name, buildCache) // F7: no valid pair from a failed run
-		return 0, len(stream.Metrics)
+	// Drive the client, retrying a transient pre-warm stall. A pre-warm timeout
+	// (driver exit preWarmExit) is the common INFRA failure: the api served stale
+	// /api/metrics-list during an apple/container journal-longpoll hiccup, so the
+	// driver's seeds never mapped and it bailed before any real write. The stall
+	// is transient and self-recovers, so re-running the driver a moment later
+	// usually clears it. Only preWarmExit is retried — a launch error (runErr) or
+	// any other non-zero exit is a real failure and fails fast. buildRun re-runs
+	// the per-driver build+run script, but the compile caches are volume-mounted
+	// (GOCACHE / rust & cpp object caches), so a repeat build is a cache-warmed
+	// near-no-op; the real cost is the driver's 60s pre-warm poll again.
+	prewarmAttempts := 1 + o.prewarmRetries
+	if prewarmAttempts < 1 {
+		prewarmAttempts = 1
 	}
-	if exitCode != 0 {
-		// A pre-warm timeout (drivers exit preWarmExit) is the common infra
-		// failure: the agent↔agg path is down so metrics were never created.
-		// Surface it by name up front rather than letting N cryptic per-metric
-		// "series absent" failures bury the real cause.
+	var (
+		exitCode int
+		output   string
+		runErr   error
+	)
+	for attempt := 1; ; attempt++ {
+		exitCode, output, runErr = d.buildRun(ctx, rt, rec, clientRunOpts{
+			stream:     stream,
+			network:    o.network,
+			agentAddr:  agentAddr,
+			apiAddr:    o.apiContainerAddr,
+			container:  clientContainer,
+			workDir:    filepath.Join(o.artifactsDir, "driver-"+d.tag),
+			repoRoot:   o.repoRoot,
+			arch:       o.arch,
+			cache:      o.cache,
+			buildCache: buildCache,
+			skipBuild:  cached,
+		})
+		if runErr != nil {
+			rec.logf("FAIL %s: build/run did not launch: %v\n%s", d.name, runErr, indent(output))
+			fmt.Printf("FAIL %s build/run: %v\n", d.tag, runErr)
+			removeStreamCacheDescriptor(rec, d.name, buildCache) // F7: no valid pair from a failed run
+			return 0, len(stream.Metrics)
+		}
+		if exitCode == 0 {
+			break
+		}
+		if exitCode == preWarmExit && attempt < prewarmAttempts {
+			rec.logf("FAIL %s: pre-warm timed out (attempt %d/%d) — transient journal stall, retrying in %s\n%s",
+				d.name, attempt, prewarmAttempts, preWarmRetryBackoff, indent(output))
+			fmt.Printf("FAIL %s: pre-warm timed out (attempt %d/%d) — retrying\n", d.tag, attempt, prewarmAttempts)
+			select {
+			case <-ctx.Done():
+				return 0, len(stream.Metrics)
+			case <-time.After(preWarmRetryBackoff):
+			}
+			continue
+		}
+		// Terminal non-zero: pre-warm exhausted its retries, or a different exit.
 		if exitCode == preWarmExit {
 			rec.logf("FAIL %s: pre-warm timed out (metrics never created — agent/agg path down?)\n%s", d.name, indent(output))
 			fmt.Printf("FAIL %s: pre-warm timed out (agent/agg path down?)\n", d.tag)
@@ -793,6 +841,50 @@ func listSafe(ctx context.Context, fn func(context.Context) ([]string, error)) [
 		return nil
 	}
 	return v
+}
+
+// resolveAPIPort applies the --api-port flag to the publish config's "api"
+// entry — the single source every downstream reader (publishSpec for the -p
+// flag, hostAddr for the harness's own query address) already consults:
+//   - "" leaves config.yaml's publish.api untouched (default behavior).
+//   - "auto" grabs a free port on the loopback via a brief net.Listen(":0").
+//   - any other value must parse as a port number 1-65535 and overrides the host
+//     port, keeping the configured host IP (defaulting to 127.0.0.1 when api is
+//     unpublished).
+//
+// The result is validated as host:port (matching loadConfig's validatePublish)
+// so checkPublishedPortsFree and publishSpec never see a malformed value.
+func resolveAPIPort(cfg publishConfig, flagVal string) (publishConfig, error) {
+	if flagVal == "" {
+		return cfg, nil
+	}
+	host := "127.0.0.1"
+	if existing := cfg.hostAddr("api"); existing != "" {
+		if h, _, perr := net.SplitHostPort(existing); perr == nil && h != "" {
+			host = h
+		}
+	}
+	var port int
+	switch {
+	case flagVal == "auto":
+		ln, lerr := net.Listen("tcp", net.JoinHostPort(host, "0"))
+		if lerr != nil {
+			return nil, fmt.Errorf("pick free api port on %s: %w", host, lerr)
+		}
+		port = ln.Addr().(*net.TCPAddr).Port
+		_ = ln.Close()
+	default:
+		n, perr := strconv.Atoi(flagVal)
+		if perr != nil || n < 1 || n > 65535 {
+			return nil, fmt.Errorf("%q must be \"auto\" or a port number 1-65535", flagVal)
+		}
+		port = n
+	}
+	cfg["api"] = net.JoinHostPort(host, strconv.Itoa(port))
+	if err := validatePublish("api", cfg["api"]); err != nil {
+		return nil, err
+	}
+	return cfg, nil
 }
 
 // checkPublishedPortsFree dials every host address the config publishes; if any
