@@ -1,4 +1,4 @@
-{{- /* Driver template for the rust StatsHouse client (spec §4/§5).
+{{- /* Driver template for the rust StatsHouse client.
 
    Rendered by the e2e harness (Go text/template) from the single generated metric
    stream (e2e/stream.go). "Pinned seed" = injection: the exact writes below are
@@ -13,7 +13,7 @@
      agent's hijack listener accepts it (internal/receiver/tcp_handshake.go:
      TCPMagicV1Default), so no upstream template patching is needed — but unlike
      the upstream rust template (which HARDCODES 127.0.0.1:13337), this driver
-     honors STATSHOUSE_ADDR, as spec §4 requires.
+     honors STATSHOUSE_ADDR, as required.
    - write_count rejects count <= 0, so every count here (seeds included) is > 0.
    - write_value/write_values pass count=0 → the counter field is omitted
      (should_write_counter(count, len) is false for 0), so the agent defaults count
@@ -26,7 +26,7 @@
      return normally — process::exit would skip Drop and lose the tail batch. The
      harness waits for this process's clean exit before asserting.
 
-   KIND DISPATCH (spec §5): counter/stag → write_count; value → write_values with a
+   KIND DISPATCH: counter/stag → write_count; value → write_values with a
    literal payload; value_p/unique large payloads → a deterministic generator loop
    (genSpec) reproducing the EXACT formula in quantile.go. The LCG uses
    wrapping_mul/wrapping_add (Rust panics on overflow in debug; release wraps, but

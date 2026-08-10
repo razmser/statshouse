@@ -10,12 +10,12 @@ import (
 	"text/template"
 )
 
-// This file implements spec §4 for the cpp client: acquire the pinned source,
+// This file implements the cpp-client path: acquire the pinned source,
 // render the generated stream into a harness-owned driver, and build+run it
 // offline in a pinned gcc container as a single header-only translation unit
 // (no cmake, no library to link) over TCP to the agent.
 //
-// BUILD RECIPE (spec §4 literal, no deviation): the cpp client is header-only —
+// BUILD RECIPE (literal, no deviation): the cpp client is header-only —
 // the entire implementation is in statshouse.hpp, included directly — so the
 // driver is a single translation unit compiled with `g++ -std=c++17 -pthread -I`.
 // There is no library to pre-build or cache (unlike rust's rlib), so the recipe
@@ -26,7 +26,7 @@ const (
 	// cppBaseImage is the pinned g++ toolchain the driver builds+runs in.
 	// Multi-arch; apple/container selects arm64, matching the cross-compiled
 	// daemons. Pinned to an exact minor (gcc 13) so a rerun reproduces the same
-	// toolchain (spec/ticket: pinned base image).
+	// toolchain (pinned base image).
 	cppBaseImage = "gcc:13-bookworm"
 
 	cppClientName = "statshouse-cpp" // the active client in e2e/clients.txt
@@ -97,7 +97,7 @@ func renderCppDriver(tmplPath string, stream metricStream, outDir string) error 
 	return renderDriver(tmplPath, "cpp-driver", cppDriverFuncs(), stream, outDir, "main.cpp")
 }
 
-// buildAndRunCppClient is the spec §4 cpp path: clone → render → offline
+// buildAndRunCppClient is the full cpp path: clone → render → offline
 // container build (single g++ -I of the header-only driver) → foreground run.
 // Returns the driver process exit code, combined stdout+stderr, and a launch
 // error (nil for a clean non-zero exit).

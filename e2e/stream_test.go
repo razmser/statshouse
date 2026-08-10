@@ -8,7 +8,7 @@ import (
 
 // TestGenerateStream exercises the single source of truth shared by every client
 // driver and the assertions: the invariants the whole harness leans on across the
-// full spec §5 metric matrix — the bucket window anchored at floor(now)−120s,
+// full metric matrix — the bucket window anchored at floor(now)−120s,
 // every kind present, fully-populated series, the runID name prefix, kind-correct
 // payloads, the rendered full-key cap, and one write per (series, bucket).
 func TestGenerateStream(t *testing.T) {
@@ -22,7 +22,7 @@ func TestGenerateStream(t *testing.T) {
 		t.Fatalf("Base = %d, want %d (floor(now)−120)", s.Base, wantBase)
 	}
 
-	// Every spec §5 kind is generated (counter/value/value_p/unique/stag). This
+	// Every kind is generated (counter/value/value_p/unique/stag). This
 	// catches a generator that silently drops a whole kind.
 	kinds := map[string]bool{}
 	for _, m := range s.Metrics {
@@ -82,7 +82,7 @@ func TestGenerateStream(t *testing.T) {
 		}
 		wantWrites += len(m.Series) * nb
 	}
-	// ticket 12: the rejection metrics append their own writes (one per bucket per
+	// the rejection metrics append their own writes (one per bucket per
 	// rejection) to s.Writes — they are NOT in s.Metrics (rejected inputs have no
 	// visible model), so they must be added to the expected write total separately.
 	rejNames := make(map[string]bool, len(s.Rejections))
@@ -109,7 +109,7 @@ func TestGenerateStream(t *testing.T) {
 		}
 		switch w.Kind {
 		case kindCounter, kindStag:
-			// Normal counter/stag writes carry a positive count; the ticket-12
+			// Normal counter/stag writes carry a positive count; the
 			// counter-REJECTION writes (cpp only: c_zero/c_neg) legitimately carry
 			// zero/negative, so the >0 check is scoped to non-rejection metrics.
 			if w.Count <= 0 && !rejNames[w.Metric] {

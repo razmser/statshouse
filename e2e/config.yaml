@@ -1,9 +1,9 @@
-# Defaults for the e2e harness (spec §6: "committed defaults in e2e/config.yaml").
+# Defaults for the e2e harness ("committed defaults in e2e/config.yaml").
 #
-# This file is the single home for published-port mapping. Ticket 07 (ClickHouse
-# skeleton) does not publish any port — the harness probes ClickHouse by exec-ing
+# This file is the single home for published-port mapping. The ClickHouse
+# skeleton does not publish any port — the harness probes ClickHouse by exec-ing
 # clickhouse-client inside the container, and later services wire to it by IP —
-# so nothing here is consumed yet. Later tickets load this file and let flags
+# so nothing here is consumed yet. Later phases load this file and let flags
 # override the values where a flag exists.
 #
 # Default publish map: the API alone. ClickHouse ports are present as commented

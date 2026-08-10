@@ -7,7 +7,7 @@
 
     This is an ephemeral test ClickHouse with no sensitive data on an isolated
     per-run network, so opening the credential-less default user to all IPs is
-    appropriate. (Ticket 08: needed once agg/api connect to CH by IP.)
+    appropriate. (needed once agg/api connect to CH by IP.)
 -->
 <clickhouse>
     <users>

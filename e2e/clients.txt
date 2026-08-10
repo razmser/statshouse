@@ -1,4 +1,4 @@
-# Pinned client sources for the e2e harness (spec §4).
+# Pinned client sources for the e2e harness.
 #
 # One line per client, whitespace-separated fields:
 #   <name> <repo-url> <git-ref> <driver-template-dir>
@@ -7,13 +7,13 @@
 # on the HOST (containers have no internet) and reuses the checkout across runs.
 # The pinned ref — NOT default-branch HEAD — is the source of truth for every
 # client's wire behavior; cmd/statshouse-client-test clones unpinned HEAD, the
-# harness must not. The initial refs are the commits ticket 03's behavior analysis
+# harness must not. The initial refs are the commits the behavior analysis
 # verified (HEADs at 2026-08).
 #
 # driver-template-dir is relative to e2e/ and holds the harness-owned Go
 # text/template that renders the generated stream into a client program.
 #
-# Active clients. Ticket 09 wired the go client end-to-end; ticket 10 adds rust
+# Active clients. The go client is wired end-to-end; rust and cpp follow
 # and cpp on the same path. All three are driven by the same generated metric
 # stream (per-client metric-name prefix isolates their writes — see stream.go).
 #

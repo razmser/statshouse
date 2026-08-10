@@ -1,10 +1,10 @@
 // Command e2e drives the StatsHouse end-to-end test harness.
 //
-// Ticket 07 brought up a single-node ClickHouse with the committed schema and
+// The first phase brought up a single-node ClickHouse with the committed schema and
 // proved the harness skeleton (runtime abstraction, preflight, readiness probes,
 // teardown, artifacts).
 //
-// Ticket 08 builds on that: it cross-compiles the four daemons (metadata, agg,
+// This builds on that: it cross-compiles the four daemons (metadata, agg,
 // api, agent), bind-mounts each into a minimal alpine image, and brings up the
 // full five-service stack — clickhouse, metadata, agg, api, agent — wired by
 // inspected IP, then proves /api/query answers on the published port.
@@ -201,7 +201,7 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeo
 		return 2
 	}
 
-	// --with-ui (ticket 15) is handled early: the npm UI is built in a pinned node
+	// --with-ui is handled early: the npm UI is built in a pinned node
 	// container (offline against a host-populated cache on apple/container; online
 	// via NAT egress on docker) and its output is mounted into the api as
 	// --static-dir=/ui. Off by default — no node, no UI build.
@@ -297,8 +297,8 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeo
 	teardown := func() {
 		if keep {
 			// Print how to reach the kept stack so a human can poke it without
-			// re-deriving addresses (spec §6: "--keep leaves the stack running and
-			// the harness prints how to reach it"). The api is the only published
+			// re-deriving addresses (--keep leaves the stack running and
+			// the harness prints how to reach it). The api is the only published
 			// port by default; when it is not published the container IP is reachable
 			// only from inside the run network. cfg/ds are nil on an early abort.
 			rec.logf("keeping resources (--keep): %d container(s) %v on network %s", len(containers), containers, network)
@@ -382,7 +382,7 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeo
 		return fail(rec, artifactsDir, rt, containers, err)
 	}
 
-	// --- build the npm UI when --with-ui is set (ticket 15) ---
+	// --- build the npm UI when --with-ui is set ---
 	// Done EARLY — right after the published-port preflight, before ClickHouse and
 	// the daemon build — so a UI failure fails fast instead of after the ~1min stack
 	// bring-up. Defaults: the placeholder page (e2e/api-static/index.html) mounted at
@@ -421,8 +421,8 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeo
 		return fail(rec, artifactsDir, rt, containers, fmt.Errorf("clickhouse: %w", err))
 	}
 	if ch.ip == "" {
-		// Ticket 07 treated a missing IP as non-fatal (it probed CH via Exec). The
-		// daemon stack wires to CH by IP (spec §2), so here it is fatal.
+		// An earlier phase treated a missing IP as non-fatal (it probed CH via Exec). The
+		// daemon stack wires to CH by IP, so here it is fatal.
 		return fail(rec, artifactsDir, rt, containers, fmt.Errorf("clickhouse has no inspected IP on %s; daemons wire to it by IP", network))
 	}
 	rec.logf("clickhouse ready (probes green in %.1fs)", time.Since(start).Seconds())
@@ -475,7 +475,7 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeo
 	}
 	rec.logf("daemon stack ready (metadata+agg+api+agent green in %.1fs)", time.Since(start).Seconds())
 
-	// --- /api/query answers on the published port (ticket 08) ---
+	// --- /api/query answers on the published port ---
 	queryAddr := cfg.hostAddr("api") // "127.0.0.1:10888"; falls back to the container IP if not published
 	if queryAddr == "" {
 		queryAddr = net.JoinHostPort(ds.api.ip, strconv.Itoa(apiPort))
@@ -500,7 +500,7 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeo
 	}
 
 	// --- gate "stack ready" on a REAL agent→agg→api round-trip, not just TCP
-	// dials (ticket 10): the agent↔agg channel can be dead while every TCP probe
+	// dials: the agent↔agg channel can be dead while every TCP probe
 	// is green, and every client write then silently times out. A recent point on
 	// the agg's receive-delay builtin proves the conveyor is live before clients
 	// start. ---
@@ -510,7 +510,7 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeo
 	rec.logf("agent↔agg conveyor live (recent %s point)", queryMetric)
 
 	// Under -v, stream each daemon container's logs to stderr LIVE while the run
-	// proceeds (spec §6: "-v streams logs live"). Stopped before teardown (the stop
+	// proceeds (-v streams logs live). Stopped before teardown (the stop
 	// defer is registered after teardown's, so it runs first — LIFO) so the tail
 	// goroutine never races the container Rm. containers holds clickhouse + the four
 	// daemons by now; client containers run foreground (their stdout already streams).
@@ -524,11 +524,11 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeo
 		}
 	}()
 
-	// --- client phase (tickets 09/10/11): drive each selected client over TCP
+	// --- client phase: drive each selected client over TCP
 	// with explicit historic timestamps, wait for its clean exit, then assert
-	// per-kind per-bucket/per-series equality across the full §5 metric matrix
-	// (counter/value/value_p/unique/stag). go came first (ticket 09); ticket 10
-	// adds rust and cpp on the same path; ticket 11 extends the stream + the
+	// per-kind per-bucket/per-series equality across the full metric matrix
+	// (counter/value/value_p/unique/stag). go came first; rust and cpp follow on
+	// the same path; a later phase extends the stream + the
 	// assertions to all metric kinds. The three are isolated by per-client metric
 	// prefixes so their values never collide on the shared stack. ---
 	phaseOpts := clientPhaseOpts{
@@ -750,7 +750,7 @@ func runClientPhase(ctx context.Context, rt Runtime, rec *recorder, d clientDriv
 		rec.logf("%s: build did not cache a driver binary at %s", d.name, filepath.Join(buildCache, driverBinName))
 	}
 
-	// Silent-loss tripwire (spec §4): query __src_client_write_err for this
+	// Silent-loss tripwire: query __src_client_write_err for this
 	// client's run window BEFORE the value assertions, so a TCP-backpressure drop
 	// is reported as one labelled failure rather than N mysterious "count too low"
 	// mismatches whose real cause (bytes never reached the agent) is otherwise
@@ -767,7 +767,7 @@ func runClientPhase(ctx context.Context, rt Runtime, rec *recorder, d clientDriv
 		failed++ // count the silent-loss failure alongside any value mismatches
 	}
 
-	// ticket 12: rejection statuses (criterion 2), conservation ledger (criteria
+	// rejection statuses (criterion 2), conservation ledger (criteria
 	// 3+5), and the whole-run sampling tripwire (criterion 4). They run AFTER the
 	// visible matrix so any sampling on a queried view is already caught; each
 	// prints its own labelled PASS/FAIL lines inside. Only their FAILURES fold into
@@ -802,7 +802,7 @@ func runClientPhase(ctx context.Context, rt Runtime, rec *recorder, d clientDriv
 
 // resolveArch picks the GOARCH to cross-compile daemons for. An explicit --arch
 // wins; otherwise runtime.GOARCH — arm64 on the verified macOS/lima paths, amd64
-// on an amd64 Linux box — matching spec §2 ("detected at preflight, default
+// on an amd64 Linux box — matching ("detected at preflight, default
 // arm64, overridable … an amd64 Linux box builds amd64").
 func resolveArch(flagArch string) string {
 	if flagArch != "" {
@@ -932,7 +932,7 @@ func repoRoot() (string, error) {
 
 // recorder captures every progress line for the artifacts summary and prints it
 // to stderr (so PASS/FAIL stdout stays clean for scripting). It also accumulates
-// the raw JSON of every FAILED /api/query (spec §6: "raw JSON of failed queries"
+// the raw JSON of every FAILED /api/query (raw JSON of failed queries
 // in the artifacts on every run), and — under -v — the raw JSON of every
 // assertion query (pass or fail), so a verbose run leaves a complete response
 // trail. verbose/artifactsDir are set once in realMain; the failed-query list is
@@ -1132,7 +1132,7 @@ func writeSummary(artifactsDir string, lines []string) {
 	_ = os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644)
 }
 
-// writeRunArtifacts writes BOTH diagnostics artifacts the spec §6 requires on
+// writeRunArtifacts writes BOTH diagnostics artifacts required on
 // every run: the PASS/FAIL summary (always) and the raw JSON of failed queries
 // (when any — a clean PASS has none). Called on the pass path, the fail() path,
 // and the assertion-failure path, so the artifacts dir is complete regardless of
@@ -1143,7 +1143,7 @@ func writeRunArtifacts(artifactsDir string, rec *recorder) {
 }
 
 // startLogStreamer tails every container's logs to stderr while the run proceeds
-// (spec §6: "-v streams logs live"). apple/container's `logs` is a one-shot fetch
+// (-v streams logs live). apple/container's `logs` is a one-shot fetch
 // (no -f follow), so this polls each container on an interval and writes the bytes
 // appended since the last fetch, each line prefixed [<service>] to distinguish a
 // daemon log line from the harness's own [e2e] progress lines. Best-effort: any

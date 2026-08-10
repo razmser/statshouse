@@ -16,10 +16,10 @@ import (
 
 const (
 	// alpineBase is the minimal image each daemon binary is bind-mounted into.
-	// No image builds anywhere (spec §2). alpine (busybox) gives the static Go
+	// No image builds anywhere. alpine (busybox) gives the static Go
 	// binaries a Linux userland + /bin/sh for the entrypoint; pinned to the exact
 	// minor tag present locally (3.24 on this machine), not the floating alpine:3
-	// tag, so a rerun reproduces the same userland (spec/ticket: pinned base image).
+	// tag, so a rerun reproduces the same userland (pinned base image).
 	alpineBase = "alpine:3.24"
 
 	metaPort   = 2442  // metadata RPC
@@ -104,10 +104,10 @@ func (o daemonStackOpts) keyVol() string { return o.rpcKeyPath + ":" + rpcKeyMou
 
 // startDaemonStack brings up metadata, agg, api, and agent on the run network,
 // wired entirely by inspected IP (never container DNS — apple/container in-
-// container DNS does not resolve names), with the exact flags of spec §2, and
+// container DNS does not resolve names), with the exact flags, and
 // waits on each one's real readiness probe (TCP dial; no fixed sleeps).
 //
-// Startup order (spec §2): metadata → agg → api + agent. Each daemon binary is
+// Startup order: metadata → agg → api + agent. Each daemon binary is
 // bind-mounted read-only into alpineBase and run via a /bin/sh entrypoint that
 // mkdirs its writable dirs then execs the binary (so the binary becomes PID 1).
 func startDaemonStack(ctx context.Context, rt Runtime, rec *recorder, o daemonStackOpts) (*daemonStack, error) {
@@ -115,7 +115,7 @@ func startDaemonStack(ctx context.Context, rt Runtime, rec *recorder, o daemonSt
 
 	// --- metadata ---
 	// First boot only: --create-binlog initializes the binlog and EXITS, then the
-	// server starts without it (spec §2; verified in cmd/statshouse-metadata: the
+	// server starts without it (verified in cmd/statshouse-metadata: the
 	// create-binlog path returns nil immediately). Both run in ONE container
 	// sharing its writable layer, so the init step's binlog is present for the
 	// server. metadata is the root service, so all its flags are static literals.
@@ -158,10 +158,10 @@ func startDaemonStack(ctx context.Context, rt Runtime, rec *recorder, o daemonSt
 	rec.logf("metadata ready (tcp :%d)", metaPort)
 
 	// --- aggregator ---
-	// --receive-budget-warming=0 is MANDATORY (spec §2): the default 15m ramp
+	// --receive-budget-warming=0 is MANDATORY: the default 15m ramp
 	// starves per-metric receive budgets and agents sample even tiny payloads.
 	//
-	// --disable-receive-sample-budget (ticket 11): stops the agg from advertising
+	// --disable-receive-sample-budget: stops the agg from advertising
 	// per-metric receive budgets back to agents, so the big-unique bucket is sized
 	// only by the agent's own (bumped) --sample-budget. The agg's receive-budget
 	// path already skips historic writes (aggregator_handlers.go:
@@ -305,7 +305,7 @@ exec /statshouse-agg \
 		"--agg-addr="+agg3,
 		"--cache-dir=/cache",
 		"--hardware-metric-scrape-disable",
-		// ticket 11: neutralize agent sampling so the exact per-bucket assertions
+		// neutralize agent sampling so the exact per-bucket assertions
 		// are never distorted by a keep×SF multiplier. agent_shard_send.go
 		// computes the per-shard sampler budget as
 		//   remainingBudget = max(MinSampleBudget,
@@ -437,7 +437,7 @@ func waitTCP(ctx context.Context, rt Runtime, rec *recorder, label, container, i
 }
 
 // queryAPI polls GET /api/query on the api's host address until it answers HTTP
-// 200 (empty data is fine — ticket 08). It proves the api serves end-to-end.
+// 200 (empty data is fine). It proves the api serves end-to-end.
 // apiAddr is the published host address ("127.0.0.1:10888") or, when the api is
 // not published, the container IP:port.
 func queryAPI(ctx context.Context, apiAddr string) (string, error) {

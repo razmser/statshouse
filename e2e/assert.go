@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-// This file implements spec §5 assertions for the FULL metric stream, polling
+// This file implements assertions for the FULL metric stream, polling
 // /api/query (w=1, ac=1) per (metric, query-function) until the expected series
 // appear, then asserting per-bucket, per-(metric, tag-set)-series equality —
 // exact for counter/value/unique-small/stag, within a tolerance band for
@@ -23,10 +23,10 @@ import (
 
 // assertTimeout is the worst-case poll window for one (metric, func) to
 // converge. The historic conveyor is ~24s end-to-end; 60s leaves headroom for
-// auto-create, agg insertion, and the big-unique bucket flush (spec §5).
+// auto-create, agg insertion, and the big-unique bucket flush.
 const assertTimeout = 60 * time.Second
 
-// percentileTol / percentileMinAbs are the value_p tolerance band (spec §5): an
+// percentileTol / percentileMinAbs are the value_p tolerance band: an
 // API percentile is accepted when |actual-truth| ≤ max(percentileTol·|truth|,
 // percentileMinAbs). percentileTol is the spec's 1% relative band; percentileMinAbs
 // is the absolute floor so a near-zero true quantile still has a usable band. The
@@ -121,8 +121,8 @@ func qwFor(kind string) string {
 // per-metric sentWrites the conservation ledger balances against (precomputed by
 // ledgerWriteCounts); it lets a FAILED value assertion also print that metric's
 // ledger state, so a value mismatch and its likely cause (silent loss vs double-
-// count) are visible in one place (spec §6: "the conservation ledger for that
-// metric").
+// count) are visible in one place (the conservation ledger for that
+// metric).
 func assertStream(ctx context.Context, rec *recorder, apiAddr, clientTag string, stream metricStream) (passed, failed int) {
 	want := ledgerWriteCounts(stream)
 	for _, m := range stream.Metrics {
@@ -146,7 +146,7 @@ func assertStream(ctx context.Context, rec *recorder, apiAddr, clientTag string,
 // pollMetricFunc queries one (metric, func) repeatedly until it matches the
 // expected model or assertTimeout elapses. detail is the last observed failure.
 // On failure it ALSO records the raw /api/query response on the recorder (so the
-// run artifacts carry the verbatim JSON of every failed query — spec §6), writes
+// run artifacts carry the verbatim JSON of every failed query), writes
 // the final response to artifacts under -v, and appends the metric's conservation
 // ledger state (sentWrites drives the balance verdict) so a mismatch and its
 // probable cause read together.
@@ -575,7 +575,7 @@ func formatFail(name, qurl string, qf queryFunc, mismatches []seriesMismatch, mi
 
 // tagSignature is the normalized identity of an API series: sorted "k=v" pairs
 // with (a) the go client's _h host tag stripped — it is never in the harness's
-// qb (stripped defensively per spec §4), and (b) empty-valued tags dropped. The
+// qb (stripped defensively), and (b) empty-valued tags dropped. The
 // drop mirrors the expected-model normalizeTags: go drops empty tags client-side,
 // but rust/cpp SEND them verbatim (their libraries have no empty-drop). The agent
 // maps an empty tag value to nothing (internal/agent/agent_mapping.go:
@@ -626,7 +626,7 @@ func expectedSignature(tags []tag) string {
 	return strings.Join(parts, ";")
 }
 
-// --- silent client-side loss tripwire (spec §4: TCP backpressure) -------------
+// --- silent client-side loss tripwire (TCP backpressure) -------------
 
 // clientWriteErrMetric is the builtin every StatsHouse client emits when it
 // SILENTLY drops bytes to the agent under TCP backpressure. The pinned go
@@ -837,7 +837,7 @@ func seriesMetaHasLang(tags map[string]apiMetaTag, lang string) bool {
 	return false
 }
 
-// --- ticket 12: rejection statuses, conservation ledger, sampling tripwire ------
+// --- rejection statuses, conservation ledger, sampling tripwire ------
 //
 // The rejected inputs have NO visible output, so they are asserted three ways
 // against __src_ingestion_status (builtin -11, MetricKindCounter), the per-event
@@ -1165,7 +1165,7 @@ func knownMetricNames(stream metricStream) map[string]bool {
 	return out
 }
 
-// assertRejections is ticket-12 criterion 2: each rejected input must surface its
+// assertRejections is criterion 2: each rejected input must surface its
 // EXACT __src_ingestion_status status with count == sentWrites. It polls the shared
 // breakdown until every generated rejection converges or ledgerTimeout elapses, then
 // reports one PASS/FAIL per rejection metric. A rejection with Sent==false is a
@@ -1241,7 +1241,7 @@ func statusCount(breakdown map[int32]float64, statusID int32) float64 {
 	return breakdown[statusID]
 }
 
-// assertConservationLedger is ticket-12 criterion 3 + 5: the conservation invariant
+// assertConservationLedger is criterion 3 + 5: the conservation invariant
 // per test metric M, EXACT:
 //
 //	sentWrites(M) == okCached(M) + Σ err_*(M)
@@ -1349,7 +1349,7 @@ func ledgerConverged(want map[string]int, bd map[string]map[int32]float64) bool 
 // insert unsampled (sf=1), so this metric must stay ABSENT/zero across the whole run.
 const aggSamplingFactorMetric = "__agg_sampling_factor"
 
-// assertNoAggSampling is ticket-12 criterion 4, the whole-run sampling tripwire:
+// assertNoAggSampling is criterion 4, the whole-run sampling tripwire:
 // __agg_sampling_factor must stay absent/zero. A non-zero point means an insert was
 // sampled, which would break the ledger's exactness (err statuses ride the metric's
 // own sample budget) and the value assertions' representativeness. compareByFunc's

@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// This file unit-tests the ticket-13 PURE logic — the diagnostics / artifacts /
+// This file unit-tests the PURE logic — the diagnostics / artifacts /
 // --skip-client-build machinery that does not touch the network or the live stack:
 // the conservation-ledger verdict formatter, the stream-source label, the build-
 // cache path/descriptor round-trip, the filename sanitizer, the realtime-window

@@ -7,7 +7,7 @@ import (
 
 // This file holds the PURE logic shared between the harness's expected model
 // and the deterministic generator loops emitted into every client driver
-// (spec §5 "pinned seed" = one deterministic formula, not per-language RNG):
+// (a "pinned seed": one deterministic formula, not per-language RNG):
 //
 //   - quantile: the TRUE quantile the value_p percentile assertions compare the
 //     t-digest's output against, using the SAME linear-interpolation definition
@@ -83,7 +83,7 @@ func quantileOf(values []float64, q float64) float64 {
 }
 
 // genValueUniform returns {0, 1, ..., n-1} — the "0–999 step 1" uniform
-// distribution (spec §5) generalised to n points. Already sorted.
+// distribution generalised to n points. Already sorted.
 func genValueUniform(n int) []float64 {
 	out := make([]float64, n)
 	for i := 0; i < n; i++ {
@@ -125,7 +125,7 @@ func genUniqueDistinct(n int) []int64 {
 	return out
 }
 
-// withinAbsTol is the percentile tolerance band (spec §5): an actual value is
+// withinAbsTol is the percentile tolerance band: an actual value is
 // accepted when |actual-truth| ≤ max(absFrac·|truth|, minAbs). absFrac is the
 // relative part (default 1%) and minAbs the absolute floor (default 1.0, so a
 // near-zero true quantile still has a usable band). The t-digest's quantile

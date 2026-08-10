@@ -7,7 +7,7 @@
 # linux/arm64, then runs it inside the VM over the same-path mounted checkout.
 # Inside the VM the harness auto-detects docker and runs the FULL suite
 # unchanged — every assertion path is byte-for-byte identical to `go run ./e2e`
-# on the Mac (apple/container). Spec: .scratch/e2e-test/spec.md §3.
+# on the Mac (apple/container).
 #
 # Assumes Apple silicon: created without --arch, the guest is linux/arm64 (an
 # Intel Mac would produce an x86_64 guest that cannot exec the harness binary).
@@ -27,7 +27,7 @@
 #     every e2e-* container BEFORE it re-publishes the api port, so there is no
 #     "port already in use" collision, then starts a fresh stack.
 #
-# Design choices (ticket 14; documented per "document the choice in the header"):
+# Design choices (documented per "document the choice in the header"):
 #
 #   • template:docker-rootful — the spec wrote `template://docker`, and Lima's
 #     `docker` template does install Docker, but it installs it ROOTLESS. Rootless
@@ -35,7 +35,7 @@
 #     user's main namespace (where the harness process runs) cannot route to:
 #     a container can be UP and listening on 0.0.0.0:2442 yet a `nc -vz
 #     <container-ip> 2442` from the VM host still fails. The harness dials
-#     container IPs for EVERY readiness probe and inter-service wire (spec §2/§3:
+#     container IPs for EVERY readiness probe and inter-service wire (
 #     "all service wiring is by IP"), so rootless breaks it with no path-neutral
 #     harness fix. `docker-rootful` runs dockerd as a system service whose bridge
 #     sits in the VM's main network namespace, so container IPs ARE reachable
@@ -56,7 +56,7 @@
 #     the daemons on the Mac too and sharing them over the mount — the daemon
 #     cache lives under the guest $HOME, which differs from the Mac home, so it
 #     could not be pre-populated over the mount without harness changes (which
-#     the ticket forbids for path-specific behavior).
+#     are forbidden as path-specific behavior).
 #
 #   • Guest $HOME differs from the Mac. Lima v2 sets it to /home/<user>.guest
 #     (NOT the Mac home), so ~/.cache/statshouse-e2e (daemon + client build

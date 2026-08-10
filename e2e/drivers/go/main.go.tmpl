@@ -1,4 +1,4 @@
-{{- /* Driver template for the go StatsHouse client (spec §4/§5).
+{{- /* Driver template for the go StatsHouse client.
    Rendered by the e2e harness (Go text/template) from the single generated
    metric stream (e2e/stream.go). "Pinned seed" = injection: the exact writes
    below are the same bytes the harness asserts against, there is no per-language
@@ -11,7 +11,7 @@
    jitter. Close() does the final synchronous flush; the harness waits for this
    process to exit before asserting.
 
-   KIND DISPATCH. The stream carries the full spec §5 metric matrix (counter,
+   KIND DISPATCH. The stream carries the full metric matrix (counter,
    value, value_p, unique, stag). counter/stag → NamedCountHistoric; value →
    NamedValuesHistoric with a literal payload; value_p/unique large payloads → a
    deterministic generator loop (genSpec) reproducing the EXACT formula in
@@ -74,7 +74,7 @@ func main() {
 	// (cmd/statshouse/statshouse.go hijackConnection → internal/receiver TCP
 	// metric receiver), and this client sends exactly that handshake
 	// (client_conn.go). UDP is lossy across containers — a dropped datagram is
-	// silent — so spec §4 mandates TCP here. The Historic writes still carry
+	// silent — so the harness mandates TCP here. The Historic writes still carry
 	// explicit timestamps.
 	// MaxBucketSize lifts the client's per-bucket reservoir cap (default 1024,
 	// statshouse.go:defaultMaxBucketSize). appendUnique (client_bucket.go) keeps

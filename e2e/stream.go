@@ -8,7 +8,7 @@ import (
 )
 
 // numBuckets is the number of consecutive 1-second buckets every series fills
-// (spec §5: "70 consecutive 1s buckets"). Each series writes all 70, so the
+// (70 consecutive 1s buckets). Each series writes all 70, so the
 // expected model has a non-zero count for every bucket and a missing/null point
 // back from /api/query is unambiguously a failure — EXCEPT for the big-unique
 // stress metric, which populates a subset (see bigUniqueBuckets) for the wire/
@@ -19,7 +19,7 @@ const numBuckets = 70
 // fills. 100k×70×3 clients ≈ 168 MB on the wire and through agent→agg→CH; a
 // subset keeps the run fast while still forcing the ChUnique thinning estimator
 // (>65536 distinct) every populated bucket. A documented, scoped deviation from
-// the "all 70 buckets" default — see DEVIATIONS in the ticket-11 report.
+// the "all 70 buckets" default (a deliberate choice, documented here rather than derived).
 const bigUniqueBuckets = 10
 
 // bigUniqueDistinct is the distinct-value count for the approximate-unique
@@ -33,12 +33,12 @@ const bigUniqueDistinct = 100000
 // region → the asserter compares equality, not a band.
 const smallUniqueDistinct = 300
 
-// valuePBucketPoints is the per-bucket sample count for value_p (spec §5: "a
-// few thousand points per bucket"). Enough for the t-digest to place centroids
+// valuePBucketPoints is the per-bucket sample count for value_p (a
+// few thousand points per bucket). Enough for the t-digest to place centroids
 // well, small enough to compile/run fast across all three clients.
 const valuePBucketPoints = 2000
 
-// fullKeyCap is the rendered full-key (metric name + tags) ceiling (spec §5).
+// fullKeyCap is the rendered full-key (metric name + tags) ceiling.
 // The generator keeps every key well under it; the assertion path logs the max
 // so a future generator change that blows the budget is visible. Stricter than
 // the clients' own caps (cpp 1024 B, rust 4096 B) so none silently drops a
@@ -52,7 +52,7 @@ const fullKeyCap = 768
 // it via POST /api/metric before the client runs (metric_create.go). kindStag is a
 // counter metric whose assertion is cardinality (qw=cardinality, no group-by).
 //
-// kindValueNaN/kindValueInf (ticket 12) are REJECTED value payloads — a NaN and a
+// kindValueNaN/kindValueInf are REJECTED value payloads — a NaN and a
 // +Inf — every write of which the pipeline rejects. They auto-create as VALUE
 // metrics from a kind-matching (valid, value=1) seed, then the real writes are
 // rejected and asserted via __src_ingestion_status (status 23 / 61). They are
@@ -69,7 +69,7 @@ const (
 	kindValueInf = "value_inf" // rejected value payload: +Inf → status 61 err_too_big_value
 )
 
-// --- ticket 12: rejection cases + conservation ledger ------------------------
+// --- rejection cases + conservation ledger ------------------------
 //
 // __src_ingestion_status (builtin metric ID -11, internal/format/builtin_metrics:
 // BuiltinMetricMetaIngestionStatus) is the per-event accounting record the agent
@@ -88,12 +88,10 @@ const (
 //	NaN value      → ValidateValue: IsNaN                                  → 23 err_nan_inf_value
 //	+Inf value     → ValidateValue: +Inf > MaxFloat32                      → 61 err_too_big_value
 //
-// NOTE on the spec's "23/24" claim: spec §5 / ticket 12 say a +Inf VALUE yields
-// status 24. The source disagrees — ValidateValue maps +Inf to 61 (too_big_value),
-// and 24 (err_nan_inf_COUNTER) only fires for a NaN COUNTER via ValidateCounter,
-// which no spec-matrix input exercises. Per the ticket's own instruction ("verify
-// against … source of truth") the harness asserts the source-true status 61 and
-// documents the deviation; see DEVIATIONS in the ticket-12 report.
+// NOTE: a +Inf VALUE yields status 61 (err_too_big_value), not 24 as an earlier
+// doc claimed. Status 24 (err_nan_inf_COUNTER) only fires for a NaN COUNTER via
+// ValidateCounter — a case no matrix input exercises. The harness asserts the
+// source-true status 61; this comment records that deviation.
 const (
 	ingestionStatusMetric = "__src_ingestion_status"
 
@@ -140,7 +138,7 @@ type tag struct {
 // RAW tag set — empty values are kept here on purpose so the template emits
 // them and the client's own empty-value handling is exercised; the expected
 // model applies the same normalization. Count is always > 0 for counter/stag
-// (zero/negative rejection is ticket 12).
+// (zero/negative inputs are rejected).
 type metricWrite struct {
 	Kind    string
 	Metric  string
@@ -206,7 +204,7 @@ type metricModel struct {
 // metricStream is the single generated stream: Base anchors the buckets, Writes
 // is injected into every client driver (the "pinned seed"), Metrics is the
 // shared expected model the VISIBLE assertions compare against, and Rejections
-// (ticket 12) are the rejection-case metrics — every write rejected by the
+// are the rejection-case metrics — every write rejected by the
 // pipeline, asserted via __src_ingestion_status + the conservation ledger, never
 // via visible output (so they stay out of Metrics and thus out of assertStream).
 type metricStream struct {
@@ -237,7 +235,7 @@ type rejectionMetric struct {
 	SkipReason string // documented reason when Sent==false
 }
 
-// generateStream builds the full spec §5 stream once. The same Writes slice is
+// generateStream builds the full metric stream once. The same Writes slice is
 // rendered into the driver template, and Metrics is derived from the same
 // construction, so there is exactly one source of truth (no per-language RNG).
 //
@@ -252,8 +250,8 @@ type rejectionMetric struct {
 // default runID is a datetime "20060102-150405" and resource names
 // (e2e-<runID>-clickhouse …) keep the hyphens, but a StatsHouse metric name
 // must match validMetricName — ASCII letters, digits, and '_' only (format.go).
-// The auto-create path tolerates a hyphen (so the counter metrics of tickets
-// 09/10 happened to work), but POST /api/metric (the value_p pre-create path)
+// The auto-create path tolerates a hyphen (so the counter metrics
+// happened to work), but POST /api/metric (the value_p pre-create path)
 // runs RestoreCachedInfo → ValidMetricName and rejects it. Sanitizing the prefix
 // makes every metric name valid for BOTH paths.
 func generateStream(runID, clientTag string, now time.Time) metricStream {
@@ -320,7 +318,7 @@ func (b *streamBuilder) addCounterMetric(suffix, kind string, qb []string, serie
 	b.metrics = append(b.metrics, m)
 }
 
-// addCounters builds the counter subset (spec §5): the original six counter
+// addCounters builds the counter subset: the original six counter
 // metrics (kept as-is) plus a formal tag-matrix metric that systematically
 // covers 0–6 tags, value pools, unicode, and an empty tag value.
 func (b *streamBuilder) addCounters() {
@@ -353,7 +351,7 @@ func (b *streamBuilder) addCounters() {
 		{tags: []tag{{"0", "a"}, {"1", "b"}, {"2", "c"}, {"3", "d"}, {"4", "e"}, {"5", "f"}}, count: alt(1, 7)},
 	})
 	b.addCounterMetric("c_matrix", kindCounter, nil, []counterSeriesSpec{
-		// Formal tag matrix (spec §5): tag-set cardinality 1..6, a value pool of
+		// Formal tag matrix: tag-set cardinality 1..6, a value pool of
 		// two at index 0, a unicode pair, and an empty tag value. Each series
 		// carries a distinct per-bucket count so a group-by error can't stay
 		// hidden; group-by covers indices 0..5 (fewer-tag series surface with
@@ -469,7 +467,7 @@ func normalizeTags(raw []tag) []tag {
 }
 
 // fullKeyLen estimates the rendered full key length (metric name + tag keys +
-// values) for the spec §5 cap check. It is an upper bound (ignores TL framing),
+// values) for the cap check. It is an upper bound (ignores TL framing),
 // which is what matters for the drop thresholds.
 func fullKeyLen(metric string, tags []tag) int {
 	n := len(metric)

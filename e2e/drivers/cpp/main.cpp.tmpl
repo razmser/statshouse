@@ -1,4 +1,4 @@
-{{- /* Driver template for the cpp StatsHouse client (spec §4/§5).
+{{- /* Driver template for the cpp StatsHouse client.
 
    Rendered by the e2e harness (Go text/template) from the single generated metric
    stream (e2e/stream.go). "Pinned seed" = injection: the exact writes below are
@@ -29,7 +29,7 @@
      would skip the destructor and lose the tail batch. The harness waits for
      this process's clean exit before asserting.
 
-   KIND DISPATCH (spec §5): counter/stag → write_count; value → write_values with
+   KIND DISPATCH: counter/stag → write_count; value → write_values with
    a literal payload; value_p/unique large payloads → a deterministic generator
    loop (genSpec) reproducing the EXACT formula in quantile.go. The LCG relies on
    unsigned long long overflow being DEFINED to wrap (mod 2^64) in C++, `(unsigned)

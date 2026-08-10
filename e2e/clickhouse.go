@@ -10,7 +10,7 @@ import (
 )
 
 const (
-	// chImage is the CI-tested ClickHouse path (spec §2).
+	// chImage is the CI-tested ClickHouse path.
 	chImage = "clickhouse/clickhouse-server:24.3-alpine"
 	// chReadyTable is the readiness sentinel: SHOW TABLES must include it once
 	// /docker-entrypoint-initdb.d/v6-init.sql has finished.
@@ -80,7 +80,7 @@ func startClickHouse(ctx context.Context, rt Runtime, container, network, repoRo
 	return ch, nil
 }
 
-// waitClickHouseReady polls real probes only (no fixed sleeps, spec §3):
+// waitClickHouseReady polls real probes only (no fixed sleeps):
 //  1. `clickhouse-client -q 'SELECT 1'` returns "1" — server is accepting queries.
 //  2. `SHOW TABLES` includes statshouse_v6_1s — the init SQL has completed.
 func waitClickHouseReady(ctx context.Context, rt Runtime, container string) error {

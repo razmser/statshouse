@@ -10,7 +10,7 @@ import (
 
 // Runtime abstracts the container CLI the harness shells out to. Two
 // implementations exist: apple/container (default on macOS) and docker
-// (default on Linux). Per spec §3, apple/container has no stable Go API, so
+// (default on Linux). apple/container has no stable Go API, so
 // CLI shell-out is the supported path.
 type Runtime interface {
 	// Name returns "container" or "docker".

@@ -2,7 +2,7 @@ package main
 
 import "sort"
 
-// This file adds the non-counter generators to streamBuilder (spec §5): value,
+// This file adds the non-counter generators to streamBuilder: value,
 // value_p (percentile), unique (exact + approximate), and stag (cardinality).
 // Each builds the same writes the driver renders AND the expected model the
 // asserter compares against from one construction, so harness and drivers share
@@ -187,9 +187,9 @@ func repeatChar(c byte, n int) string {
 	return string(buf)
 }
 
-// --- ticket 12: rejection cases (spec §5) ------------------------------------
+// --- rejection cases ----------------------------------------------------------
 //
-// addRejections builds the four spec §5 rejection inputs as DEDICATED metrics so
+// addRejections builds the four rejection inputs as DEDICATED metrics so
 // their rejections never bleed into a normal metric's expected model. Each write is
 // rejected by the pipeline and asserted through __src_ingestion_status (the exact
 // status) plus the conservation ledger — never via visible output.

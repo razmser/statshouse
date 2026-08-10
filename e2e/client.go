@@ -18,7 +18,7 @@ import (
 	"time"
 )
 
-// This file implements spec §4 for the go client: acquire the pinned source,
+// This file implements the go-client path: acquire the pinned source,
 // render the generated stream into a synthetic driver module, pre-resolve its
 // dependencies on the HOST (containers have no internet), then build and run it
 // in a pinned golang container over TCP to the agent — capturing the exit code.
@@ -152,7 +152,7 @@ func (c clientSpec) ensureCloned(ctx context.Context, log func(string, ...any)) 
 	// may be a short SHA (rust/cpp), a full SHA (go), or a branch/tag, so resolve it
 	// to a full commit SHA inside the existing checkout and compare to HEAD — a raw
 	// ref never equals `git rev-parse HEAD`, which would otherwise re-clone every
-	// run (ticket 10 pins rust/cpp by short SHAs like 43b4a629).
+	// run (rust/cpp are pinned by short SHAs like 43b4a629).
 	//
 	// A probe that FAILED because its context was cancelled (the run deadline or a
 	// signal firing mid-probe) must NEVER tear down a healthy cache: the probe is
@@ -510,7 +510,7 @@ func clientBuildCacheFor(repoRoot, cache, clientName, clientTag, arch string) (c
 // and Arch guard against replaying a binary built for a different client or arch.
 //
 // SourceHash (sha256 of the rendered driver source) and BaseImage (the pinned
-// toolchain tag the binary was built in) were added by ticket 13's cache-
+// toolchain tag the binary was built in) were added by the cache-
 // invalidation fix: a later --skip-client-build re-renders the source from the
 // descriptor and REFUSES if either changed, so a template/generator edit or a
 // toolchain bump can never replay a stale binary against a freshly-rendered
@@ -578,7 +578,7 @@ func loadStreamCacheMeta(buildCache string) (streamCacheMeta, error) {
 // validateSkipClientBuildCache performs the PURE host-side --skip-client-build
 // validation for one driver: the stream descriptor is present and loadable, its
 // ClientTag/Arch match this driver+arch, the cached driver binary exists, and —
-// for descriptors written after the cache-invalidation guard (ticket 13) — the
+// for descriptors written after the cache-invalidation guard — the
 // pinned base image and the sha256 of the re-rendered driver source still match.
 // A missing/mismatched cache fails with actionable text (run once WITHOUT
 // --skip-client-build). Pure (file reads + a re-render only) so it is also called
@@ -702,7 +702,7 @@ func runCachedDriver(ctx context.Context, rt Runtime, rec *recorder, o clientRun
 	return res.exitCode, output, runErr
 }
 
-// buildAndRunGoClient is the full spec §4 go-client path: clone → render → host
+// buildAndRunGoClient is the full go-client path: clone → render → host
 // module resolve → offline container build → foreground run. Returns the driver
 // process exit code, its combined stdout+stderr, and a launch error (if any). A
 // non-zero exit is reported via exitCode, not err.

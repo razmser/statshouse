@@ -10,7 +10,7 @@ import (
 // publishConfig maps a service name ("api") to the host-side publish address
 // parsed from e2e/config.yaml (e.g. "127.0.0.1:10888"). The harness appends the
 // service's container port to form the full -p publish spec
-// ("127.0.0.1:10888:10888"). Per spec §2/§6, published ports come ONLY from this
+// ("127.0.0.1:10888:10888"). Published ports come ONLY from this
 // file; the default map publishes the api alone.
 type publishConfig map[string]string
 

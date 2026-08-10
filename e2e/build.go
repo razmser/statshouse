@@ -16,7 +16,7 @@ import (
 // cannot build without CGO (the metadata uses sqlite via the C amalgamation in
 // internal/sqlite/sqlite0). The others build static with CGO_ENABLED=0.
 //
-// NOTE on the spec: spec §2/§3 says all four daemons build with CGO_ENABLED=0.
+// NOTE: all four daemons build with CGO_ENABLED=0.
 // That holds for agg/api/agent but NOT metadata — sqlite0 is a cgo package, so
 // `CGO_ENABLED=0` yields "build constraints exclude all Go files". The project's
 // own Makefile confirms this: it builds statshouse-metadata with plain `go build`
@@ -35,7 +35,7 @@ type daemonSpec struct {
 	cgo bool
 }
 
-// buildDaemons cross-compiles the four daemons for the runtime arch (spec §2/§3:
+// buildDaemons cross-compiles the four daemons for the runtime arch:
 // GOOS=linux GOARCH=<arch>) into a cache dir shared across runs
 // (~/.cache/statshouse-e2e/bin/<arch>/). A binary whose cached copy is newer than
 // the newest source file is reused verbatim, so a no-change rerun is instant and

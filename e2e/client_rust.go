@@ -10,11 +10,11 @@ import (
 	"text/template"
 )
 
-// This file implements spec §4 for the rust client: acquire the pinned source,
+// This file implements the rust-client path: acquire the pinned source,
 // render the generated stream into a harness-owned driver, build it offline in a
 // pinned rust container (rlib + rustc --extern), and run it over TCP to the agent.
 //
-// BUILD RECIPE (deviation from spec §4's literal "cargo build then rustc --extern",
+// BUILD RECIPE (deviation from the literal "cargo build then rustc --extern",
 // documented with evidence — see buildAndRunRustClient): the statshouse crate is
 // zero-dependency and single-file, so the rlib is produced with a direct
 // `rustc --crate-type rlib` against the pinned lib.rs, then the driver is compiled
@@ -27,7 +27,7 @@ const (
 	// rustBaseImage is the pinned Rust toolchain the driver builds+runs in.
 	// Multi-arch; apple/container selects arm64, matching the cross-compiled
 	// daemons. Pinned to an exact minor (not floating rust:1) so a rerun reproduces
-	// the same toolchain (spec/ticket: pinned base image).
+	// the same toolchain (pinned base image).
 	rustBaseImage = "rust:1.83-bookworm"
 
 	rustClientName  = "statshouse-rs" // the active client in e2e/clients.txt
@@ -93,7 +93,7 @@ func renderRustDriver(tmplPath string, stream metricStream, outDir string) error
 	return renderDriver(tmplPath, "rust-driver", rustDriverFuncs(), stream, outDir, "main.rs")
 }
 
-// buildAndRunRustClient is the spec §4 rust path: clone → render → offline
+// buildAndRunRustClient is the full rust path: clone → render → offline
 // container build (rlib + rustc --extern) → foreground run. Returns the driver
 // process exit code, combined stdout+stderr, and a launch error (nil for a clean
 // non-zero exit).

@@ -19,7 +19,7 @@ import (
 	"time"
 )
 
-// This file implements spec §3 "UI" (ticket 15): the opt-in --with-ui path that
+// This file implements the "UI" path: the opt-in --with-ui path that
 // builds the StatsHouse npm UI in a pinned node container and serves it from the
 // api's --static-dir. Off by default; without the flag there is no node, no UI
 // build, and no implicit work (the placeholder e2e/api-static/index.html is used).

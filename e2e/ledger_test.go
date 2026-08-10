@@ -6,12 +6,12 @@ import (
 	"testing"
 )
 
-// This file unit-tests the ticket-12 PURE logic — the parts of the rejection /
+// This file unit-tests the PURE logic — the parts of the rejection /
 // conservation-ledger machinery that do not touch the network or the live stack:
 // status-ID classification, ledger balance math, convergence predicates, the
 // seed-kind derivation, and the per-client rejection-metric generation. The
 // networked assertions themselves are exercised only by the full `go run ./e2e`
-// run (their correctness is pinned by the negative-proof step in the ticket).
+// run (their correctness is pinned by the negative-proof step).
 //
 // Note on IDs vs names: the API renders the __src_ingestion_status tag2 as the
 // numeric VALUE ID (10=ok_cached, 23=err_nan_inf_value, …), NOT the name, so the
@@ -341,7 +341,7 @@ func TestRejectionsConverged(t *testing.T) {
 	}
 }
 
-// TestAddRejectionsPerClient pins the per-client rejection generation (spec §5 + the
+// TestAddRejectionsPerClient pins the per-client rejection generation (the
 // client-side-rejection analysis). All three clients get the two VALUE rejections
 // (NaN → 23, +Inf → 61), Sent==true with Writes==numBuckets. cpp additionally SENDS
 // the two COUNTER rejections (zero → 62, negative → 25), Sent==true with Writes==
