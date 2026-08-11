@@ -26,3 +26,5 @@ node_modules/
 
 # built harness binary (go build run inside e2e/)
 /e2e/e2e
+
+/.scratch
