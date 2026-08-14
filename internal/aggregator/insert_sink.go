@@ -67,6 +67,78 @@ type InsertSink interface {
 	Reset()
 }
 
+// duckStoreHandle is the aggregator's lifecycle handle on its duck-store: it
+// owns the single writer goroutine all insert threads share and produces their
+// sinks. The concrete type exists only in duckdb-tagged builds; without the
+// tag the duck backend is rejected during config validation and the handle
+// stays nil.
+type duckStoreHandle interface {
+	NewSink() InsertSink
+	Close() error
+}
+
+// newInsertSink returns the sink one insert thread writes its rounds through:
+// the duck-store writer when the duck backend is selected, today's
+// ClickHouse inserter otherwise.
+func (a *Aggregator) newInsertSink(httpClient *http.Client) InsertSink {
+	if a.duckStore != nil {
+		return a.duckStore.NewSink()
+	}
+	return newClickhouseSink(httpClient, a.config.KHAddr, a.config.KHUser, a.config.KHPassword, getTableDesc(),
+		func() string { // insert settings can change through the remote config
+			a.configMu.RLock()
+			defer a.configMu.RUnlock()
+			return a.configR.V3InsertSettings
+		})
+}
+
+// rowBinarySize returns the number of bytes appendRowBinary produces for row,
+// computed without building them. Every sink reports this per row, so the
+// insertSize accounting stays identical regardless of the storage backend.
+func rowBinarySize(row *insertRow) int {
+	n := 1 + 4 + 4 // index_type, metric, time
+	for ki := 0; ki < format.MaxTags; ki++ {
+		if ki == format.StringTopTagIndexV3 {
+			continue // the string top pair below takes this slot
+		}
+		n += tagBinarySize(row.key.STags[ki], row.key.Tags[ki])
+	}
+	n += tagBinarySize(row.top.S, row.top.I)
+	n += 6 * 8 // count, max_count, min, max, sum, sumsquare
+	n += len(row.percentiles) + len(row.unique)
+	n += argMinMaxTagBinarySize(row.minHost)
+	n += argMinMaxTagBinarySize(row.maxHost)
+	n += argMinMaxTagBinarySize(row.maxCountHost)
+	return n
+}
+
+// tagBinarySize is the size of appendTagBinary's output: the uint32 id plus a
+// RowBinary string — always empty when an id is set.
+func tagBinarySize(s string, i int32) int {
+	if i != 0 || s == "" {
+		return 4 + 1
+	}
+	var tmp [10]byte
+	return 4 + binary.PutUvarint(tmp[:], uint64(len(s))) + len(s)
+}
+
+// argMinMaxTagBinarySize is the size of appendArgMinMaxTag's output for one
+// host pair: the empty encoding, or AppendArgMinMaxBytesFloat32's framing —
+// the uint32 size, the packed tag argument, the bool terminator and the
+// float. The 4-byte placeholder appendArgMinMaxTag writes first is
+// overwritten by that framing (it exists to keep the append aliasing-safe),
+// so the tag bytes are counted exactly once.
+func argMinMaxTagBinarySize(h hostPair) int {
+	if h.tag.Empty() {
+		return 5 // AppendArgMinMaxStringEmpty
+	}
+	argLen := 1 + len(h.tag.S) // string-kind discriminator + bytes
+	if h.tag.I != 0 {
+		argLen = 1 + 4 // int-kind discriminator + uint32
+	}
+	return 4 + argLen + 2 + 4
+}
+
 // clickhouseSink posts each round as one RowBinary insert over HTTP, byte for
 // byte the way the aggregator inserted before the seam existed.
 type clickhouseSink struct {

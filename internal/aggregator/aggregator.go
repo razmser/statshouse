@@ -29,6 +29,7 @@ import (
 	"github.com/VKCOM/statshouse/internal/data_model"
 	"github.com/VKCOM/statshouse/internal/data_model/gen2/tlmetadata"
 	"github.com/VKCOM/statshouse/internal/data_model/gen2/tlstatshouse"
+	"github.com/VKCOM/statshouse/internal/duckstore"
 	"github.com/VKCOM/statshouse/internal/format"
 	"github.com/VKCOM/statshouse/internal/metajournal"
 	"github.com/VKCOM/statshouse/internal/metarqlite"
@@ -109,6 +110,11 @@ type (
 		historicSenders int
 
 		config ConfigAggregator
+
+		// duckStore is non-nil exactly when the duck storage backend is
+		// selected: the handle on the shard's duck-store, shared by all insert
+		// threads (see duckStoreHandle). ClickHouse remains the default.
+		duckStore duckStoreHandle
 
 		// Remote config
 		configR     ConfigAggregatorRemote
@@ -381,6 +387,16 @@ func MakeAggregator(fj *os.File, fjCompact *os.File, mappingsCache *pcache.Mappi
 	a.startTimestamp = uint32(now.Unix())
 	_ = a.advanceRecentBuckets(now, true) // Just create initial set of buckets and set LastHour
 	a.appendInternalLog("start", "", build.Commit(), build.Info(), strings.Join(os.Args[1:], " "), strings.Join(a.config.RemoteInitial.ClusterShardsAddrs, ","), "", "Started")
+
+	// The duck store must exist before the insert threads start; from here to
+	// the end of MakeAggregator nothing fails anymore.
+	if a.config.StorageBackend == duckstore.BackendDuck {
+		duck, err := openDuckStore(a.config)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open duck-store in %q: %v", a.config.DuckStoreDir, err)
+		}
+		a.duckStore = duck
+	}
 
 	a.insertsSemaSize = int64(a.config.RecentInserters)
 	a.insertsSema = semaphore.NewWeighted(a.insertsSemaSize)
@@ -718,12 +734,7 @@ func (a *Aggregator) goInsert(insertsSema *semaphore.Weighted, cancelCtx context
 
 	rnd := rand.New()
 	httpClient := makeHTTPClient()
-	sink := newClickhouseSink(httpClient, a.config.KHAddr, a.config.KHUser, a.config.KHPassword, getTableDesc(),
-		func() string { // insert settings can change through the remote config
-			a.configMu.RLock()
-			defer a.configMu.RUnlock()
-			return a.configR.V3InsertSettings
-		})
+	sink := a.newInsertSink(httpClient)
 	var buffers data_model.SamplerBuffers
 	var aggBuckets []*aggregatorBucket
 	var hostBudgets = map[data_model.TagUnion][]tlstatshouse.MetricBudget{}

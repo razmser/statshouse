@@ -66,6 +66,11 @@ type ConfigAggregator struct {
 	// build tag; validation rejects it otherwise.
 	StorageBackend duckstore.StorageBackend
 
+	// DuckStoreDir is the directory the duck-store owns when StorageBackend
+	// is duck: delta generations and archive windows are created inside it on
+	// first start. Empty means unset, which openDuckStore rejects.
+	DuckStoreDir string
+
 	KHAddr         string
 	KHUser         string
 	KHPassword     string

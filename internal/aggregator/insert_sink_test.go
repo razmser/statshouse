@@ -352,6 +352,116 @@ func sinkRoundBody(sink InsertSink) []byte {
 	return sink.(*clickhouseSink).body
 }
 
+// TestRowBinarySizeMatchesEncoding pins rowBinarySize to appendRowBinary's
+// actual output, so the per-row size accounting of every sink (not just the
+// one that really encodes the bytes) reports what ClickHouse would have sent.
+func TestRowBinarySizeMatchesEncoding(t *testing.T) {
+	storage := goldenMetricStorage(t)
+	rnd := rand.New(goldenSeed)
+
+	// rows resolved through the conveyor's own resolution cover every branch
+	// of the encoders: values, counters, skips, sampling factors, string tops
+	// in both encodings, raw string tags, both host encodings and both sketches
+	valueKey := func(metric int32) *data_model.Key {
+		return &data_model.Key{Timestamp: goldenNow, Metric: metric}
+	}
+	appendCtx := appendContext{
+		metricCache:       makeMetricCache(storage),
+		unknownTags:       map[string]createMappingExtra{},
+		bucketUnknownTags: map[string]createMappingExtra{},
+	}
+	richTail := func() *data_model.MultiValue {
+		v := &data_model.MultiValue{}
+		v.AddValueCounterHost(rnd, 1.5, 3, data_model.TagUnion{I: 7})
+		v.AddValueCounterHost(rnd, 9.75, 4, data_model.TagUnion{S: "max host"})
+		td := tdigest.NewWithCompression(rowbinary.TDigestCompression)
+		td.Add(1.5, 3)
+		v.ValueTDigest = td
+		v.HLL.Insert(11)
+		return v
+	}
+	var rows []insertRow
+	for _, sf := range []float64{1, 2.5, 17} {
+		row, _ := resolveMultiValueRow(rnd, valueKey(goldenMetricValues), data_model.TagUnion{}, richTail(), sf, appendCtx, nil)
+		rows = append(rows, row)
+		row, _ = resolveMultiValueRow(rnd, valueKey(goldenMetricSkips), data_model.TagUnion{S: "string top"}, richTail(), 1, appendCtx, nil)
+		rows = append(rows, row)
+		// value-stat rows (badges, contributors log) have no sketches of their own
+		row, _, _ = resolveValueStatRow(rnd, valueKey(format.BuiltinMetricIDBadges), data_model.SimpleItemValue(3.5, 2, data_model.TagUnion{I: goldenHostID}), appendCtx, nil)
+		rows = append(rows, row)
+	}
+	// and randomized rows exercising arbitrary tag strings, ids, hosts and
+	// sketch lengths (including empty sketches and empty hosts)
+	randStr := func(maxLen int) string {
+		b := make([]byte, rnd.Intn(maxLen))
+		_, _ = rnd.Read(b)
+		return string(b)
+	}
+	for i := 0; i < 2000; i++ {
+		row := insertRow{
+			key: data_model.Key{
+				Timestamp: rnd.Uint32(),
+				Metric:    int32(rnd.Int31()),
+			},
+			top:       data_model.TagUnion{I: int32(rnd.Int31()), S: randStr(200)},
+			count:     rnd.Float64() * 100,
+			min:       rnd.Float64(),
+			max:       rnd.Float64() * 100,
+			sum:       rnd.Float64() * 1e6,
+			sumSquare: rnd.Float64() * 1e9,
+		}
+		for ki := 0; ki < format.MaxTags; ki++ {
+			if rnd.Intn(2) == 0 {
+				row.key.Tags[ki] = int32(rnd.Int31())
+			} else {
+				row.key.STags[ki] = randStr(300)
+			}
+		}
+		row.percentiles = make([]byte, rnd.Intn(600))
+		row.unique = make([]byte, rnd.Intn(600))
+		if rnd.Intn(2) == 0 {
+			row.minHost = hostPair{data_model.TagUnion{I: int32(rnd.Int31())}, rnd.Float32()}
+		} else if rnd.Intn(2) == 0 {
+			row.minHost = hostPair{data_model.TagUnion{S: randStr(250)}, rnd.Float32()}
+		}
+		if rnd.Intn(2) == 0 {
+			row.maxHost = hostPair{data_model.TagUnion{S: randStr(250)}, rnd.Float32()}
+		}
+		if rnd.Intn(2) == 0 {
+			row.maxCountHost = hostPair{data_model.TagUnion{I: int32(rnd.Int31()), S: randStr(50)}, rnd.Float32()}
+		}
+		rows = append(rows, row)
+	}
+
+	for i := range rows {
+		row := &rows[i]
+		if got, want := rowBinarySize(row), len(appendRowBinary(nil, row)); got != want {
+			t.Fatalf("row %d: rowBinarySize=%d but appendRowBinary produces %d bytes (row %+v)", i, got, want, row)
+		}
+	}
+}
+
+// fakeDuckHandle drives the sink selection without any DuckDB.
+type fakeDuckHandle struct{ sink InsertSink }
+
+func (f *fakeDuckHandle) NewSink() InsertSink { return f.sink }
+func (f *fakeDuckHandle) Close() error        { return nil }
+
+// TestNewInsertSinkSelectsBackend pins the wiring of goInsert's sink: the duck
+// handle when the duck backend opened one, the ClickHouse inserter otherwise.
+func TestNewInsertSinkSelectsBackend(t *testing.T) {
+	a := &Aggregator{}
+	if _, ok := a.newInsertSink(nil).(*clickhouseSink); !ok {
+		t.Fatal("without a duck store the sink must be the ClickHouse inserter")
+	}
+
+	sentinel := newClickhouseSink(nil, "", "", "", "", func() string { return "" }) // any distinct sink works
+	a.duckStore = &fakeDuckHandle{sink: sentinel}
+	if got := a.newInsertSink(nil); got != InsertSink(sentinel) {
+		t.Fatalf("with a duck store the sink must come from the store handle, got %T", got)
+	}
+}
+
 // TestClickhouseSinkSend drives the sink's HTTP insert against a fake
 // ClickHouse: the request must carry the same query prefix, settings, headers
 // and RowBinary body the pre-seam sendToClickhouse built, and the status,
