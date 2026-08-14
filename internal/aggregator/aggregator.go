@@ -718,14 +718,19 @@ func (a *Aggregator) goInsert(insertsSema *semaphore.Weighted, cancelCtx context
 
 	rnd := rand.New()
 	httpClient := makeHTTPClient()
+	sink := newClickhouseSink(httpClient, a.config.KHAddr, a.config.KHUser, a.config.KHPassword, getTableDesc(),
+		func() string { // insert settings can change through the remote config
+			a.configMu.RLock()
+			defer a.configMu.RUnlock()
+			return a.configR.V3InsertSettings
+		})
 	var buffers data_model.SamplerBuffers
 	var aggBuckets []*aggregatorBucket
-	var bodyStorage []byte
 	var hostBudgets = map[data_model.TagUnion][]tlstatshouse.MetricBudget{}
 
 	for aggBucket := range bucketsToSend {
 		aggBuckets = aggBuckets[:0]
-		bodyStorage = bodyStorage[:0]
+		sink.Reset()
 		for host := range hostBudgets {
 			hostBudgets[host] = hostBudgets[host][:0]
 		}
@@ -822,11 +827,11 @@ func (a *Aggregator) goInsert(insertsSema *semaphore.Weighted, cancelCtx context
 
 		var marshalDur time.Duration
 		var stats insertStats
-		bodyStorage, buffers, stats, marshalDur = a.rowDataMarshalAppendPositions(aggBuckets, buffers, rnd, bodyStorage[:0])
+		buffers, stats, marshalDur = a.rowDataMarshalAppendPositions(aggBuckets, buffers, rnd, sink, nowUnix)
 
 		// Never empty, because adds value stats
 		ctx, cancelSendToCh := context.WithTimeout(cancelCtx, data_model.ClickHouseTimeoutInsert)
-		status, exception, dur, sendErr := sendToClickhouse(ctx, httpClient, a.config.KHAddr, a.config.KHUser, a.config.KHPassword, getTableDesc(), bodyStorage, configR.V3InsertSettings)
+		status, exception, dur, sendErr := sink.Send(ctx)
 		cancelSendToCh()
 		func() {
 			a.migrationMu.Lock()
@@ -910,7 +915,7 @@ func (a *Aggregator) goInsert(insertsSema *semaphore.Weighted, cancelCtx context
 			a.reportInsertMetric(b.time, format.BuiltinMetricMetaAggInsertTime, i != 0, sendErr, status, exception, 0, dur.Seconds())
 		}
 		// insert of all buckets is also accounted into single event at aggBucket.time second, so the graphic will be smoother
-		a.reportInsertMetric(aggBucket.time, format.BuiltinMetricMetaAggInsertSizeReal, willInsertHistoric, sendErr, status, exception, 0, float64(len(bodyStorage)))
+		a.reportInsertMetric(aggBucket.time, format.BuiltinMetricMetaAggInsertSizeReal, willInsertHistoric, sendErr, status, exception, 0, float64(sink.RoundSize()))
 		a.reportInsertMetric(aggBucket.time, format.BuiltinMetricMetaAggInsertTimeReal, willInsertHistoric, sendErr, status, exception, 0, dur.Seconds())
 		a.reportInsertMetric(aggBucket.time, format.BuiltinMetricMetaAggSamplingTime, willInsertHistoric, sendErr, status, exception, 0, marshalDur.Seconds())
 		tableTag := int32(format.TagValueIDAggInsertV3)
