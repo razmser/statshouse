@@ -10,10 +10,29 @@
 // behind the "duckdb" build tag, so binaries built without it stay pure Go.
 package duckstore
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 // BuildTag is the Go build tag that compiles DuckDB support into a binary.
 const BuildTag = "duckdb"
+
+// Default retention per tier, mirroring ClickHouse's TTLs so switching
+// backends does not change how long data lives: an archive window file is
+// unlinked once the window it covers ended this long ago. Zero keeps the
+// tier's windows forever.
+const (
+	DefaultRetention1s = 52 * time.Hour
+	DefaultRetention1m = 33 * 24 * time.Hour
+
+	DefaultRetention1h time.Duration = 0
+)
+
+// DefaultFreeSpaceWatermark is the free-space low watermark's default: the
+// safety net is off until an operator sets it, because disk is bounded
+// upstream by the sampling budget and there is no required disk-cap flag.
+const DefaultFreeSpaceWatermark uint64 = 0
 
 // StorageBackend selects which storage backend metric data is written to and
 // read from. Parsed from --storage-backend by the aggregator and the API.

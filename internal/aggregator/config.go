@@ -71,6 +71,20 @@ type ConfigAggregator struct {
 	// first start. Empty means unset, which openDuckStore rejects.
 	DuckStoreDir string
 
+	// Duck retention, applied per tier by the retainer that unlinks whole
+	// archive window files: how long a tier's windows are kept after the
+	// window they cover has ended. Zero keeps the tier's windows forever. The
+	// defaults mirror ClickHouse's TTLs — 52 h (1s), 33 d (1m), unbounded (1h).
+	DuckRetention1s time.Duration
+	DuckRetention1m time.Duration
+	DuckRetention1h time.Duration
+
+	// DuckFreeSpaceWatermark is the minimum free disk space, in bytes, on the
+	// volume holding the duck store directory; below it the oldest archive
+	// windows are evicted early instead of letting ingestion stop for want of
+	// disk. Zero disables the check.
+	DuckFreeSpaceWatermark int64
+
 	KHAddr         string
 	KHUser         string
 	KHPassword     string
@@ -109,6 +123,11 @@ func DefaultConfigAggregator() ConfigAggregator {
 		MetadataAddr:         "127.0.0.1:2442",
 		LocalReplica:         0, // require setting it explicitly
 		LocalShard:           1,
+
+		DuckRetention1s:        duckstore.DefaultRetention1s,
+		DuckRetention1m:        duckstore.DefaultRetention1m,
+		DuckRetention1h:        duckstore.DefaultRetention1h,
+		DuckFreeSpaceWatermark: int64(duckstore.DefaultFreeSpaceWatermark),
 
 		RemoteInitial: ConfigAggregatorRemote{
 			ShortWindow:               data_model.MaxShortWindow,
@@ -230,6 +249,18 @@ func (c *ConfigAggregatorRemote) Bind(f *flag.FlagSet, d ConfigAggregatorRemote,
 func ValidateConfigAggregator(c *ConfigAggregator) error {
 	if err := c.StorageBackend.Validate(); err != nil {
 		return err
+	}
+	if c.DuckRetention1s < 0 {
+		return fmt.Errorf("--duck-retention-1s (%s) must be >= 0 (0 keeps 1s-tier archive windows forever)", c.DuckRetention1s)
+	}
+	if c.DuckRetention1m < 0 {
+		return fmt.Errorf("--duck-retention-1m (%s) must be >= 0 (0 keeps 1m-tier archive windows forever)", c.DuckRetention1m)
+	}
+	if c.DuckRetention1h < 0 {
+		return fmt.Errorf("--duck-retention-1h (%s) must be >= 0 (0 keeps 1h-tier archive windows forever)", c.DuckRetention1h)
+	}
+	if c.DuckFreeSpaceWatermark < 0 {
+		return fmt.Errorf("--duck-free-space-watermark (%d) must be >= 0 (0 disables early eviction)", c.DuckFreeSpaceWatermark)
 	}
 	if c.InsertHistoricWhen < 1 {
 		return fmt.Errorf("--insert-historic-when (%d) must be >= 1", c.InsertHistoricWhen)

@@ -10,6 +10,7 @@ import (
 	"flag"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -89,4 +90,11 @@ func TestStorageBackendValidate(t *testing.T) {
 	// both what to change and how to get a binary that supports it
 	require.Contains(t, err.Error(), "--storage-backend=duck")
 	require.Contains(t, err.Error(), `"`+BuildTag+`"`)
+}
+
+func TestDefaultRetentionMirrorsClickHouseTTLs(t *testing.T) {
+	require.Equal(t, 52*time.Hour, DefaultRetention1s)
+	require.Equal(t, 33*24*time.Hour, DefaultRetention1m)
+	require.Equal(t, time.Duration(0), DefaultRetention1h, "the 1h tier is unbounded by default")
+	require.Equal(t, uint64(0), DefaultFreeSpaceWatermark, "the free-space safety net is off by default")
 }

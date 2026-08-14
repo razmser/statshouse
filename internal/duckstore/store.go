@@ -108,6 +108,7 @@ type Store struct {
 
 	windows     []WindowFile
 	consumed    map[windowKey]map[int64]struct{} // per archive window, the delta generations it already holds
+	leases      map[windowKey]int                // per archive window, the read leases queries hold; retention defers unlinks to them
 	quarantined []QuarantineInfo
 }
 

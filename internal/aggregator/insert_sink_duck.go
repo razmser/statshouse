@@ -19,8 +19,8 @@ import (
 	"github.com/VKCOM/statshouse/internal/duckstore"
 )
 
-// openDuckStore opens the shard's duck-store and starts its single writer,
-// producing the handle the insert threads take their sinks from.
+// openDuckStore opens the shard's duck-store and starts its single writer and
+// its retainer, producing the handle the insert threads take their sinks from.
 func openDuckStore(config ConfigAggregator) (duckStoreHandle, error) {
 	s, err := duckstore.OpenStore(duckstore.StoreConfig{
 		Dir:  config.DuckStoreDir,
@@ -34,20 +34,38 @@ func openDuckStore(config ConfigAggregator) (duckStoreHandle, error) {
 		_ = s.Close()
 		return nil, err
 	}
-	return &duckStore{store: s, writer: w}, nil
+	retainer := duckstore.NewRetainer(s, duckstore.RetentionConfig{
+		Retention1s:        config.DuckRetention1s,
+		Retention1m:        config.DuckRetention1m,
+		Retention1h:        config.DuckRetention1h,
+		FreeSpaceWatermark: uint64(config.DuckFreeSpaceWatermark),
+		Logf:               log.Printf,
+	})
+	retCtx, stopRetainer := context.WithCancel(context.Background())
+	retainerDone := make(chan struct{})
+	go func() {
+		defer close(retainerDone)
+		_ = retainer.Run(retCtx)
+	}()
+	return &duckStore{store: s, writer: w, stopRetainer: stopRetainer, retainerDone: retainerDone}, nil
 }
 
-// duckStore implements duckStoreHandle over the store and its writer.
+// duckStore implements duckStoreHandle over the store, its writer and its
+// retainer.
 type duckStore struct {
-	store  *duckstore.Store
-	writer *duckstore.Writer
+	store        *duckstore.Store
+	writer       *duckstore.Writer
+	stopRetainer context.CancelFunc
+	retainerDone chan struct{}
 }
 
 func (d *duckStore) NewSink() InsertSink { return newDuckSink(d.writer) }
 
-// Close stops the writer before releasing the store, so the appenders' dedicated
-// connection is never closed underneath a live writer.
+// Close stops the retainer and the writer before releasing the store, so the
+// appenders' dedicated connection is never closed underneath a live writer.
 func (d *duckStore) Close() error {
+	d.stopRetainer()
+	<-d.retainerDone
 	return errors.Join(d.writer.Close(), d.store.Close())
 }
 
