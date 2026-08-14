@@ -52,6 +52,29 @@ _Avoid_: merge, flush, rollup (already means something else)
 The once-per-window rewrite of an **archive window file**'s several sorted runs into one, after which the file is reopened `READ_ONLY`. Happens at `window_end + 48h` — past `MaxHistoricWindow`, so no late row can ever invalidate a sealed collapse.
 _Avoid_: freezing, finalizing, closing
 
+**Retention**:
+The bound on how long a shard keeps a tier's data. Enforced by unlinking whole **archive window
+files**, oldest first. A tier's age limit is the normal bound; a free-space low watermark can evict a
+window before it reaches that age. How much disk the data occupies in the first place is set upstream,
+by the sampling budget.
+_Avoid_: TTL, expiry, cleanup
+
+**Quarantined file**:
+A delta or **archive window file** whose version stamp does not match the running binary. The agg
+refuses to open it, excludes it from queries, and leaves it on disk untouched — duck-store never
+upgrades a file in place, in either direction.
+_Avoid_: corrupt file, incompatible file, stale file
+
+**Differential conformance run**:
+An e2e run that executes the unchanged suite against both **storage backends** and compares the
+results by *decoded value* — never by state bytes, since two valid merge orders of the same
+**aggregate state** serialize differently. The only thing keeping the ClickHouse and DuckDB SQL
+renderers honest with each other.
+_Avoid_: dual-write, shadow read, backend diff
+
 **Small installation**:
-The whole statshouse stack (agent + aggregator + API + storage) on a single node with no ClickHouse process. A motivating case for duck-store, but not the only one — sharded multi-node duck-store deployments are in scope; replication is not.
+A statshouse deployment with no ClickHouse process, running on nodes too small to justify one. This is
+duck-store's *purpose*, not merely one of its uses: it is a cheap alternative for installs that cannot
+afford ClickHouse, so the design spends as little CPU, RAM and disk as it can rather than as much as
+the node allows. Sharded multi-node duck-store deployments are in scope; replication is not.
 _Avoid_: tiny install, lightweight deployment
