@@ -61,6 +61,11 @@ type WindowFile struct {
 	Tier        string
 	WindowStart int64 // unix seconds
 	Path        string
+
+	// Sealed reports the file's sealed marker: the window's runs were rewritten
+	// into one and its contents never change again, so the file is opened
+	// read-only from then on.
+	Sealed bool
 }
 
 // QuarantineInfo records a store file that was quarantined on open: excluded
@@ -93,6 +98,13 @@ type Store struct {
 	deltas []int64 // all valid delta generations present, ascending
 	gen    int64   // active delta generation
 	writer *Writer // the store's single writer, when one is attached
+
+	// archiveMu serializes read-write maintenance of archive window files:
+	// compaction's appends and the sealer's rewrite must never interleave on
+	// one file — an append landing between a seal's rewrite and its marker
+	// would violate the sealed window's immutability. Ingestion never takes
+	// it, so sealing cannot delay a write; take it before mu, never after.
+	archiveMu sync.Mutex
 
 	windows     []WindowFile
 	consumed    map[windowKey]map[int64]struct{} // per archive window, the delta generations it already holds
@@ -291,16 +303,21 @@ func (s *Store) scanArchives() error {
 			continue
 		}
 		_, err = s.verifyStamp(db, path)
+		var sealed bool
 		if err == nil {
-			// The consumed-generations records drive crash recovery, so a
-			// stamped file that cannot give them up is as unusable as a
-			// mismatching one.
+			// The consumed-generations records drive crash recovery and the
+			// sealed marker drives write refusal, so a stamped file that
+			// cannot give either of them up is as unusable as a mismatching
+			// one.
 			var recorded map[int64]struct{}
 			recorded, err = readConsumed(db)
 			if err == nil {
+				sealed, err = readSealed(db)
+			}
+			if err == nil {
 				s.consumed[windowKey{tier: tier, start: windowStart}] = recorded
 			} else {
-				err = fmt.Errorf("cannot read %s: %v", ConsumedTable, err)
+				err = fmt.Errorf("cannot read metadata: %v", err)
 			}
 		}
 		db.Close()
@@ -308,7 +325,7 @@ func (s *Store) scanArchives() error {
 			s.quarantineFile(path, err.Error())
 			continue
 		}
-		s.windows = append(s.windows, WindowFile{Tier: tier, WindowStart: windowStart, Path: path})
+		s.windows = append(s.windows, WindowFile{Tier: tier, WindowStart: windowStart, Path: path, Sealed: sealed})
 	}
 	sort.Slice(s.windows, func(i, j int) bool { return lessWindow(s.windows[i], s.windows[j]) })
 	return nil
@@ -418,6 +435,10 @@ func createFile(path string, tables []string, st stamp) error {
 	if _, err := tx.Exec(ConsumedTableDDL); err != nil {
 		_ = tx.Rollback()
 		return fmt.Errorf("create %s in %s: %w", ConsumedTable, path, err)
+	}
+	if _, err := tx.Exec(SealedTableDDL); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("create %s in %s: %w", SealedTable, path, err)
 	}
 	var stamped int
 	if err := tx.QueryRow("SELECT count(*) FROM " + VersionTable).Scan(&stamped); err != nil {

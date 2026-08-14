@@ -23,7 +23,8 @@ import (
 //
 //	1: initial layout — tier tables plus the version stamp
 //	2: every store file also carries duck_store_consumed
-const SchemaVersion = 2
+//	3: every store file also carries duck_store_sealed
+const SchemaVersion = 3
 
 // VersionTable is the version-stamp table written into every store file
 // (delta generations and archive windows alike). It carries the three version
@@ -48,6 +49,18 @@ const ConsumedTable = "duck_store_consumed"
 // ConsumedTableDDL creates the consumed-generations table (see ConsumedTable).
 const ConsumedTableDDL = "CREATE TABLE IF NOT EXISTS " + ConsumedTable + " (" +
 	"generation BIGINT NOT NULL)"
+
+// SealedTable is the metadata table archive window files carry: it holds a row
+// once the window is sealed — its runs rewritten into one and its contents
+// frozen. The marker is written in the same DuckDB transaction as the rewrite,
+// so the two can never disagree. The store reads it to refuse every later
+// write to the file and to serve it read-only; retention and operators may
+// still unlink or copy the file, which is the only thing that can happen to it.
+const SealedTable = "duck_store_sealed"
+
+// SealedTableDDL creates the sealed-marker table (see SealedTable).
+const SealedTableDDL = "CREATE TABLE IF NOT EXISTS " + SealedTable + " (" +
+	"sealed BOOLEAN NOT NULL)"
 
 // Tier names, used both as archive file-name prefixes and to map a tier to its
 // table. Delta files hold all three tier tables; an archive window file holds

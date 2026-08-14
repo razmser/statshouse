@@ -121,7 +121,7 @@ type decodedGroup struct {
 
 	count, min, max, maxCount, sum, sumSquare float64
 
-	minHost, maxHost, maxCountHost         hostPairDecoded
+	minHost, maxHost, maxCountHost          hostPairDecoded
 	minHostVal, maxHostVal, maxCountHostVal float64
 
 	pctCount float64
@@ -420,8 +420,8 @@ func TestCompactionRoutesRowsToWindowsByTimestamp(t *testing.T) {
 	// two 1s windows, one each for 1m and 1h (the 3700s span stays inside both)
 	wins := s.Windows()
 	require.Len(t, wins, 4)
-	require.Equal(t, WindowFile{Tier1s, oldWindow, filepath.Join(s.cfg.Dir, archiveSubdir, archiveFileName(Tier1s, oldWindow))}, wins[0])
-	require.Equal(t, WindowFile{Tier1s, nowWindow, filepath.Join(s.cfg.Dir, archiveSubdir, archiveFileName(Tier1s, nowWindow))}, wins[1])
+	require.Equal(t, WindowFile{Tier: Tier1s, WindowStart: oldWindow, Path: filepath.Join(s.cfg.Dir, archiveSubdir, archiveFileName(Tier1s, oldWindow))}, wins[0])
+	require.Equal(t, WindowFile{Tier: Tier1s, WindowStart: nowWindow, Path: filepath.Join(s.cfg.Dir, archiveSubdir, archiveFileName(Tier1s, nowWindow))}, wins[1])
 
 	olderTS := int64(now) - 3700
 	for _, tc := range []struct {

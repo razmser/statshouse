@@ -177,17 +177,18 @@ type collapsedGroup struct {
 // empty host rather than to an arbitrary row's.
 func collapseWindowRows(tx *sql.Tx, tier string, windowStart, windowEnd int64) error {
 	table := tierTables[tier]
-	groups, err := queryCollapsedGroups(tx, table, windowStart, windowEnd)
+	groups, err := queryCollapsedGroups(tx, deltaSrcAlias, table, windowStart, windowEnd)
 	if err != nil {
 		return err
 	}
 	return insertCollapsedGroups(tx, table, groups)
 }
 
-// queryCollapsedGroups runs the collapse over the delta generation attached
-// as deltaSrcAlias and returns its groups with both sketch columns folded.
-func queryCollapsedGroups(tx *sql.Tx, table string, windowStart, windowEnd int64) ([]collapsedGroup, error) {
-	rows, err := tx.Query(collapseQuery(table), windowStart, windowEnd)
+// queryCollapsedGroups runs the collapse over the table qualifier src — the
+// delta generation attached as deltaSrcAlias for compaction, main for sealing
+// — and returns its groups with both sketch columns folded.
+func queryCollapsedGroups(tx *sql.Tx, src, table string, windowStart, windowEnd int64) ([]collapsedGroup, error) {
+	rows, err := tx.Query(collapseQuery(src, table), windowStart, windowEnd)
 	if err != nil {
 		return nil, err
 	}
@@ -292,12 +293,13 @@ func hostStruct(idCol, sCol string) string {
 	return fmt.Sprintf("struct_pack(i := %s, s := %s)", idCol, sCol)
 }
 
-// collapseQuery builds the collapse statement for one tier table: the
-// transliteration of the DDL sketch in .scratch/duck-store/03-schema-ddl.sql.
-// The empty-host FILTER mirrors ClickHouse's empty argMin/argMax states, which
-// lose to any real state on merge; the coalesce keeps an all-empty group at
-// the empty host instead of NULL.
-func collapseQuery(table string) string {
+// collapseQuery builds the collapse statement for one tier table, reading it
+// through the src qualifier: the transliteration of the DDL sketch in
+// .scratch/duck-store/03-schema-ddl.sql. The empty-host FILTER mirrors
+// ClickHouse's empty argMin/argMax states, which lose to any real state on
+// merge; the coalesce keeps an all-empty group at the empty host instead of
+// NULL.
+func collapseQuery(src, table string) string {
 	var cols []string
 	cols = append(cols, "metric, time")
 	for i := 0; i < format.MaxTags; i++ {
@@ -327,7 +329,7 @@ func collapseQuery(table string) string {
 		"list(uniq_state) AS uniq_state_list")
 	return fmt.Sprintf(
 		"SELECT %s FROM %s.%s WHERE time >= $1 AND time < $2 GROUP BY ALL ORDER BY metric, time",
-		strings.Join(cols, ", "), deltaSrcAlias, table)
+		strings.Join(cols, ", "), src, table)
 }
 
 // argFn maps each host column's ordering value to its aggregate: min_host is

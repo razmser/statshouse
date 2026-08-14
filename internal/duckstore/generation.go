@@ -185,8 +185,13 @@ func (s *Store) ConsumeGeneration(ctx context.Context, gen int64, opts ConsumeOp
 
 // consumeWindow lands one archive window's share of the generation: the
 // append and the consumption record in a single transaction on the window
-// file, skipped entirely when an earlier attempt already committed it.
+// file, skipped entirely when an earlier attempt already committed it. The
+// whole window maintenance holds archiveMu, so the append can never interleave
+// with the sealer's rewrite of the same file, and a sealed window — whose
+// contents must never change again — refuses the append instead.
 func (s *Store) consumeWindow(ctx context.Context, gen int64, deltaPath string, k windowKey, opts ConsumeOptions) error {
+	s.archiveMu.Lock()
+	defer s.archiveMu.Unlock()
 	if err := opts.fault(CrashBeforeAppend); err != nil {
 		return err
 	}
@@ -210,6 +215,18 @@ func (s *Store) consumeWindow(ctx context.Context, gen int64, deltaPath string, 
 	}
 	if _, done := recorded[gen]; done {
 		return nil
+	}
+
+	// A sealed window is frozen: its rows were rewritten into one run past the
+	// historic window, so only a sender violating that window could land here.
+	// Refuse loudly rather than corrupt the sealed collapse or drop the rows
+	// silently; the compaction pass surfaces the error and keeps retrying.
+	sealed, err := readSealed(db)
+	if err != nil {
+		return fmt.Errorf("duck-store: read %s of %s: %w", SealedTable, path, err)
+	}
+	if sealed {
+		return fmt.Errorf("duck-store: %s is sealed: generation %d holds rows for a window past the historic window", path, gen)
 	}
 
 	conn, err := db.Conn(ctx)
