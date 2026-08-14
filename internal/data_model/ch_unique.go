@@ -302,7 +302,11 @@ func (ch *ChUnique) Merge(rhs ChUnique) {
 		ch.shrinkIfNeed()
 	}
 	for i := 0; i < rhs.bufSize(); i++ {
-		if rhs.buf[i] != 0 && rhs.good(rhs.buf[i]) {
+		// Screen with the target's filter, not the source's: ch.skipDegree can be
+		// higher than rhs.skipDegree (already, or raised by shrinkIfNeed mid-loop),
+		// and Size() extrapolates itemsCount by 1 << ch.skipDegree, so admitting an
+		// item rhs.good but !ch.good inflates the estimate.
+		if rhs.buf[i] != 0 && ch.good(rhs.buf[i]) {
 			ch.insertImpl(rhs.buf[i])
 			ch.shrinkIfNeed()
 		}
