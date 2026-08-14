@@ -30,6 +30,9 @@ type (
 	VectorStringBytes          = internal.VectorStringBytes
 	VectorTupleDouble2         = internal.VectorTupleDouble2
 	VectorVectorDouble         = internal.VectorVectorDouble
+	VectorVectorLong           = internal.VectorVectorLong
+	VectorVectorString         = internal.VectorVectorString
+	VectorVectorStringBytes    = internal.VectorVectorStringBytes
 )
 
 func BoolReadTL1Boxed(w []byte, v *bool) ([]byte, error) {
