@@ -266,7 +266,7 @@ func TestRetainerRunsAlongsideIngestion(t *testing.T) {
 		if wf.Tier != Tier1s {
 			continue
 		}
-		db, err := openStoreFile(wf.Path, true)
+		db, err := openStoreFile(wf.Path, true, ResourcesConfig{})
 		require.NoError(t, err)
 		require.NoError(t, db.QueryRow(
 			fmt.Sprintf(`SELECT coalesce(sum(count), 0) FROM %s WHERE metric = $1`, TierTable(Tier1s)),

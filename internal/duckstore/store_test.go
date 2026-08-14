@@ -56,11 +56,11 @@ func currentTestStamp(t *testing.T) stamp {
 func createTestFile(t *testing.T, path string, tables []string, st stamp, rows func(db *sql.DB)) {
 	t.Helper()
 	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
-	require.NoError(t, createFile(path, tables, st))
+	require.NoError(t, createFile(path, tables, st, ResourcesConfig{}))
 	if rows == nil {
 		return
 	}
-	db, err := openStoreFile(path, false)
+	db, err := openStoreFile(path, false, ResourcesConfig{})
 	require.NoError(t, err)
 	defer db.Close()
 	rows(db)
@@ -282,7 +282,7 @@ func TestOpenStoreQuarantinesBadArchivesAndKeepsServing(t *testing.T) {
 	require.Contains(t, strings.Join(*logs, "\n"), "quarantined")
 
 	// the good window's data is intact and the delta keeps serving
-	db, err := openStoreFile(good, true)
+	db, err := openStoreFile(good, true, ResourcesConfig{})
 	require.NoError(t, err)
 	var count float64
 	require.NoError(t, db.QueryRow(`SELECT sum(count) FROM s1`).Scan(&count))

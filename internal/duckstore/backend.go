@@ -34,6 +34,61 @@ const (
 // upstream by the sampling budget and there is no required disk-cap flag.
 const DefaultFreeSpaceWatermark uint64 = 0
 
+// Resource bounds for every DuckDB database instance the store opens, so an
+// embedded DuckDB cannot grow into the CPU and RAM the aggregator's own
+// conveyor needs. Defaults target the smallest viable node, not the available
+// envelope: one execution thread, a 256 MB memory limit and a temp directory
+// bounded to the same 256 MB. The memory limit bounds intermediate state only
+// (a measured 100 MB limit still produced a 382 MB result — nothing but the
+// row cap bounds result size), which is why it sits alongside the row limit
+// and the query admission control rather than instead of them.
+const (
+	// DefaultDuckDBThreads is DuckDB's thread count per store file: the spec
+	// fixes one, so compaction, sealing and queries all run single-threaded
+	// and never compete for CPU with ingestion.
+	DefaultDuckDBThreads = 1
+	// DefaultMemoryLimitBytes is DuckDB's memory_limit per store file.
+	DefaultMemoryLimitBytes int64 = 256 << 20
+	// DefaultMaxTempDirBytes is DuckDB's max_temp_directory_size per store
+	// file: the bound that makes "spill to disk instead of OOM" terminate
+	// with an out-of-memory error instead of filling the volume. It defaults
+	// to the memory limit rather than DuckDB's own 90%-of-disk.
+	DefaultMaxTempDirBytes int64 = 256 << 20
+)
+
+// ResourcesConfig carries the DuckDB resource bounds applied when a store file
+// is opened. The zero value means the defaults above.
+type ResourcesConfig struct {
+	// Threads is DuckDB's threads setting per opened store file.
+	Threads int
+	// MemoryLimitBytes is DuckDB's memory_limit per opened store file.
+	MemoryLimitBytes int64
+	// MaxTempDirBytes is DuckDB's max_temp_directory_size per opened store
+	// file. Each file spills into its own temp directory next to itself.
+	MaxTempDirBytes int64
+}
+
+// WithDefaults returns res with unset fields filled from the defaults, so a
+// zero ResourcesConfig behaves like DefaultResources() and a partially set one
+// keeps its explicit values.
+func (res ResourcesConfig) WithDefaults() ResourcesConfig {
+	if res.Threads <= 0 {
+		res.Threads = DefaultDuckDBThreads
+	}
+	if res.MemoryLimitBytes <= 0 {
+		res.MemoryLimitBytes = DefaultMemoryLimitBytes
+	}
+	if res.MaxTempDirBytes <= 0 {
+		res.MaxTempDirBytes = DefaultMaxTempDirBytes
+	}
+	return res
+}
+
+// DefaultResources returns the default DuckDB resource bounds.
+func DefaultResources() ResourcesConfig {
+	return ResourcesConfig{}.WithDefaults()
+}
+
 // StorageBackend selects which storage backend metric data is written to and
 // read from. Parsed from --storage-backend by the aggregator and the API.
 type StorageBackend int8

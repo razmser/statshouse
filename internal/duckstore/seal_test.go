@@ -70,7 +70,7 @@ func TestSealRewritesRunsIntoOnePreservingDecodedContents(t *testing.T) {
 	want := map[string]map[decodedKey]*decodedGroup{}
 	for _, tier := range tiers {
 		wf := findWindow(t, s, tier, testWindowStart(tier, int64(now)-5))
-		db, err := openStoreFile(wf.Path, true)
+		db, err := openStoreFile(wf.Path, true, ResourcesConfig{})
 		require.NoError(t, err)
 		rows := scanTableRows(t, db, tierTables[tier])
 		require.NoError(t, db.Close())
@@ -85,7 +85,7 @@ func TestSealRewritesRunsIntoOnePreservingDecodedContents(t *testing.T) {
 
 	for _, wf := range s.Windows() {
 		require.True(t, wf.Sealed, "%s window %d must be sealed", wf.Tier, wf.WindowStart)
-		db, err := openStoreFile(wf.Path, true)
+		db, err := openStoreFile(wf.Path, true, ResourcesConfig{})
 		require.NoError(t, err)
 		rows := scanTableRows(t, db, tierTables[wf.Tier])
 		// one row per key: the runs were rewritten into one...
@@ -123,7 +123,7 @@ func TestSealedFileRejectsWrites(t *testing.T) {
 
 	// the read-only reopen rejects writes itself
 	wf := findWindow(t, s, Tier1s, testWindowStart(Tier1s, int64(now)-5))
-	db, err := openStoreFile(wf.Path, true)
+	db, err := openStoreFile(wf.Path, true, ResourcesConfig{})
 	require.NoError(t, err)
 	_, err = db.Exec(fmt.Sprintf("INSERT INTO %s (metric, time) VALUES ($1, $2)", TierTable(Tier1s)), int32(1), int64(1))
 	require.Error(t, err, "a read-only open must reject writes")
@@ -144,7 +144,7 @@ func TestSealedFileRejectsWrites(t *testing.T) {
 
 	// the refused append left the window exactly as the seal wrote it: the
 	// fixture's two keys, one row each
-	db, err = openStoreFile(wf.Path, true)
+	db, err = openStoreFile(wf.Path, true, ResourcesConfig{})
 	require.NoError(t, err)
 	defer db.Close()
 	var rows int
@@ -259,7 +259,7 @@ func TestSealerRunsAlongsideIngestion(t *testing.T) {
 		if wf.Tier != Tier1s {
 			continue
 		}
-		db, err := openStoreFile(wf.Path, true)
+		db, err := openStoreFile(wf.Path, true, ResourcesConfig{})
 		require.NoError(t, err)
 		require.NoError(t, db.QueryRow(
 			`SELECT coalesce(sum(count), 0) FROM s1 WHERE metric = $1`, testMetricID2).Scan(&c))
@@ -268,7 +268,7 @@ func TestSealerRunsAlongsideIngestion(t *testing.T) {
 	}
 	require.EqualValues(t, rounds, count, "every acknowledged round must land exactly once")
 
-	db, err := openStoreFile(filepath.Join(s.cfg.Dir, archiveSubdir, archiveFileName(Tier1s, oldWindow)), true)
+	db, err := openStoreFile(filepath.Join(s.cfg.Dir, archiveSubdir, archiveFileName(Tier1s, oldWindow)), true, ResourcesConfig{})
 	require.NoError(t, err)
 	require.NoError(t, db.QueryRow(
 		`SELECT coalesce(sum(count), 0) FROM s1 WHERE metric = $1`, testMetricID).Scan(&c))

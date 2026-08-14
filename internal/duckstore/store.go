@@ -15,6 +15,8 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/duckdb/duckdb-go/v2"
@@ -53,6 +55,11 @@ type StoreConfig struct {
 	// Logf receives quarantine and other operator-facing messages. Defaults
 	// to log.Printf.
 	Logf func(format string, args ...any)
+
+	// Resources are the DuckDB resource bounds applied to every store file
+	// the store opens: single-threaded, a memory limit and a bounded temp
+	// directory. The zero value takes DefaultResources().
+	Resources ResourcesConfig
 }
 
 // WindowFile is one archive window file that passed the version check and is
@@ -123,6 +130,7 @@ func OpenStore(cfg StoreConfig) (*Store, error) {
 	if cfg.Logf == nil {
 		cfg.Logf = log.Printf
 	}
+	cfg.Resources = cfg.Resources.WithDefaults()
 	storageVersion, err := embeddedDuckDBVersion()
 	if err != nil {
 		return nil, fmt.Errorf("duck-store: %w", err)
@@ -246,7 +254,7 @@ func (s *Store) openDeltas() error {
 		// quarantined or consumed file is never reused or shadowed.
 		gen := maxSeen + 1
 		path := filepath.Join(s.cfg.Dir, deltaFileName(gen))
-		if err := createFile(path, allTierTables(), s.currentStamp()); err != nil {
+		if err := createFile(path, allTierTables(), s.currentStamp(), s.cfg.Resources); err != nil {
 			return fmt.Errorf("duck-store: %w", err)
 		}
 		s.deltas = append(s.deltas, gen)
@@ -255,7 +263,7 @@ func (s *Store) openDeltas() error {
 	// Resume the newest valid generation: writes go to it, older ones wait
 	// for consumption to take them.
 	s.gen = s.deltas[len(s.deltas)-1]
-	db, err := openStoreFile(filepath.Join(s.cfg.Dir, deltaFileName(s.gen)), false)
+	db, err := openStoreFile(filepath.Join(s.cfg.Dir, deltaFileName(s.gen)), false, s.cfg.Resources)
 	if err != nil {
 		return fmt.Errorf("duck-store: %w", err)
 	}
@@ -268,7 +276,7 @@ func (s *Store) openDeltas() error {
 // file while the rest keep opening.
 func (s *Store) verifyDeltaGeneration(gen int64) bool {
 	path := filepath.Join(s.cfg.Dir, deltaFileName(gen))
-	db, err := openStoreFile(path, false)
+	db, err := openStoreFile(path, false, s.cfg.Resources)
 	if err != nil {
 		s.quarantineFile(path, fmt.Sprintf("cannot open: %v", err))
 		return false
@@ -298,7 +306,7 @@ func (s *Store) scanArchives() error {
 			continue
 		}
 		path := filepath.Join(s.cfg.Dir, archiveSubdir, e.Name())
-		db, err := openStoreFile(path, true)
+		db, err := openStoreFile(path, true, s.cfg.Resources)
 		if err != nil {
 			s.quarantineFile(path, fmt.Sprintf("cannot open: %v", err))
 			continue
@@ -392,14 +400,32 @@ func (s *Store) quarantineFile(path, reason string) {
 	s.quarantined = append(s.quarantined, QuarantineInfo{Path: path, Reason: reason})
 }
 
-// openStoreFile opens a store file; readOnly picks the access mode. Any open
-// failure (a corrupt or foreign file, a newer DuckDB storage format, ...)
-// is returned to the caller, which quarantines the file.
-func openStoreFile(path string, readOnly bool) (*sql.DB, error) {
-	dsn := path
+// dsnBytes renders a byte count as a DuckDB size option value. The DSN parser
+// rejects bare byte integers for the size options ("could not set invalid or
+// local option"); an explicit B suffix is exact for any byte count and is what
+// current_setting reports back in MiB.
+func dsnBytes(n int64) string {
+	return strconv.FormatInt(n, 10) + "B"
+}
+
+// openStoreFile opens a store file; readOnly picks the access mode, res the
+// DuckDB resource bounds for the file's database instance (a zero res takes
+// the defaults). Any open failure (a corrupt or foreign file, a newer DuckDB
+// storage format, ...) is returned to the caller, which quarantines the file.
+// The bounds ride as DSN options rather than SET statements, so they hold from
+// the first connection and every caller opening the same path agrees on them
+// (the driver shares one database instance per file).
+func openStoreFile(path string, readOnly bool, res ResourcesConfig) (*sql.DB, error) {
+	res = res.WithDefaults()
+	var opts []string
 	if readOnly {
-		dsn += "?access_mode=READ_ONLY"
+		opts = append(opts, "access_mode=READ_ONLY")
 	}
+	opts = append(opts,
+		"threads="+strconv.Itoa(res.Threads),
+		"memory_limit="+dsnBytes(res.MemoryLimitBytes),
+		"max_temp_directory_size="+dsnBytes(res.MaxTempDirBytes))
+	dsn := path + "?" + strings.Join(opts, "&")
 	c, err := duckdb.NewConnector(dsn, nil)
 	if err != nil {
 		return nil, err
@@ -413,8 +439,8 @@ func openStoreFile(path string, readOnly bool) (*sql.DB, error) {
 // and the same metadata. The database is closed again; callers open it through
 // their own handle. A file already stamped by this binary is left as it was,
 // so re-running against a leftover is harmless.
-func createFile(path string, tables []string, st stamp) error {
-	db, err := openStoreFile(path, false)
+func createFile(path string, tables []string, st stamp, res ResourcesConfig) error {
+	db, err := openStoreFile(path, false, res)
 	if err != nil {
 		return err
 	}

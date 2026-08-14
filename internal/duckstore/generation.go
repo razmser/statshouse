@@ -113,10 +113,10 @@ func (s *Store) RollGeneration() error {
 	path := filepath.Join(s.cfg.Dir, deltaFileName(next))
 	// A file left by a failed earlier roll is complete (createFile is
 	// all-or-nothing) and stamped by this binary, so it is reused as-is.
-	if err := createFile(path, allTierTables(), s.currentStamp()); err != nil {
+	if err := createFile(path, allTierTables(), s.currentStamp(), s.cfg.Resources); err != nil {
 		return fmt.Errorf("duck-store: roll: %w", err)
 	}
-	db, err := openStoreFile(path, false)
+	db, err := openStoreFile(path, false, s.cfg.Resources)
 	if err != nil {
 		return fmt.Errorf("duck-store: roll: %w", err)
 	}
@@ -162,7 +162,7 @@ func (s *Store) ConsumeGeneration(ctx context.Context, gen int64, opts ConsumeOp
 		return fmt.Errorf("duck-store: generation %d is the active delta or newer; roll before consuming", gen)
 	}
 	deltaPath := filepath.Join(s.cfg.Dir, deltaFileName(gen))
-	windows, err := generationWindows(deltaPath)
+	windows, err := generationWindows(deltaPath, s.cfg.Resources)
 	if err != nil {
 		return fmt.Errorf("duck-store: consume generation %d: %w", gen, err)
 	}
@@ -197,11 +197,11 @@ func (s *Store) consumeWindow(ctx context.Context, gen int64, deltaPath string, 
 	}
 	path := filepath.Join(s.cfg.Dir, archiveSubdir, archiveFileName(k.tier, k.start))
 	if _, err := os.Stat(path); os.IsNotExist(err) {
-		if err := createFile(path, []string{tierTables[k.tier]}, s.currentStamp()); err != nil {
+		if err := createFile(path, []string{tierTables[k.tier]}, s.currentStamp(), s.cfg.Resources); err != nil {
 			return fmt.Errorf("duck-store: consume generation %d: %w", gen, err)
 		}
 	}
-	db, err := openStoreFile(path, false)
+	db, err := openStoreFile(path, false, s.cfg.Resources)
 	if err != nil {
 		return fmt.Errorf("duck-store: consume generation %d into %s: %w", gen, path, err)
 	}
@@ -293,8 +293,8 @@ func copyWindowRows(tx *sql.Tx, tier string, windowStart, windowEnd int64) error
 // function of the generation's immutable contents, so a crashed consumption
 // and its resume always agree on it. A generation with no rows plans no
 // windows and is consumed by the unlink alone.
-func generationWindows(deltaPath string) (map[windowKey]struct{}, error) {
-	db, err := openStoreFile(deltaPath, true)
+func generationWindows(deltaPath string, res ResourcesConfig) (map[windowKey]struct{}, error) {
+	db, err := openStoreFile(deltaPath, true, res)
 	if err != nil {
 		return nil, err
 	}
@@ -350,7 +350,7 @@ func (s *Store) generationRecorded(db *sql.DB, gen int64) (bool, error) {
 // planned stays: consumption resumes on it rather than risk dropping rows.
 func (s *Store) unlinkDeltaIfConsumed(gen int64) bool {
 	path := filepath.Join(s.cfg.Dir, deltaFileName(gen))
-	db, err := openStoreFile(path, true)
+	db, err := openStoreFile(path, true, s.cfg.Resources)
 	if err != nil {
 		s.cfg.Logf("[error] duck-store: cannot reopen %s to check its consumption: %v", path, err)
 		return false

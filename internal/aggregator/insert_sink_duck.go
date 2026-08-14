@@ -20,11 +20,16 @@ import (
 )
 
 // openDuckStore opens the shard's duck-store and starts its single writer and
-// its retainer, producing the handle the insert threads take their sinks from.
+// its retainer, producing the handle the insert threads take their sinks from
+// and the query listener takes its executor from. The DuckDB resource bounds
+// from the config ride into every store file the store opens.
 func openDuckStore(config ConfigAggregator) (duckStoreHandle, error) {
 	s, err := duckstore.OpenStore(duckstore.StoreConfig{
 		Dir:  config.DuckStoreDir,
 		Logf: log.Printf,
+		Resources: duckstore.ResourcesConfig{
+			MemoryLimitBytes: config.DuckMemoryLimit,
+		},
 	})
 	if err != nil {
 		return nil, err
@@ -60,6 +65,12 @@ type duckStore struct {
 }
 
 func (d *duckStore) NewSink() InsertSink { return newDuckSink(d.writer) }
+
+// QueryExecutor serves the two structured store-query verbs. The series and
+// tag-values renderers arrive with the next tasks; until then the stub
+// answers internal, keeping the listener's admission and cancellation
+// behaviour exercisable end-to-end.
+func (d *duckStore) QueryExecutor() storeQueryExecutor { return stubStoreQueryExecutor{} }
 
 // Close stops the retainer and the writer before releasing the store, so the
 // appenders' dedicated connection is never closed underneath a live writer.

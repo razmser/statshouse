@@ -320,7 +320,7 @@ func TestCompactionCollapseMatchesUncollapsedRead(t *testing.T) {
 	require.Len(t, wins, 3, "one window per tier")
 	for _, tier := range tiers {
 		path := filepath.Join(s.cfg.Dir, archiveSubdir, archiveFileName(tier, testWindowStart(tier, ts)))
-		db, err := openStoreFile(path, true)
+		db, err := openStoreFile(path, true, ResourcesConfig{})
 		require.NoError(t, err)
 		rows := scanTableRows(t, db, tierTables[tier])
 		require.Len(t, rows, 2, "%s: one row per key after the collapse", tier)
@@ -373,7 +373,7 @@ func TestCompactionHostTieKeepsHalvesTogether(t *testing.T) {
 	require.NoError(t, NewCompactor(s, CompactorConfig{}).CompactOnce(context.Background()))
 
 	path := filepath.Join(s.cfg.Dir, archiveSubdir, archiveFileName(Tier1s, testWindowStart(Tier1s, int64(now))))
-	db, err := openStoreFile(path, true)
+	db, err := openStoreFile(path, true, ResourcesConfig{})
 	require.NoError(t, err)
 	defer db.Close()
 	host := func(metric int32) hostPairDecoded {
@@ -437,7 +437,7 @@ func TestCompactionRoutesRowsToWindowsByTimestamp(t *testing.T) {
 		{Tier1h, testWindowStart(Tier1h, olderTS), testMetricID2, olderTS / 3600 * 3600},
 		{Tier1h, testWindowStart(Tier1h, olderTS), testMetricID, int64(now) / 3600 * 3600},
 	} {
-		db, err := openStoreFile(filepath.Join(s.cfg.Dir, archiveSubdir, archiveFileName(tc.tier, tc.window)), true)
+		db, err := openStoreFile(filepath.Join(s.cfg.Dir, archiveSubdir, archiveFileName(tc.tier, tc.window)), true, ResourcesConfig{})
 		require.NoError(t, err)
 		var n int
 		require.NoError(t, db.QueryRow(
@@ -475,7 +475,7 @@ func TestCompactionWritesSortedArchive(t *testing.T) {
 
 	wins := s.Windows()
 	require.Len(t, wins, 3)
-	db, err := openStoreFile(wins[2].Path, true) // the 1h window, largest truncation
+	db, err := openStoreFile(wins[2].Path, true, ResourcesConfig{}) // the 1h window, largest truncation
 	require.NoError(t, err)
 	defer db.Close()
 	rr, err := db.Query(`SELECT metric, time FROM s1h`) // no ORDER BY: physical order
@@ -554,7 +554,7 @@ func TestCompactorRunsAlongsideIngestion(t *testing.T) {
 		if wf.Tier != Tier1s {
 			continue
 		}
-		db, err := openStoreFile(wf.Path, true)
+		db, err := openStoreFile(wf.Path, true, ResourcesConfig{})
 		require.NoError(t, err)
 		require.NoError(t, db.QueryRow(
 			`SELECT coalesce(sum(count), 0), coalesce(sum(sum), 0) FROM s1 WHERE metric = $1`,

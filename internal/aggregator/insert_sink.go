@@ -68,12 +68,13 @@ type InsertSink interface {
 }
 
 // duckStoreHandle is the aggregator's lifecycle handle on its duck-store: it
-// owns the single writer goroutine all insert threads share and produces their
-// sinks. The concrete type exists only in duckdb-tagged builds; without the
-// tag the duck backend is rejected during config validation and the handle
-// stays nil.
+// owns the single writer goroutine all insert threads share, produces their
+// sinks and serves store queries. The concrete type exists only in
+// duckdb-tagged builds; without the tag the duck backend is rejected during
+// config validation and the handle stays nil.
 type duckStoreHandle interface {
 	NewSink() InsertSink
+	QueryExecutor() storeQueryExecutor
 	Close() error
 }
 

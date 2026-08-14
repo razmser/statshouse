@@ -161,7 +161,7 @@ func (s *Store) SealWindow(ctx context.Context, tier string, windowStart int64) 
 	s.archiveMu.Lock()
 	defer s.archiveMu.Unlock()
 
-	db, err := openStoreFile(path, false)
+	db, err := openStoreFile(path, false, s.cfg.Resources)
 	if err != nil {
 		return fmt.Errorf("duck-store: seal %s: %w", path, err)
 	}
@@ -198,7 +198,7 @@ func (s *Store) SealWindow(ctx context.Context, tier string, windowStart int64) 
 
 	// Reopen read-only and take the marker from the file itself: the mode the
 	// store serves the window in from now on, proven by the open.
-	ro, err := openStoreFile(path, true)
+	ro, err := openStoreFile(path, true, s.cfg.Resources)
 	if err != nil {
 		return fmt.Errorf("duck-store: reopen %s read-only after sealing: %w", path, err)
 	}

@@ -116,6 +116,12 @@ type (
 		// threads (see duckStoreHandle). ClickHouse remains the default.
 		duckStore duckStoreHandle
 
+		// queryServer is the store-query listener, non-nil when the duck
+		// backend is selected and a query address is configured: the second
+		// RPC endpoint, bounded and admission-controlled, that the API reads
+		// the shard through.
+		queryServer *storeQueryServer
+
 		// Remote config
 		configR     ConfigAggregatorRemote
 		configS     string
@@ -396,6 +402,17 @@ func MakeAggregator(fj *os.File, fjCompact *os.File, mappingsCache *pcache.Mappi
 			return nil, fmt.Errorf("failed to open duck-store in %q: %v", a.config.DuckStoreDir, err)
 		}
 		a.duckStore = duck
+		// Query traffic gets its own listener with its own, bounded settings —
+		// the ingest listener's unlimited workers and absent timeouts are for
+		// trusted contributors, not for the API's queries.
+		if a.config.DuckQueryAddr != "" {
+			a.queryServer = newStoreQueryServer(storeQueryServerConfig{
+				Address:     a.config.DuckQueryAddr,
+				Concurrency: a.config.DuckQueryConcurrency,
+				CryptoKeys:  []string{aesPwd},
+				Logf:        log.Printf,
+			}, duck.QueryExecutor())
+		}
 	}
 
 	a.insertsSemaSize = int64(a.config.RecentInserters)
@@ -415,6 +432,12 @@ func MakeAggregator(fj *os.File, fjCompact *os.File, mappingsCache *pcache.Mappi
 	go func() { // before sh2.Run because agent will also connect to local aggregator
 		_ = a.server.ListenAndServe("tcp4", listenAddr)
 	}()
+
+	if a.queryServer != nil {
+		go func() {
+			_ = a.queryServer.ListenAndServe()
+		}()
+	}
 
 	sh2.Run(a.aggregatorHostTag.I, a.shardKey, a.replicaKey)
 
@@ -482,6 +505,9 @@ func (a *Aggregator) WaitInsertsFinish(timeout time.Duration) {
 
 func (a *Aggregator) ShutdownRPCServer() {
 	a.server.Shutdown()
+	if a.queryServer != nil {
+		a.queryServer.Shutdown()
+	}
 }
 
 func (a *Aggregator) WaitRPCServer(timeout time.Duration) {
@@ -489,6 +515,11 @@ func (a *Aggregator) WaitRPCServer(timeout time.Duration) {
 	defer cancel()
 	if err := a.server.CloseWait(ctx); err != nil {
 		log.Printf("WaitRPCServer timeout after %v: %v", timeout, err)
+	}
+	if a.queryServer != nil {
+		if err := a.queryServer.CloseWait(ctx); err != nil {
+			log.Printf("query server CloseWait timeout after %v: %v", timeout, err)
+		}
 	}
 }
 

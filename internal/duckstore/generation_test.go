@@ -42,7 +42,7 @@ func TestRollGenerationSwitchesWriterAndNeverWritesTheOldFile(t *testing.T) {
 
 	// the new rows are in the rolled-to generation and nowhere else
 	require.Equal(t, 1, tierCount(t, s, Tier1s, testMetricID2))
-	gen0, err := openStoreFile(filepath.Join(s.cfg.Dir, deltaFileName(0)), true)
+	gen0, err := openStoreFile(filepath.Join(s.cfg.Dir, deltaFileName(0)), true, ResourcesConfig{})
 	require.NoError(t, err)
 	defer gen0.Close()
 	var oldNew, oldKept int
@@ -101,7 +101,7 @@ func TestRollGenerationDuringConcurrentRounds(t *testing.T) {
 		db := s.Delta()
 		if gen != s.ActiveDeltaGeneration() {
 			var err error
-			db, err = openStoreFile(filepath.Join(s.cfg.Dir, deltaFileName(gen)), true)
+			db, err = openStoreFile(filepath.Join(s.cfg.Dir, deltaFileName(gen)), true, ResourcesConfig{})
 			require.NoError(t, err)
 		}
 		var c float64
@@ -208,7 +208,7 @@ func readerTotals(t *testing.T, s *Store) map[string]consumeTotals {
 		add(s.Delta(), tierTables[tier])
 	}
 	for _, wf := range s.Windows() {
-		db, err := openStoreFile(wf.Path, true)
+		db, err := openStoreFile(wf.Path, true, ResourcesConfig{})
 		require.NoError(t, err)
 		add(db, tierTables[wf.Tier])
 		require.NoError(t, db.Close())
@@ -295,7 +295,7 @@ func TestConsumeCrashPointsKeepValuesExactlyOnce(t *testing.T) {
 				require.EqualValues(t, current1sWindow, wins[1].WindowStart)
 
 				aborted := filepath.Join(dir, archiveSubdir, archiveFileName(Tier1s, current1sWindow))
-				db, err := openStoreFile(aborted, true)
+				db, err := openStoreFile(aborted, true, ResourcesConfig{})
 				require.NoError(t, err)
 				var rows int
 				require.NoError(t, db.QueryRow(`SELECT count(*) FROM s1`).Scan(&rows))

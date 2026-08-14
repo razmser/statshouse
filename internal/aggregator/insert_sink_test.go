@@ -444,8 +444,9 @@ func TestRowBinarySizeMatchesEncoding(t *testing.T) {
 // fakeDuckHandle drives the sink selection without any DuckDB.
 type fakeDuckHandle struct{ sink InsertSink }
 
-func (f *fakeDuckHandle) NewSink() InsertSink { return f.sink }
-func (f *fakeDuckHandle) Close() error        { return nil }
+func (f *fakeDuckHandle) NewSink() InsertSink               { return f.sink }
+func (f *fakeDuckHandle) QueryExecutor() storeQueryExecutor { return stubStoreQueryExecutor{} }
+func (f *fakeDuckHandle) Close() error                      { return nil }
 
 // TestNewInsertSinkSelectsBackend pins the wiring of goInsert's sink: the duck
 // handle when the duck backend opened one, the ClickHouse inserter otherwise.

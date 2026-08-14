@@ -20,14 +20,70 @@ func TestValidateConfigAggregatorStorageBackend(t *testing.T) {
 	require.Equal(t, duckstore.BackendClickHouse, c.StorageBackend, "clickhouse must be the default backend")
 	require.NoError(t, ValidateConfigAggregator(&c))
 
+	// The query listener's defaults: two admission slots and the smallest
+	// viable DuckDB memory limit.
+	require.Equal(t, DefaultQueryConcurrency, c.DuckQueryConcurrency)
+	require.Equal(t, int64(duckstore.DefaultMemoryLimitBytes), c.DuckMemoryLimit)
+
 	if duckstore.Available {
-		t.Skip("built with the duckdb tag; duck is a valid backend there")
+		// A duck shard without a query address is a misconfiguration: the
+		// shard would be a write-only sink no API can read.
+		c.StorageBackend = duckstore.BackendDuck
+		err := ValidateConfigAggregator(&c)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "--duck-query-addr")
+
+		c.DuckQueryAddr = "127.0.0.1:9900"
+		require.NoError(t, ValidateConfigAggregator(&c))
+		return
 	}
 	c.StorageBackend = duckstore.BackendDuck
 	err := ValidateConfigAggregator(&c)
 	require.Error(t, err, "an untagged binary must refuse to start with the duck backend")
 	require.Contains(t, err.Error(), "--storage-backend=duck")
 	require.Contains(t, err.Error(), duckstore.BuildTag)
+}
+
+func TestValidateConfigAggregatorDuckQuery(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		set  func(*ConfigAggregator)
+		flag string
+	}{
+		{
+			name: "zero query concurrency",
+			set:  func(c *ConfigAggregator) { c.DuckQueryConcurrency = 0 },
+			flag: "--duck-query-concurrency",
+		},
+		{
+			name: "negative query concurrency",
+			set:  func(c *ConfigAggregator) { c.DuckQueryConcurrency = -3 },
+			flag: "--duck-query-concurrency",
+		},
+		{
+			name: "zero memory limit",
+			set:  func(c *ConfigAggregator) { c.DuckMemoryLimit = 0 },
+			flag: "--duck-memory-limit",
+		},
+		{
+			name: "negative memory limit",
+			set:  func(c *ConfigAggregator) { c.DuckMemoryLimit = -1 },
+			flag: "--duck-memory-limit",
+		},
+		{
+			name: "query address without the duck backend",
+			set:  func(c *ConfigAggregator) { c.DuckQueryAddr = "127.0.0.1:9900" },
+			flag: "--duck-query-addr",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			c := DefaultConfigAggregator()
+			tt.set(&c)
+			err := ValidateConfigAggregator(&c)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tt.flag, "the error must name the offending flag")
+		})
+	}
 }
 
 func TestValidateConfigAggregatorDuckRetention(t *testing.T) {

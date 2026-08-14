@@ -85,6 +85,23 @@ type ConfigAggregator struct {
 	// disk. Zero disables the check.
 	DuckFreeSpaceWatermark int64
 
+	// DuckQueryAddr is the address the store-query listener serves on when
+	// StorageBackend is duck: its own RPC endpoint, separate from the ingest
+	// listener, with bounded workers and admission control. Empty means no
+	// query endpoint.
+	DuckQueryAddr string
+
+	// DuckQueryConcurrency is how many store queries may execute at once per
+	// shard; the next concurrent query is refused as overloaded rather than
+	// queued, so a burst of heavy queries cannot eat the machine ingestion
+	// needs.
+	DuckQueryConcurrency int
+
+	// DuckMemoryLimit is DuckDB's memory_limit per store file, in bytes,
+	// bounding the intermediate state of every query, compaction pass and
+	// seal the shard runs. The default targets the smallest viable node.
+	DuckMemoryLimit int64
+
 	KHAddr         string
 	KHUser         string
 	KHPassword     string
@@ -128,6 +145,8 @@ func DefaultConfigAggregator() ConfigAggregator {
 		DuckRetention1m:        duckstore.DefaultRetention1m,
 		DuckRetention1h:        duckstore.DefaultRetention1h,
 		DuckFreeSpaceWatermark: int64(duckstore.DefaultFreeSpaceWatermark),
+		DuckQueryConcurrency:   DefaultQueryConcurrency,
+		DuckMemoryLimit:        duckstore.DefaultMemoryLimitBytes,
 
 		RemoteInitial: ConfigAggregatorRemote{
 			ShortWindow:               data_model.MaxShortWindow,
@@ -261,6 +280,23 @@ func ValidateConfigAggregator(c *ConfigAggregator) error {
 	}
 	if c.DuckFreeSpaceWatermark < 0 {
 		return fmt.Errorf("--duck-free-space-watermark (%d) must be >= 0 (0 disables early eviction)", c.DuckFreeSpaceWatermark)
+	}
+	if c.DuckQueryConcurrency < 1 {
+		return fmt.Errorf("--duck-query-concurrency (%d) must be >= 1", c.DuckQueryConcurrency)
+	}
+	if c.DuckMemoryLimit <= 0 {
+		return fmt.Errorf("--duck-memory-limit (%d) must be > 0", c.DuckMemoryLimit)
+	}
+	if c.StorageBackend == duckstore.BackendDuck {
+		// The store directory is what the store itself needs; the query
+		// address is what makes the shard readable as a storage backend
+		// rather than a write-only sink, so a duck shard without one is a
+		// misconfiguration rather than a supported mode.
+		if c.DuckQueryAddr == "" {
+			return fmt.Errorf("--duck-query-addr must be set when --storage-backend=duck: the shard serves store queries on its own address")
+		}
+	} else if c.DuckQueryAddr != "" {
+		return fmt.Errorf("--duck-query-addr (%s) is set but --storage-backend is not duck", c.DuckQueryAddr)
 	}
 	if c.InsertHistoricWhen < 1 {
 		return fmt.Errorf("--insert-historic-when (%d) must be >= 1", c.InsertHistoricWhen)
