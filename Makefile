@@ -22,6 +22,7 @@ COMMON_LDFLAGS = $(COMMON_BUILD_VARS) -extldflags '-O2'
 
 .PHONY: all build-go build-ui \
 	build-sh build-sh-api build-sh-api-noembed build-sh-metadata build-sh-grafana build-sh-balancer \
+	build-agg-duckdb \
 	build-sh-ui build-grafana-ui
 
 all: build-ui build-go # order important
@@ -50,6 +51,28 @@ build-igp:
 
 build-agg:
 	go build -ldflags "$(COMMON_LDFLAGS)" -buildvcs=false -o target/statshouse-agg ./cmd/statshouse-agg
+
+# Aggregator with the DuckDB storage backend embedded (the "duckdb" build tag).
+# Not part of build-go: the default build stays pure Go.
+#
+# On linux the DuckDB binary must be fully static, and a naive -static link
+# segfaults on first connector creation: under glibc < 2.34 libstdc++ probes
+# weak pthread symbols at startup, and only the pthread archive members that
+# resolved some reference get linked in, so DuckDB's task scheduler ends up
+# with no-op mutexes. Whole-archiving libpthread.a fixes it; the duplicate
+# members that Go's own -lpthread already pulled in are byte-identical, so
+# --allow-multiple-definition is safe here. Verified recipe, see
+# .scratch/duck-store/02-cgo-build-research.md. On darwin the platform
+# toolchain links as usual and none of this applies.
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Linux)
+DUCKDB_EXTLDFLAGS := -static -Wl,--allow-multiple-definition -Wl,--whole-archive $(shell $(CC) -print-file-name=libpthread.a) -Wl,--no-whole-archive
+else
+DUCKDB_EXTLDFLAGS := -O2
+endif
+
+build-agg-duckdb:
+	go build -tags duckdb -ldflags "$(COMMON_BUILD_VARS) -extldflags '$(DUCKDB_EXTLDFLAGS)'" -buildvcs=false -o target/statshouse-agg-duckdb ./cmd/statshouse-agg
 
 build-sh-grafana:
 	go build -ldflags "$(COMMON_LDFLAGS)" -buildvcs=false -o target/statshouse-grafana-plugin ./cmd/statshouse-grafana-plugin

@@ -19,6 +19,7 @@ import (
 	"github.com/VKCOM/statshouse/internal/agent"
 	"github.com/VKCOM/statshouse/internal/data_model"
 	"github.com/VKCOM/statshouse/internal/data_model/gen2/tlstatshouse"
+	"github.com/VKCOM/statshouse/internal/duckstore"
 )
 
 // ConfigChangeNotifier notify getConfigResult3Locked if ConfigAggregatorRemote.ClusterShardsAddrs was updated
@@ -58,6 +59,12 @@ type ConfigAggregator struct {
 	RecentInserters    int
 	HistoricInserters  int
 	InsertHistoricWhen int
+
+	// StorageBackend selects where the aggregator stores metric data. The
+	// default (clickhouse) is behaviourally identical to the pre-seam
+	// aggregator. Selecting duck requires a binary built with the "duckdb"
+	// build tag; validation rejects it otherwise.
+	StorageBackend duckstore.StorageBackend
 
 	KHAddr         string
 	KHUser         string
@@ -216,6 +223,9 @@ func (c *ConfigAggregatorRemote) Bind(f *flag.FlagSet, d ConfigAggregatorRemote,
 }
 
 func ValidateConfigAggregator(c *ConfigAggregator) error {
+	if err := c.StorageBackend.Validate(); err != nil {
+		return err
+	}
 	if c.InsertHistoricWhen < 1 {
 		return fmt.Errorf("--insert-historic-when (%d) must be >= 1", c.InsertHistoricWhen)
 	}

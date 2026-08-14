@@ -287,6 +287,7 @@ func parseCommandLine() error {
 	flag.StringVar(&argv.MetadataAddr, "metadata-addr", aggregator.DefaultConfigAggregator().MetadataAddr, "")
 	flag.StringVar(&argv.MetadataNet, "metadata-net", aggregator.DefaultConfigAggregator().MetadataNet, "")
 	flag.StringVar(&argv.KHAddr, "kh", "127.0.0.1:13338,127.0.0.1:13339", "clickhouse HTTP address:port")
+	flag.Var(&argv.StorageBackend, "storage-backend", "storage backend for metric data: \"clickhouse\" (default) or \"duck\" (DuckDB embedded in the aggregator; requires a binary built with the duckdb build tag)")
 	flag.StringVar(&argv.KHUser, "kh-user", "", "clickhouse user")
 	flag.StringVar(&argv.KHPasswordFile, "kh-password-file", "", "file with clickhouse password")
 	flag.StringVar(&argv.pprofListenAddr, "pprof", "", "HTTP pprof listen address")

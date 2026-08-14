@@ -12,6 +12,7 @@ import (
 
 	"github.com/VKCOM/statshouse/internal/chutil"
 	"github.com/VKCOM/statshouse/internal/config"
+	"github.com/VKCOM/statshouse/internal/duckstore"
 	"github.com/VKCOM/statshouse/internal/format"
 )
 
@@ -41,6 +42,13 @@ type Config struct {
 	HardwareSlowMetricResolution int
 	Announcement                 string // if !empty, show to user in UI
 	RQLiteAddrs                  string // comma-separated list
+
+	// StorageBackend selects where the API reads metric data from. The API
+	// never embeds DuckDB itself (it queries the aggregator shards over the
+	// structured query RPC), so duck is a valid choice for any API binary
+	// and is deliberately not gated on duckstore.Available.
+	StorageBackend duckstore.StorageBackend
+
 	chutil.RateLimitConfig
 }
 
@@ -135,6 +143,7 @@ func (argv *Config) Bind(f *flag.FlagSet, defaultI config.Config) {
 	f.StringVar(&argv.ReplicaThrottleCfgStr, "replica-throttle-config", "", "JSON config for replica throttling testing (feature flag)")
 	f.IntVar(&argv.HardwareMetricResolution, "hardware-metric-resolution", default_.HardwareMetricResolution, "Statshouse hardware metric resolution")
 	f.IntVar(&argv.HardwareSlowMetricResolution, "hardware-slow-metric-resolution", default_.HardwareSlowMetricResolution, "Statshouse slow hardware metric resolution")
+	f.Var(&argv.StorageBackend, "storage-backend", "storage backend to query: \"clickhouse\" (default) or \"duck\" (aggregator shards over the structured query RPC)")
 
 	f.BoolVar(&argv.RateLimitDisable, "rate-limit-disable", default_.RateLimitDisable, "disable rate limiting")
 	f.DurationVar(&argv.WindowDuration, "rate-limit-window-duration", default_.WindowDuration, "time window for analyzing ClickHouse requests")
