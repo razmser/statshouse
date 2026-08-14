@@ -18,7 +18,12 @@ import (
 // stamped with the version that wrote it; a file whose stamp does not match
 // the running binary is quarantined, never upgraded in place and never read
 // through a compatibility shim.
-const SchemaVersion = 1
+//
+// History:
+//
+//	1: initial layout — tier tables plus the version stamp
+//	2: every store file also carries duck_store_consumed
+const SchemaVersion = 2
 
 // VersionTable is the version-stamp table written into every store file
 // (delta generations and archive windows alike). It carries the three version
@@ -31,6 +36,18 @@ const VersionTableDDL = "CREATE TABLE IF NOT EXISTS " + VersionTable + " (" +
 	"schema_version INTEGER NOT NULL, " +
 	"storage_version VARCHAR NOT NULL, " +
 	"statshouse_version VARCHAR NOT NULL)"
+
+// ConsumedTable is the metadata table every store file carries, read from
+// archive window files: one row per delta generation whose rows the window
+// already holds. Compaction writes the record in the same DuckDB transaction
+// as the append, so a crash between the two can leave neither rows without
+// the record nor the record without the rows — and a resumed consumption
+// skips a recorded window instead of appending to it twice.
+const ConsumedTable = "duck_store_consumed"
+
+// ConsumedTableDDL creates the consumed-generations table (see ConsumedTable).
+const ConsumedTableDDL = "CREATE TABLE IF NOT EXISTS " + ConsumedTable + " (" +
+	"generation BIGINT NOT NULL)"
 
 // Tier names, used both as archive file-name prefixes and to map a tier to its
 // table. Delta files hold all three tier tables; an archive window file holds
@@ -54,6 +71,16 @@ var tierSeconds = map[string]int64{
 	Tier1s: 1,
 	Tier1m: 60,
 	Tier1h: 3600,
+}
+
+// tierWindowSecs is each tier's archive window length: the file boundary
+// consumption routes rows by, retention unlinks whole files at, and sealing
+// rewrites one of. The 1s tier's hour is the tickets' provisional starting
+// point; the numbers are revisited when compaction is wired up.
+var tierWindowSecs = map[string]int64{
+	Tier1s: 3600,
+	Tier1m: 86400,
+	Tier1h: 30 * 86400,
 }
 
 // Tiers returns the tier names in canonical order.

@@ -75,11 +75,13 @@ type WriterConfig struct {
 	FlushFault func(round int64) error
 }
 
-// writeRequest is one round submitted to the writer goroutine. resp is
-// buffered so the writer never blocks on a caller that went away.
+// writeRequest is one round submitted to the writer goroutine — or, with
+// roll set, a switch to a new delta generation's pool instead of a round.
+// resp is buffered so the writer never blocks on a caller that went away.
 type writeRequest struct {
 	ctx  context.Context
 	rows []Row
+	roll *sql.DB
 	resp chan error
 }
 
@@ -100,6 +102,10 @@ var errWriterClosed = errors.New("duck-store: writer is closed")
 type Writer struct {
 	cfg WriterConfig
 
+	// store is the store this writer belongs to; it unregisters itself on
+	// Close so rolls stop coordinating with a dead writer.
+	store *Store
+
 	// conn is one connection checked out of the active delta generation's
 	// pool for the appenders' exclusive use; queries through the pool's
 	// other connections are unaffected.
@@ -117,8 +123,9 @@ type Writer struct {
 }
 
 // NewWriter starts the single writer goroutine over s's active delta
-// generation. The store stays responsible for its lifetime; Close the writer
-// before closing the store.
+// generation and attaches it to the store as its writer, so RollGeneration
+// can move it along. The store stays responsible for its lifetime; Close the
+// writer before closing the store.
 func NewWriter(s *Store, cfg WriterConfig) (*Writer, error) {
 	if cfg.NowFunc == nil {
 		cfg.NowFunc = time.Now
@@ -131,6 +138,7 @@ func NewWriter(s *Store, cfg WriterConfig) (*Writer, error) {
 	}
 	w := &Writer{
 		cfg:       cfg,
+		store:     s,
 		conn:      conn,
 		appenders: make(map[string]*duckdb.Appender, len(tiers)),
 		reqs:      make(chan writeRequest),
@@ -142,6 +150,15 @@ func NewWriter(s *Store, cfg WriterConfig) (*Writer, error) {
 		_ = conn.Close()
 		return nil, err
 	}
+	s.mu.Lock()
+	if s.writer != nil {
+		s.mu.Unlock()
+		_ = conn.Close()
+		w.closeAppenders()
+		return nil, fmt.Errorf("duck-store: store already has a writer")
+	}
+	s.writer = w
+	s.mu.Unlock()
 	go w.run()
 	return w, nil
 }
@@ -171,12 +188,34 @@ func (w *Writer) WriteRound(ctx context.Context, rows []Row) error {
 	}
 }
 
+// SwitchDelta moves the writer onto db, the pool of a freshly rolled delta
+// generation, between rounds: the round in flight finishes in the old
+// generation first, and from then on the old file is never written to again.
+func (w *Writer) SwitchDelta(db *sql.DB) error {
+	req := writeRequest{roll: db, resp: make(chan error, 1)}
+	select {
+	case w.reqs <- req:
+	case <-w.done:
+		return errWriterClosed
+	}
+	// The unbuffered handoff means the writer goroutine took the request, so
+	// its reply is guaranteed to arrive.
+	return <-req.resp
+}
+
 // Close stops the writer goroutine, releases the appenders and returns their
 // connection to the pool. In-flight rounds finish first; the store stays
 // usable afterwards.
 func (w *Writer) Close() error {
 	w.closeOnce.Do(func() { close(w.done) })
 	<-w.finished
+	if s := w.store; s != nil {
+		s.mu.Lock()
+		if s.writer == w {
+			s.writer = nil
+		}
+		s.mu.Unlock()
+	}
 	return nil
 }
 
@@ -185,13 +224,40 @@ func (w *Writer) run() {
 	for {
 		select {
 		case req := <-w.reqs:
-			req.resp <- w.writeRound(req.ctx, req.rows)
+			if req.roll != nil {
+				req.resp <- w.switchDelta(req.roll)
+			} else {
+				req.resp <- w.writeRound(req.ctx, req.rows)
+			}
 		case <-w.done:
 			w.closeAppenders()
 			_ = w.conn.Close()
 			return
 		}
 	}
+}
+
+// switchDelta swaps the writer onto a new delta generation's pool. It runs on
+// the writer goroutine only, so no round is ever split across generations. A
+// failure partway leaves the writer untouched on the old generation.
+func (w *Writer) switchDelta(db *sql.DB) error {
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		return fmt.Errorf("duck-store: rolled generation connection: %w", err)
+	}
+	appenders, err := createTierAppenders(conn)
+	if err != nil {
+		_ = conn.Close()
+		return err
+	}
+	w.closeAppenders() // the old generation's; its last round flushed before this
+	old := w.conn
+	w.conn = conn
+	w.appenders = appenders
+	if err := old.Close(); err != nil {
+		return fmt.Errorf("duck-store: release the previous generation connection: %w", err)
+	}
+	return nil
 }
 
 // writeRound appends every guard-passing row to all three tier appenders and
@@ -279,17 +345,29 @@ func tagColumnValues(id int32, s string) (int64, string) {
 	return 0, s
 }
 
-// ensureAppenders (re)creates the missing tier appenders on the writer's
-// dedicated connection.
+// ensureAppenders (re)creates the tier appenders on the writer's dedicated
+// connection when none survive. A failed append or flush invalidates a DuckDB
+// appender, so failures drop the whole set and the next round starts from
+// fresh ones; creation is cheap, and the set is always complete or empty.
 func (w *Writer) ensureAppenders() error {
+	if len(w.appenders) == len(tiers) {
+		return nil
+	}
+	w.dropAppenders()
+	appenders, err := createTierAppenders(w.conn)
+	if err != nil {
+		return err
+	}
+	w.appenders = appenders
+	return nil
+}
+
+// createTierAppenders builds one appender per tier table on conn.
+func createTierAppenders(conn *sql.Conn) (map[string]*duckdb.Appender, error) {
+	appenders := make(map[string]*duckdb.Appender, len(tiers))
 	for _, tier := range tiers {
-		if w.appenders[tier] != nil {
-			continue
-		}
 		var a *duckdb.Appender
-		err := w.conn.Raw(func(c any) error {
-			// A failed flush invalidates a DuckDB appender, so appenders are
-			// recreated rather than reused after errors; creation is cheap.
+		err := conn.Raw(func(c any) error {
 			created, err := duckdb.NewAppender(c.(driver.Conn), "", "", tierTables[tier])
 			if err != nil {
 				return err
@@ -298,12 +376,14 @@ func (w *Writer) ensureAppenders() error {
 			return nil
 		})
 		if err != nil {
-			w.dropAppenders()
-			return fmt.Errorf("duck-store: create %s appender: %w", tier, err)
+			for _, x := range appenders {
+				_ = x.CloseWithCancel(context.Background())
+			}
+			return nil, fmt.Errorf("duck-store: create %s appender: %w", tier, err)
 		}
-		w.appenders[tier] = a
+		appenders[tier] = a
 	}
-	return nil
+	return appenders, nil
 }
 
 // dropAppenders destroys the appenders (discarding anything still buffered in
