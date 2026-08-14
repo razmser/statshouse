@@ -23,6 +23,16 @@ import (
 // pulling them through Go.
 const deltaSrcAlias = "delta_src"
 
+// tierWindowSecs is each tier's archive window length: the file boundary
+// consumption routes rows by, retention unlinks whole files at, and sealing
+// rewrites one of. The 1s tier's hour is the tickets' provisional starting
+// point; the numbers are revisited when compaction is wired up.
+var tierWindowSecs = map[string]int64{
+	Tier1s: 3600,
+	Tier1m: 86400,
+	Tier1h: 30 * 86400,
+}
+
 // windowKey identifies one archive window file.
 type windowKey struct {
 	tier  string
