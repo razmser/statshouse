@@ -10,6 +10,7 @@ package aggregator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"testing"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/VKCOM/statshouse/internal/data_model"
 	"github.com/VKCOM/statshouse/internal/duckstore"
+	"github.com/VKCOM/statshouse/internal/format"
 )
 
 // sinkNowUnix is the frozen clock the duck sink tests run under — the writer's
@@ -238,16 +240,18 @@ func TestDuckSinkCopiesSketchBytes(t *testing.T) {
 }
 
 // TestOpenDuckStore covers the plumbing: the dir must be set, and a set dir
-// yields a handle that produces working sinks and closes cleanly.
+// yields a handle that produces working sinks and closes cleanly. A nil
+// metrics agent is allowed — the store and its maintenance run without
+// observability in that case.
 func TestOpenDuckStore(t *testing.T) {
 	t.Run("empty_dir_is_rejected", func(t *testing.T) {
-		_, err := openDuckStore(ConfigAggregator{})
+		_, err := openDuckStore(ConfigAggregator{}, nil)
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "store directory is not set")
 	})
 
 	t.Run("opens_and_closes", func(t *testing.T) {
-		handle, err := openDuckStore(ConfigAggregator{DuckStoreDir: t.TempDir()})
+		handle, err := openDuckStore(ConfigAggregator{DuckStoreDir: t.TempDir()}, nil)
 		require.NoError(t, err)
 		require.NotNil(t, handle)
 
@@ -258,4 +262,42 @@ func TestOpenDuckStore(t *testing.T) {
 
 		require.NoError(t, handle.Close())
 	})
+}
+
+// TestDuckMetricsTagMappings proves the duck*Tag helpers name every event
+// value the store emits with the constant its metric's value comments
+// document, and collapse anything unknown to 0 — the value no comment names.
+func TestDuckMetricsTagMappings(t *testing.T) {
+	require.Equal(t, int32(format.TagValueIDStatusOK), duckStatusTag(nil))
+	require.Equal(t, int32(format.TagValueIDStatusError), duckStatusTag(errors.New("boom")))
+
+	require.Equal(t, int32(format.TagValueIDDuckMaintenanceCompaction), duckMaintenanceTag(duckstore.MaintenanceCompaction))
+	require.Equal(t, int32(format.TagValueIDDuckMaintenanceSealing), duckMaintenanceTag(duckstore.MaintenanceSealing))
+	require.Equal(t, int32(format.TagValueIDDuckMaintenanceRetention), duckMaintenanceTag(duckstore.MaintenanceRetention))
+	require.Zero(t, duckMaintenanceTag(duckstore.MaintenanceKind("other")))
+
+	require.Equal(t, int32(format.TagValueIDDuckWindowSealed), duckWindowEventTag(duckstore.WindowSealed))
+	require.Equal(t, int32(format.TagValueIDDuckWindowUnlinked), duckWindowEventTag(duckstore.WindowUnlinked))
+	require.Equal(t, int32(format.TagValueIDDuckWindowEarlyEvicted), duckWindowEventTag(duckstore.WindowEarlyEvicted))
+	require.Equal(t, int32(format.TagValueIDDuckWindowLeaseDeferred), duckWindowEventTag(duckstore.WindowLeaseDeferred))
+	require.Zero(t, duckWindowEventTag(duckstore.WindowEventKind("other")))
+
+	require.Equal(t, int32(format.TagValueIDDuckTier1s), duckTierTag(duckstore.Tier1s))
+	require.Equal(t, int32(format.TagValueIDDuckTier1m), duckTierTag(duckstore.Tier1m))
+	require.Equal(t, int32(format.TagValueIDDuckTier1h), duckTierTag(duckstore.Tier1h))
+	require.Zero(t, duckTierTag("no such tier"))
+
+	require.Equal(t, int32(format.TagValueIDDuckQuarantineSchema), duckQuarantineAxisTag(duckstore.QuarantineSchema))
+	require.Equal(t, int32(format.TagValueIDDuckQuarantineStorage), duckQuarantineAxisTag(duckstore.QuarantineStorage))
+	require.Equal(t, int32(format.TagValueIDDuckQuarantineStatshouse), duckQuarantineAxisTag(duckstore.QuarantineStatshouse))
+	require.Equal(t, int32(format.TagValueIDDuckQuarantineUnreadable), duckQuarantineAxisTag(duckstore.QuarantineUnreadable))
+	require.Zero(t, duckQuarantineAxisTag(duckstore.QuarantineAxis("other")))
+
+	require.Equal(t, int32(format.TagValueIDDuckQuerySeries), duckQueryVerbTag(duckstore.QuerySeries))
+	require.Equal(t, int32(format.TagValueIDDuckQueryTagValues), duckQueryVerbTag(duckstore.QueryTagValues))
+	require.Zero(t, duckQueryVerbTag(duckstore.QueryVerb("other")))
+
+	require.Equal(t, int32(format.TagValueIDDuckSizeDelta), duckSizeLocationTag(duckstore.SizeDelta))
+	require.Equal(t, int32(format.TagValueIDDuckSizeArchive), duckSizeLocationTag(duckstore.SizeArchive))
+	require.Zero(t, duckSizeLocationTag(duckstore.SizeLocation("other")))
 }

@@ -404,7 +404,7 @@ func MakeAggregator(fj *os.File, fjCompact *os.File, mappingsCache *pcache.Mappi
 	// The duck store must exist before the insert threads start; from here to
 	// the end of MakeAggregator nothing fails anymore.
 	if a.config.StorageBackend == duckstore.BackendDuck {
-		duck, err := openDuckStore(a.config)
+		duck, err := openDuckStore(a.config, a.sh2)
 		if err != nil {
 			return nil, fmt.Errorf("failed to open duck-store in %q: %v", a.config.DuckStoreDir, err)
 		}

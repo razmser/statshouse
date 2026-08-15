@@ -1542,6 +1542,187 @@ var BuiltinMetricMetaAgentAggregatorTimeDiff = &MetricMetaValue{
 	}},
 }
 
+// Tag values of the duck-store observability metrics. The constants are the
+// contract between the metrics' ValueComments and the aggregator code that
+// fills the tags (internal/aggregator), so both sides name the same numbers.
+const (
+	TagValueIDDuckMaintenanceCompaction = 1
+	TagValueIDDuckMaintenanceSealing    = 2
+	TagValueIDDuckMaintenanceRetention  = 3
+)
+
+var duckMaintenanceToValue = map[int32]string{
+	TagValueIDDuckMaintenanceCompaction: "compaction",
+	TagValueIDDuckMaintenanceSealing:    "sealing",
+	TagValueIDDuckMaintenanceRetention:  "retention",
+}
+
+const (
+	TagValueIDDuckWindowSealed        = 1
+	TagValueIDDuckWindowUnlinked      = 2
+	TagValueIDDuckWindowEarlyEvicted  = 3
+	TagValueIDDuckWindowLeaseDeferred = 4
+)
+
+var duckWindowEventToValue = map[int32]string{
+	TagValueIDDuckWindowSealed:        "sealed",
+	TagValueIDDuckWindowUnlinked:      "unlinked",
+	TagValueIDDuckWindowEarlyEvicted:  "early_evicted",
+	TagValueIDDuckWindowLeaseDeferred: "lease_deferred",
+}
+
+const (
+	TagValueIDDuckTier1s = 1
+	TagValueIDDuckTier1m = 2
+	TagValueIDDuckTier1h = 3
+)
+
+var duckTierToValue = map[int32]string{
+	TagValueIDDuckTier1s: "1s",
+	TagValueIDDuckTier1m: "1m",
+	TagValueIDDuckTier1h: "1h",
+}
+
+const (
+	TagValueIDDuckQuarantineSchema     = 1
+	TagValueIDDuckQuarantineStorage    = 2
+	TagValueIDDuckQuarantineStatshouse = 3
+	TagValueIDDuckQuarantineUnreadable = 4
+)
+
+var duckQuarantineAxisToValue = map[int32]string{
+	TagValueIDDuckQuarantineSchema:     "schema",
+	TagValueIDDuckQuarantineStorage:    "storage",
+	TagValueIDDuckQuarantineStatshouse: "statshouse",
+	TagValueIDDuckQuarantineUnreadable: "unreadable",
+}
+
+const (
+	TagValueIDDuckQuerySeries    = 1
+	TagValueIDDuckQueryTagValues = 2
+)
+
+var duckQueryVerbToValue = map[int32]string{
+	TagValueIDDuckQuerySeries:    "series",
+	TagValueIDDuckQueryTagValues: "tag_values",
+}
+
+const (
+	TagValueIDDuckSizeDelta   = 1
+	TagValueIDDuckSizeArchive = 2
+)
+
+var duckSizeLocationToValue = map[int32]string{
+	TagValueIDDuckSizeDelta:   "delta",
+	TagValueIDDuckSizeArchive: "archive",
+}
+
+const (
+	TagValueIDDuckSizeUsed = 1
+	TagValueIDDuckSizeFree = 2
+)
+
+var duckSizeMeasureToValue = map[int32]string{
+	TagValueIDDuckSizeUsed: "used",
+	TagValueIDDuckSizeFree: "free",
+}
+
+var BuiltinMetricMetaDuckMaintenanceTime = &MetricMetaValue{
+	Name: "__duck_store_maintenance_time",
+	Kind: MetricKindValue,
+	Description: `Time one duck-store background maintenance pass took, by maintenance and outcome.
+Set by aggregator.`,
+	MetricType:              MetricSecond,
+	NoSampleAgent:           true, // generated on aggregators, must be delivered without losses
+	BuiltinAllowedToReceive: false,
+	WithAgentEnvRouteArch:   false,
+	WithAggregatorID:        true,
+	Tags: []MetricMetaTag{{
+		Description:   "maintenance",
+		ValueComments: convertToValueComments(duckMaintenanceToValue),
+	}, {
+		Description: "status",
+		ValueComments: convertToValueComments(map[int32]string{
+			TagValueIDStatusOK:    "ok",
+			TagValueIDStatusError: "error",
+		}),
+	}},
+}
+
+var BuiltinMetricMetaDuckWindows = &MetricMetaValue{
+	Name: "__duck_store_windows",
+	Kind: MetricKindCounter,
+	Description: `Archive windows duck-store maintenance acted on: sealed by the sealer, unlinked by retention, evicted early by the free-space watermark, or whose unlink a reader's lease deferred.
+Set by aggregator.`,
+	NoSampleAgent:           true, // generated on aggregators, must be delivered without losses
+	BuiltinAllowedToReceive: false,
+	WithAgentEnvRouteArch:   false,
+	WithAggregatorID:        true,
+	Tags: []MetricMetaTag{{
+		Description:   "event",
+		ValueComments: convertToValueComments(duckWindowEventToValue),
+	}, {
+		Description:   "tier",
+		ValueComments: convertToValueComments(duckTierToValue),
+	}},
+}
+
+var BuiltinMetricMetaDuckQuarantinedFiles = &MetricMetaValue{
+	Name: "__duck_store_quarantined_files",
+	Kind: MetricKindCounter,
+	Description: `Store files the aggregator quarantined on open, by the version axis that excluded them (schema, DuckDB storage, statshouse version, or unreadable).
+Count is the number of files. Set by aggregator.`,
+	NoSampleAgent:           true, // generated on aggregators, must be delivered without losses
+	BuiltinAllowedToReceive: false,
+	WithAgentEnvRouteArch:   false,
+	WithAggregatorID:        true,
+	Tags: []MetricMetaTag{{
+		Description:   "axis",
+		ValueComments: convertToValueComments(duckQuarantineAxisToValue),
+	}},
+}
+
+var BuiltinMetricMetaDuckQueryTime = &MetricMetaValue{
+	Name: "__duck_store_query_time",
+	Kind: MetricKindValue,
+	Description: `Time one structured store query served by the aggregator's query listener took, by verb and outcome. Count is the query load.
+Set by aggregator.`,
+	MetricType:              MetricSecond,
+	NoSampleAgent:           true, // generated on aggregators, must be delivered without losses
+	BuiltinAllowedToReceive: false,
+	WithAgentEnvRouteArch:   false,
+	WithAggregatorID:        true,
+	Tags: []MetricMetaTag{{
+		Description:   "verb",
+		ValueComments: convertToValueComments(duckQueryVerbToValue),
+	}, {
+		Description: "status",
+		ValueComments: convertToValueComments(map[int32]string{
+			TagValueIDStatusOK:    "ok",
+			TagValueIDStatusError: "error",
+		}),
+	}},
+}
+
+var BuiltinMetricMetaDuckStoreSize = &MetricMetaValue{
+	Name: "__duck_store_size",
+	Kind: MetricKindValue,
+	Description: `Size of the shard's duck-store measured with DuckDB's database-size pragma — block_size times blocks, which sees the free blocks DuckDB reuses and file length does not — summed over the delta generations and the archive windows.
+Set by aggregator.`,
+	MetricType:              MetricByte,
+	NoSampleAgent:           true, // generated on aggregators, must be delivered without losses
+	BuiltinAllowedToReceive: false,
+	WithAgentEnvRouteArch:   false,
+	WithAggregatorID:        true,
+	Tags: []MetricMetaTag{{
+		Description:   "location",
+		ValueComments: convertToValueComments(duckSizeLocationToValue),
+	}, {
+		Description:   "measure",
+		ValueComments: convertToValueComments(duckSizeMeasureToValue),
+	}},
+}
+
 var BuiltinMetricMetaSrcSamplingMetricCount = &MetricMetaValue{
 	Name:                    "__src_sampling_metric_count",
 	Kind:                    MetricKindValue,

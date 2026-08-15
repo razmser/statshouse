@@ -500,6 +500,13 @@ func int64s(v []int32) []int64 {
 // structured store errors (bad_request, row_limit); infrastructure failures
 // come back plain for the server to map onto the remaining codes.
 func (s *Store) RenderSeries(ctx context.Context, shardNum int32, args tlstatshouse.StoreQuerySeries) (tlstatshouse.StoreSeriesResponse, error) {
+	start := time.Now()
+	resp, err := s.renderSeries(ctx, shardNum, args)
+	recordQuery(s.cfg.Metrics, QuerySeries, start, err)
+	return resp, err
+}
+
+func (s *Store) renderSeries(ctx context.Context, shardNum int32, args tlstatshouse.StoreQuerySeries) (tlstatshouse.StoreSeriesResponse, error) {
 	p, err := planSeriesQuery(args)
 	if err != nil {
 		return tlstatshouse.StoreSeriesResponse{}, err

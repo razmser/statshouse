@@ -52,6 +52,10 @@ type SealerConfig struct {
 	// time.Now.
 	NowFunc func() time.Time
 
+	// Metrics receives each pass's timing (MaintenanceSealing) and one
+	// MaintenanceWindow per window the pass sealed. Optional.
+	Metrics MetricsRecorder
+
 	// Logf receives pass failures. Defaults to log.Printf.
 	Logf func(format string, args ...any)
 }
@@ -112,6 +116,13 @@ func (sl *Sealer) Run(ctx context.Context) error {
 // that no longer exist on disk at their seal time — retention unlinked them
 // in the meantime — are skipped: sealing rewrites, it never resurrects.
 func (sl *Sealer) SealOnce(ctx context.Context) error {
+	start := time.Now()
+	err := sl.sealOnce(ctx)
+	recordMaintenancePass(sl.cfg.Metrics, MaintenanceSealing, start, err)
+	return err
+}
+
+func (sl *Sealer) sealOnce(ctx context.Context) error {
 	sl.mu.Lock()
 	defer sl.mu.Unlock()
 	now := sl.cfg.NowFunc().Unix()
@@ -128,6 +139,7 @@ func (sl *Sealer) SealOnce(ctx context.Context) error {
 			}
 			return fmt.Errorf("duck-store: seal %s: %w", wf.Path, err)
 		}
+		recordMaintenanceWindow(sl.cfg.Metrics, WindowSealed, wf.Tier)
 	}
 	return nil
 }

@@ -13,6 +13,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/VKCOM/statshouse/internal/data_model/gen2/tlstatshouse"
 	"github.com/VKCOM/statshouse/internal/format"
@@ -149,6 +150,13 @@ func buildTagValuesSQL(p *tagValuesPlan, sources []string) (*seriesQuerySQL, err
 // (bad_request, row_limit); infrastructure failures come back plain for the
 // server to map onto the remaining codes.
 func (s *Store) RenderTagValues(ctx context.Context, args tlstatshouse.StoreQueryTagValues) (tlstatshouse.StoreTagValuesResponse, error) {
+	start := time.Now()
+	resp, err := s.renderTagValues(ctx, args)
+	recordQuery(s.cfg.Metrics, QueryTagValues, start, err)
+	return resp, err
+}
+
+func (s *Store) renderTagValues(ctx context.Context, args tlstatshouse.StoreQueryTagValues) (tlstatshouse.StoreTagValuesResponse, error) {
 	p, err := planTagValuesQuery(args)
 	if err != nil {
 		return tlstatshouse.StoreTagValuesResponse{}, err

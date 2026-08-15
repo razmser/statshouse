@@ -14,21 +14,32 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
+	"github.com/VKCOM/statshouse/internal/agent"
 	"github.com/VKCOM/statshouse/internal/data_model/gen2/tlstatshouse"
 	"github.com/VKCOM/statshouse/internal/duckstore"
+	"github.com/VKCOM/statshouse/internal/format"
 	"github.com/VKCOM/statshouse/internal/metajournal"
 )
 
 // openDuckStore opens the shard's duck-store and starts its single writer and
-// its retainer, producing the handle the insert threads take their sinks from
-// and the query listener takes its executor from. The DuckDB resource bounds
-// from the config ride into every store file the store opens.
-func openDuckStore(config ConfigAggregator) (duckStoreHandle, error) {
+// its background maintenance — compaction, sealing, retention and the size
+// sampler — producing the handle the insert threads take their sinks from and
+// the query listener takes its executor from. The DuckDB resource bounds from
+// the config ride into every store file the store opens, and sh2 (the
+// aggregator's builtin-metrics agent, may be nil in tests) receives the
+// store's observability events as __duck_store_* builtin metrics.
+func openDuckStore(config ConfigAggregator, sh2 *agent.Agent) (duckStoreHandle, error) {
+	var rec duckstore.MetricsRecorder
+	if sh2 != nil {
+		rec = &duckMetrics{sh: sh2}
+	}
 	s, err := duckstore.OpenStore(duckstore.StoreConfig{
-		Dir:  config.DuckStoreDir,
-		Logf: log.Printf,
+		Dir:     config.DuckStoreDir,
+		Logf:    log.Printf,
+		Metrics: rec,
 		Resources: duckstore.ResourcesConfig{
 			MemoryLimitBytes: config.DuckMemoryLimit,
 		},
@@ -41,29 +52,176 @@ func openDuckStore(config ConfigAggregator) (duckStoreHandle, error) {
 		_ = s.Close()
 		return nil, err
 	}
+	compactor := duckstore.NewCompactor(s, duckstore.CompactorConfig{Metrics: rec, Logf: log.Printf})
+	sealer := duckstore.NewSealer(s, duckstore.SealerConfig{Metrics: rec, Logf: log.Printf})
 	retainer := duckstore.NewRetainer(s, duckstore.RetentionConfig{
 		Retention1s:        config.DuckRetention1s,
 		Retention1m:        config.DuckRetention1m,
 		Retention1h:        config.DuckRetention1h,
 		FreeSpaceWatermark: uint64(config.DuckFreeSpaceWatermark),
+		Metrics:            rec,
 		Logf:               log.Printf,
 	})
-	retCtx, stopRetainer := context.WithCancel(context.Background())
-	retainerDone := make(chan struct{})
+	sampler := func(ctx context.Context) error {
+		return duckstore.RunSizeSampler(ctx, s, rec, 0)
+	}
+
+	// The four maintenance loops share one lifecycle: cancel on Close, wait
+	// for every goroutine, then the writer and the store shut down in order.
+	mntCtx, stopMaintenance := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	wg.Add(4)
+	for _, loop := range []func(context.Context) error{compactor.Run, sealer.Run, retainer.Run, sampler} {
+		loop := loop
+		go func() {
+			defer wg.Done()
+			_ = loop(mntCtx)
+		}()
+	}
+	maintenanceDone := make(chan struct{})
 	go func() {
-		defer close(retainerDone)
-		_ = retainer.Run(retCtx)
+		wg.Wait()
+		close(maintenanceDone)
 	}()
-	return &duckStore{store: s, writer: w, stopRetainer: stopRetainer, retainerDone: retainerDone}, nil
+	return &duckStore{
+		store:           s,
+		writer:          w,
+		stopMaintenance: stopMaintenance,
+		maintenanceDone: maintenanceDone,
+	}, nil
+}
+
+// duckMetrics forwards the store's observability events to the __duck_store_*
+// builtin metrics through the aggregator's own agent, the same way
+// reportInsertMetric forwards the insert-path metrics: one tags slice per
+// event in final tag positions (environment at 0, filled by the agent), the
+// metric metas carrying the value comments that name the numbers.
+type duckMetrics struct {
+	sh *agent.Agent
+}
+
+var _ duckstore.MetricsRecorder = (*duckMetrics)(nil)
+
+func (m *duckMetrics) MaintenancePass(kind duckstore.MaintenanceKind, err error, dur time.Duration) {
+	m.sh.AddValueCounter(m.now(), format.BuiltinMetricMetaDuckMaintenanceTime,
+		[]int32{0, duckMaintenanceTag(kind), duckStatusTag(err)}, dur.Seconds(), 1)
+}
+
+func (m *duckMetrics) MaintenanceWindow(kind duckstore.WindowEventKind, tier string) {
+	m.sh.AddCounter(m.now(), format.BuiltinMetricMetaDuckWindows,
+		[]int32{0, duckWindowEventTag(kind), duckTierTag(tier)}, 1)
+}
+
+func (m *duckMetrics) QuarantinedFiles(axis duckstore.QuarantineAxis, count int) {
+	m.sh.AddCounter(m.now(), format.BuiltinMetricMetaDuckQuarantinedFiles,
+		[]int32{0, duckQuarantineAxisTag(axis)}, float64(count))
+}
+
+func (m *duckMetrics) StoreQuery(verb duckstore.QueryVerb, err error, dur time.Duration) {
+	m.sh.AddValueCounter(m.now(), format.BuiltinMetricMetaDuckQueryTime,
+		[]int32{0, duckQueryVerbTag(verb), duckStatusTag(err)}, dur.Seconds(), 1)
+}
+
+func (m *duckMetrics) StoreSize(location duckstore.SizeLocation, used, free int64) {
+	t := m.now()
+	m.sh.AddValueCounter(t, format.BuiltinMetricMetaDuckStoreSize,
+		[]int32{0, duckSizeLocationTag(location), format.TagValueIDDuckSizeUsed}, float64(used), 1)
+	m.sh.AddValueCounter(t, format.BuiltinMetricMetaDuckStoreSize,
+		[]int32{0, duckSizeLocationTag(location), format.TagValueIDDuckSizeFree}, float64(free), 1)
+}
+
+func (m *duckMetrics) now() uint32 { return uint32(time.Now().Unix()) }
+
+// The duck*Tag helpers map the store's typed event values onto the tag-value
+// constants the metas' value comments name. Unknown values map to 0, which no
+// comment names and which therefore stands out on a dashboard.
+
+func duckStatusTag(err error) int32 {
+	if err != nil {
+		return format.TagValueIDStatusError
+	}
+	return format.TagValueIDStatusOK
+}
+
+func duckMaintenanceTag(kind duckstore.MaintenanceKind) int32 {
+	switch kind {
+	case duckstore.MaintenanceCompaction:
+		return format.TagValueIDDuckMaintenanceCompaction
+	case duckstore.MaintenanceSealing:
+		return format.TagValueIDDuckMaintenanceSealing
+	case duckstore.MaintenanceRetention:
+		return format.TagValueIDDuckMaintenanceRetention
+	}
+	return 0
+}
+
+func duckWindowEventTag(kind duckstore.WindowEventKind) int32 {
+	switch kind {
+	case duckstore.WindowSealed:
+		return format.TagValueIDDuckWindowSealed
+	case duckstore.WindowUnlinked:
+		return format.TagValueIDDuckWindowUnlinked
+	case duckstore.WindowEarlyEvicted:
+		return format.TagValueIDDuckWindowEarlyEvicted
+	case duckstore.WindowLeaseDeferred:
+		return format.TagValueIDDuckWindowLeaseDeferred
+	}
+	return 0
+}
+
+func duckTierTag(tier string) int32 {
+	switch tier {
+	case duckstore.Tier1s:
+		return format.TagValueIDDuckTier1s
+	case duckstore.Tier1m:
+		return format.TagValueIDDuckTier1m
+	case duckstore.Tier1h:
+		return format.TagValueIDDuckTier1h
+	}
+	return 0
+}
+
+func duckQuarantineAxisTag(axis duckstore.QuarantineAxis) int32 {
+	switch axis {
+	case duckstore.QuarantineSchema:
+		return format.TagValueIDDuckQuarantineSchema
+	case duckstore.QuarantineStorage:
+		return format.TagValueIDDuckQuarantineStorage
+	case duckstore.QuarantineStatshouse:
+		return format.TagValueIDDuckQuarantineStatshouse
+	case duckstore.QuarantineUnreadable:
+		return format.TagValueIDDuckQuarantineUnreadable
+	}
+	return 0
+}
+
+func duckQueryVerbTag(verb duckstore.QueryVerb) int32 {
+	switch verb {
+	case duckstore.QuerySeries:
+		return format.TagValueIDDuckQuerySeries
+	case duckstore.QueryTagValues:
+		return format.TagValueIDDuckQueryTagValues
+	}
+	return 0
+}
+
+func duckSizeLocationTag(location duckstore.SizeLocation) int32 {
+	switch location {
+	case duckstore.SizeDelta:
+		return format.TagValueIDDuckSizeDelta
+	case duckstore.SizeArchive:
+		return format.TagValueIDDuckSizeArchive
+	}
+	return 0
 }
 
 // duckStore implements duckStoreHandle over the store, its writer and its
-// retainer.
+// maintenance goroutines.
 type duckStore struct {
-	store        *duckstore.Store
-	writer       *duckstore.Writer
-	stopRetainer context.CancelFunc
-	retainerDone chan struct{}
+	store           *duckstore.Store
+	writer          *duckstore.Writer
+	stopMaintenance context.CancelFunc
+	maintenanceDone chan struct{}
 }
 
 func (d *duckStore) NewSink() InsertSink { return newDuckSink(d.writer) }
@@ -100,11 +258,12 @@ func (e *duckQueryExecutor) QueryTagValues(ctx context.Context, args tlstatshous
 	return e.store.RenderTagValues(ctx, args)
 }
 
-// Close stops the retainer and the writer before releasing the store, so the
-// appenders' dedicated connection is never closed underneath a live writer.
+// Close stops the maintenance loops and the writer before releasing the
+// store, so the appenders' dedicated connection is never closed underneath a
+// live writer.
 func (d *duckStore) Close() error {
-	d.stopRetainer()
-	<-d.retainerDone
+	d.stopMaintenance()
+	<-d.maintenanceDone
 	return errors.Join(d.writer.Close(), d.store.Close())
 }
 

@@ -82,6 +82,11 @@ type RetentionConfig struct {
 	// time.Now.
 	NowFunc func() time.Time
 
+	// Metrics receives each pass's timing (MaintenanceRetention) and one
+	// MaintenanceWindow per window unlinked, early-evicted or lease-deferred.
+	// Optional.
+	Metrics MetricsRecorder
+
 	// Logf receives pass failures and evictions. Defaults to log.Printf.
 	Logf func(format string, args ...any)
 }
@@ -186,6 +191,13 @@ func (r *Retainer) Stats() RetentionStats {
 // nothing evictable is left. A window that fails to unlink fails the pass;
 // the next pass retries it.
 func (r *Retainer) RetainOnce(ctx context.Context) error {
+	start := time.Now()
+	err := r.retainOnce(ctx)
+	recordMaintenancePass(r.cfg.Metrics, MaintenanceRetention, start, err)
+	return err
+}
+
+func (r *Retainer) retainOnce(ctx context.Context) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	now := r.cfg.NowFunc().Unix()
@@ -199,10 +211,12 @@ func (r *Retainer) RetainOnce(ctx context.Context) error {
 		switch err := r.store.DropWindow(wf.Tier, wf.WindowStart); {
 		case err == nil:
 			r.expiredUnlinked.Add(1)
+			recordMaintenanceWindow(r.cfg.Metrics, WindowUnlinked, wf.Tier)
 			r.cfg.Logf("[info] duck-store: unlinked %s: %s-tier window is past its %s retention",
 				wf.Path, wf.Tier, r.tierRetention(wf.Tier))
 		case errors.Is(err, ErrWindowLeased):
 			r.leaseDeferred.Add(1)
+			recordMaintenanceWindow(r.cfg.Metrics, WindowLeaseDeferred, wf.Tier)
 			r.cfg.Logf("[info] duck-store: deferred unlink of %s: a reader still holds the window", wf.Path)
 		case errors.Is(err, ErrWindowNotServed):
 			// the window left between the snapshot and the drop; nothing to do
@@ -247,6 +261,7 @@ func (r *Retainer) evictForFreeSpace() {
 		switch {
 		case err == nil:
 			r.earlyEvicted.Add(1)
+			recordMaintenanceWindow(r.cfg.Metrics, WindowEarlyEvicted, wf.Tier)
 			r.cfg.Logf("[warning] duck-store: early-evicted %s: free space was below the watermark", wf.Path)
 		case errors.Is(err, ErrWindowLeased), errors.Is(err, ErrWindowNotServed):
 			skipped[windowKey{tier: wf.Tier, start: wf.WindowStart}] = struct{}{}

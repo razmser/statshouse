@@ -56,6 +56,10 @@ type StoreConfig struct {
 	// to log.Printf.
 	Logf func(format string, args ...any)
 
+	// Metrics receives the count of files the open quarantined, per axis
+	// (QuarantinedFiles). Optional.
+	Metrics MetricsRecorder
+
 	// Resources are the DuckDB resource bounds applied to every store file
 	// the store opens: single-threaded, a memory limit and a bounded temp
 	// directory. The zero value takes DefaultResources().
@@ -80,6 +84,7 @@ type WindowFile struct {
 type QuarantineInfo struct {
 	Path   string // original path, before the file was moved aside
 	Reason string
+	Axis   QuarantineAxis // the version axis that disagreed, or unreadable
 }
 
 // Store is one shard's duck-store: the delta file the aggregator writes and
@@ -160,7 +165,24 @@ func OpenStore(cfg StoreConfig) (*Store, error) {
 		s.Close()
 		return nil, err
 	}
+	s.reportQuarantined(cfg.Metrics)
 	return s, nil
+}
+
+// reportQuarantined tells the metrics recorder how many files this open
+// quarantined on each axis, so a version bump is visible as a metric and not
+// only as a log line. Axes with no files are not reported.
+func (s *Store) reportQuarantined(rec MetricsRecorder) {
+	if rec == nil || len(s.quarantined) == 0 {
+		return
+	}
+	counts := map[QuarantineAxis]int{}
+	for _, q := range s.quarantined {
+		counts[q.Axis]++
+	}
+	for axis, n := range counts {
+		rec.QuarantinedFiles(axis, n)
+	}
 }
 
 // Close releases the store's database handles. Files on disk are untouched.
@@ -284,15 +306,34 @@ func (s *Store) verifyDeltaGeneration(gen int64) bool {
 	path := filepath.Join(s.cfg.Dir, deltaFileName(gen))
 	db, err := openStoreFile(path, false, s.cfg.Resources)
 	if err != nil {
-		s.quarantineFile(path, fmt.Sprintf("cannot open: %v", err))
+		s.quarantineFile(path, fmt.Sprintf("cannot open: %v", err), QuarantineUnreadable)
 		return false
 	}
 	defer db.Close()
-	if _, err := s.verifyStamp(db, path); err != nil {
-		s.quarantineFile(path, err.Error())
+	st, err := s.verifyStamp(db, path)
+	if err != nil {
+		s.quarantineFile(path, err.Error(), s.stampMismatchAxis(st))
 		return false
 	}
 	return true
+}
+
+// stampMismatchAxis names the axis a stamp verifyStamp rejected: which of the
+// three version axes disagreed, or that there was no readable stamp to
+// compare at all.
+func (s *Store) stampMismatchAxis(st stamp) QuarantineAxis {
+	if st.storageVersion == "" && st.schemaVersion == 0 {
+		return QuarantineUnreadable
+	}
+	cur := s.currentStamp()
+	switch {
+	case st.schemaVersion != cur.schemaVersion:
+		return QuarantineSchema
+	case st.storageVersion != cur.storageVersion:
+		return QuarantineStorage
+	default:
+		return QuarantineStatshouse
+	}
 }
 
 // scanArchives verifies the version stamp of every archive window file,
@@ -314,10 +355,14 @@ func (s *Store) scanArchives() error {
 		path := filepath.Join(s.cfg.Dir, archiveSubdir, e.Name())
 		db, err := openStoreFile(path, true, s.cfg.Resources)
 		if err != nil {
-			s.quarantineFile(path, fmt.Sprintf("cannot open: %v", err))
+			s.quarantineFile(path, fmt.Sprintf("cannot open: %v", err), QuarantineUnreadable)
 			continue
 		}
-		_, err = s.verifyStamp(db, path)
+		st, err := s.verifyStamp(db, path)
+		axis := QuarantineUnreadable
+		if err != nil {
+			axis = s.stampMismatchAxis(st)
+		}
 		var sealed bool
 		if err == nil {
 			// The consumed-generations records drive crash recovery and the
@@ -337,7 +382,7 @@ func (s *Store) scanArchives() error {
 		}
 		db.Close()
 		if err != nil {
-			s.quarantineFile(path, err.Error())
+			s.quarantineFile(path, err.Error(), axis)
 			continue
 		}
 		s.windows = append(s.windows, WindowFile{Tier: tier, WindowStart: windowStart, Path: path, Sealed: sealed})
@@ -392,8 +437,9 @@ func (s *Store) verifyStamp(db *sql.DB, path string) (stamp, error) {
 
 // quarantineFile moves an unreadable or version-mismatching store file into
 // the quarantine directory — out of queries, but kept on disk for deliberate
-// reclamation — and records it. The store keeps opening and serving the rest.
-func (s *Store) quarantineFile(path, reason string) {
+// reclamation — and records it with the axis that excluded it. The store
+// keeps opening and serving the rest.
+func (s *Store) quarantineFile(path, reason string, axis QuarantineAxis) {
 	dst := uniquePath(filepath.Join(s.cfg.Dir, quarantineSubdir, filepath.Base(path)))
 	// DuckDB may leave a write-ahead log next to the file; move it along so
 	// the quarantined file is not split from it.
@@ -403,7 +449,7 @@ func (s *Store) quarantineFile(path, reason string) {
 		_ = os.Rename(path+".wal", dst+".wal")
 		s.cfg.Logf("[error] duck-store: quarantined %s: %s", path, reason)
 	}
-	s.quarantined = append(s.quarantined, QuarantineInfo{Path: path, Reason: reason})
+	s.quarantined = append(s.quarantined, QuarantineInfo{Path: path, Reason: reason, Axis: axis})
 }
 
 // dsnBytes renders a byte count as a DuckDB size option value. The DSN parser

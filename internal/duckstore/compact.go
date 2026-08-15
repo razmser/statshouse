@@ -41,6 +41,9 @@ type CompactorConfig struct {
 	// DefaultCompactorInterval.
 	Interval time.Duration
 
+	// Metrics receives each pass's timing (MaintenanceCompaction). Optional.
+	Metrics MetricsRecorder
+
 	// Logf receives pass failures. Defaults to log.Printf.
 	Logf func(format string, args ...any)
 }
@@ -99,6 +102,13 @@ func (c *Compactor) Run(ctx context.Context) error {
 // routed into the archive windows their own timestamps belong to across all
 // three tiers.
 func (c *Compactor) CompactOnce(ctx context.Context) error {
+	start := time.Now()
+	err := c.compactOnce(ctx)
+	recordMaintenancePass(c.cfg.Metrics, MaintenanceCompaction, start, err)
+	return err
+}
+
+func (c *Compactor) compactOnce(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	s := c.store

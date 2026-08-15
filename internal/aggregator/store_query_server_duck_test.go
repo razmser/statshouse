@@ -31,7 +31,7 @@ import (
 func TestStoreQueryServerIngestKeepsRunningWhileQueriesRefused(t *testing.T) {
 	config := DefaultConfigAggregator()
 	config.DuckStoreDir = t.TempDir()
-	handle, err := openDuckStore(config)
+	handle, err := openDuckStore(config, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = handle.Close() })
 	sink := handle.NewSink()

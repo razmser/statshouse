@@ -11,6 +11,7 @@ package aggregator
 import (
 	"fmt"
 
+	"github.com/VKCOM/statshouse/internal/agent"
 	"github.com/VKCOM/statshouse/internal/duckstore"
 )
 
@@ -18,6 +19,6 @@ import (
 // implementation in insert_sink_duck.go. It is unreachable in practice:
 // ValidateConfigAggregator rejects the duck backend in binaries built without
 // the duckdb build tag, so MakeAggregator never calls it here.
-func openDuckStore(config ConfigAggregator) (duckStoreHandle, error) {
+func openDuckStore(config ConfigAggregator, sh2 *agent.Agent) (duckStoreHandle, error) {
 	return nil, fmt.Errorf("duck storage backend requires a binary built with the %q build tag", duckstore.BuildTag)
 }
