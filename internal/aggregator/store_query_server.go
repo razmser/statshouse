@@ -17,6 +17,7 @@ import (
 
 	"github.com/VKCOM/statshouse/internal/data_model/gen2/tlstatshouse"
 	"github.com/VKCOM/statshouse/internal/duckstore"
+	"github.com/VKCOM/statshouse/internal/metajournal"
 	"github.com/VKCOM/statshouse/internal/vkgo/build"
 )
 
@@ -40,26 +41,84 @@ const (
 )
 
 // storeQueryExecutor runs the two structured store-query verbs against the
-// shard's store. The DuckDB renderers (series and tag values) implement it;
-// until they exist the duck store hands out a stub that answers internal. The
-// executor must honour its context: a cancelled context must actually stop the
-// underlying query (duckdb-go interrupts DuckDB), because admission slots are
-// only released once the call returns.
+// shard's store. The DuckDB renderers (series and tag values) implement it
+// behind the aggregator's journal validation. The executor must honour its
+// context: a cancelled context must actually stop the underlying query
+// (duckdb-go interrupts DuckDB), because admission slots are only released
+// once the call returns.
 type storeQueryExecutor interface {
 	QuerySeries(ctx context.Context, args tlstatshouse.StoreQuerySeries) (tlstatshouse.StoreSeriesResponse, error)
 	QueryTagValues(ctx context.Context, args tlstatshouse.StoreQueryTagValues) (tlstatshouse.StoreTagValuesResponse, error)
 }
 
-// stubStoreQueryExecutor answers every verb with an internal error. It is what
-// the duck store serves until the renderers are wired in.
-type stubStoreQueryExecutor struct{}
+// storeQueryJournalWait bounds how long a store query waits for the local
+// journal to reach the request's metric_version before deciding the two
+// journals disagree. It is a variable only so tests can shrink it; production
+// leaves it alone.
+var storeQueryJournalWait = 5 * time.Second
 
-func (stubStoreQueryExecutor) QuerySeries(ctx context.Context, args tlstatshouse.StoreQuerySeries) (tlstatshouse.StoreSeriesResponse, error) {
-	return tlstatshouse.StoreSeriesResponse{}, duckstore.NewError(duckstore.ErrCodeInternal, "store query rendering is not implemented in this build")
+// validateStoreQueryMetadata checks a store query against the aggregator's
+// own journal before any row is read: every metric the query addresses must
+// exist there — unknown_metric otherwise — and the request's tag layout must
+// equal the journal's own derivation — metadata_mismatch otherwise. A layout
+// the journal disagrees with would reinterpret stored bytes (a tag flipping
+// between mapped and raw64 changes what tagN means), so the query is refused
+// instead; the API retries with a fresh layout.
+//
+// The check first waits briefly for the journal to reach the request's
+// metric_version, so a query racing journal propagation between the API and
+// this shard converges rather than failing — the request's version exists
+// exactly so the two sides can meet.
+func validateStoreQueryMetadata(ctx context.Context, storage *metajournal.MetricsStorage, base tlstatshouse.StoreQueryBase) error {
+	ids := addressedMetricIDs(base)
+	if len(ids) == 0 {
+		// nothing specific is addressed; the layout is the API's own choice
+		// and there is no journal entry to check it against
+		return nil
+	}
+	if base.MetricVersion > 0 {
+		waitCtx, cancel := context.WithTimeout(ctx, storeQueryJournalWait)
+		err := storage.WaitVersion(waitCtx, base.MetricVersion)
+		cancel()
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err() // the query itself died; the caller maps it
+			}
+			return duckstore.NewError(duckstore.ErrCodeMetadataMismatch,
+				"journal has not reached version %d: the tag layout cannot be validated", base.MetricVersion)
+		}
+	}
+	for _, id := range ids {
+		metric := storage.GetMetaMetric(id)
+		if metric == nil {
+			return duckstore.NewError(duckstore.ErrCodeUnknownMetric,
+				"metric %d is absent from the journal", id)
+		}
+		if !duckstore.TagLayoutsEqual(duckstore.TagLayoutKinds(metric), base.TagLayout.Kinds) {
+			return duckstore.NewError(duckstore.ErrCodeMetadataMismatch,
+				"tag layout of metric %d disagrees with the journal at version %d: refusing to reinterpret rows",
+				id, base.MetricVersion)
+		}
+	}
+	return nil
 }
 
-func (stubStoreQueryExecutor) QueryTagValues(ctx context.Context, args tlstatshouse.StoreQueryTagValues) (tlstatshouse.StoreTagValuesResponse, error) {
-	return tlstatshouse.StoreTagValuesResponse{}, duckstore.NewError(duckstore.ErrCodeInternal, "store query rendering is not implemented in this build")
+// addressedMetricIDs returns the metric ids a store query reads: its explicit
+// metric_id, else the members of its metric_in list. A query that only
+// excludes metrics (metric_not_in alone) addresses none in particular.
+func addressedMetricIDs(base tlstatshouse.StoreQueryBase) []int32 {
+	if base.MetricId != 0 {
+		return []int32{base.MetricId}
+	}
+	var ids []int32
+	if base.IsSetMetricIn() {
+		for _, id := range base.MetricIn {
+			if id != 0 {
+				ids = append(ids, id)
+			}
+		}
+	}
+	return ids
 }
 
 // storeQueryServerConfig configures the query listener.

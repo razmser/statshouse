@@ -411,7 +411,7 @@ func MakeAggregator(fj *os.File, fjCompact *os.File, mappingsCache *pcache.Mappi
 				Concurrency: a.config.DuckQueryConcurrency,
 				CryptoKeys:  []string{aesPwd},
 				Logf:        log.Printf,
-			}, duck.QueryExecutor())
+			}, duck.QueryExecutor(a.metricStorage, a.shardKey))
 		}
 	}
 

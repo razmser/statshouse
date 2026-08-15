@@ -16,7 +16,9 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/VKCOM/statshouse/internal/data_model/gen2/tlstatshouse"
 	"github.com/VKCOM/statshouse/internal/duckstore"
+	"github.com/VKCOM/statshouse/internal/metajournal"
 )
 
 // openDuckStore opens the shard's duck-store and starts its single writer and
@@ -66,11 +68,37 @@ type duckStore struct {
 
 func (d *duckStore) NewSink() InsertSink { return newDuckSink(d.writer) }
 
-// QueryExecutor serves the two structured store-query verbs. The series and
-// tag-values renderers arrive with the next tasks; until then the stub
-// answers internal, keeping the listener's admission and cancellation
-// behaviour exercisable end-to-end.
-func (d *duckStore) QueryExecutor() storeQueryExecutor { return stubStoreQueryExecutor{} }
+// QueryExecutor serves the two structured store-query verbs: journal
+// validation first (unknown_metric, metadata_mismatch), then the renderer.
+// storage is the aggregator's metrics journal and shardNum the shard's own
+// 1-based number — the same convention ClickHouse's _shard_num column uses —
+// which the series response answers its shard-tag column from.
+func (d *duckStore) QueryExecutor(storage *metajournal.MetricsStorage, shardNum int32) storeQueryExecutor {
+	return &duckQueryExecutor{store: d.store, storage: storage, shardNum: shardNum}
+}
+
+// duckQueryExecutor renders store queries against the shard's store behind
+// the aggregator's journal validation, so no query reaches storage under a
+// tag layout the journal disagrees with.
+type duckQueryExecutor struct {
+	store    *duckstore.Store
+	storage  *metajournal.MetricsStorage
+	shardNum int32
+}
+
+func (e *duckQueryExecutor) QuerySeries(ctx context.Context, args tlstatshouse.StoreQuerySeries) (tlstatshouse.StoreSeriesResponse, error) {
+	if err := validateStoreQueryMetadata(ctx, e.storage, args.Base); err != nil {
+		return tlstatshouse.StoreSeriesResponse{}, err
+	}
+	return e.store.RenderSeries(ctx, e.shardNum, args)
+}
+
+func (e *duckQueryExecutor) QueryTagValues(ctx context.Context, args tlstatshouse.StoreQueryTagValues) (tlstatshouse.StoreTagValuesResponse, error) {
+	if err := validateStoreQueryMetadata(ctx, e.storage, args.Base); err != nil {
+		return tlstatshouse.StoreTagValuesResponse{}, err
+	}
+	return e.store.RenderTagValues(ctx, args)
+}
 
 // Close stops the retainer and the writer before releasing the store, so the
 // appenders' dedicated connection is never closed underneath a live writer.

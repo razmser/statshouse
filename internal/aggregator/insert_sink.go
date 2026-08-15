@@ -18,6 +18,7 @@ import (
 	"github.com/VKCOM/statshouse/internal/chutil"
 	"github.com/VKCOM/statshouse/internal/data_model"
 	"github.com/VKCOM/statshouse/internal/format"
+	"github.com/VKCOM/statshouse/internal/metajournal"
 	"github.com/VKCOM/statshouse/internal/vkgo/kittenhouseclient/rowbinary"
 )
 
@@ -74,7 +75,10 @@ type InsertSink interface {
 // config validation and the handle stays nil.
 type duckStoreHandle interface {
 	NewSink() InsertSink
-	QueryExecutor() storeQueryExecutor
+	// QueryExecutor serves the store query listener from the shard's store,
+	// validating requests against the metrics journal and answering with this
+	// shard's number.
+	QueryExecutor(storage *metajournal.MetricsStorage, shardNum int32) storeQueryExecutor
 	Close() error
 }
 

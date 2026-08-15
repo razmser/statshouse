@@ -50,14 +50,6 @@ const MaxSeriesRowLimit = 1_000_000
 // tests can shrink it; production leaves it alone.
 var seriesBatchTargetBytes = 10_000_000
 
-// The tag-layout kinds of statshouse.storeTagLayout, mirroring how the API
-// resolved each tag from its journal.
-const (
-	tagKindMapped = int32(0)
-	tagKindRaw32  = int32(1)
-	tagKindRaw64  = int32(2)
-)
-
 // monthLodStep is the one step with a genuine timezone dependency: calendar
 // months. Every other step truncates by integer arithmetic against
 // utc_offset. The value is data_model's _1M: 31 days of seconds.
@@ -104,16 +96,67 @@ type byCol struct {
 	stagAlias string
 }
 
-// seriesPlan is the validated, tier-resolved form of one storeQuerySeries:
-// everything about the request that does not depend on which store files the
-// query ends up reading.
-type seriesPlan struct {
-	args     tlstatshouse.StoreQuerySeries
+// storeQueryPlan is the validated, tier-resolved form of one StoreQueryBase:
+// the parts of a request that do not depend on which store files the query
+// ends up reading. Both renderers build on it.
+type storeQueryPlan struct {
+	base     tlstatshouse.StoreQueryBase
 	tier     string
 	table    string
 	from     int64
 	to       int64
 	rowLimit int
+}
+
+// planStoreQuery validates the request base every store query shares and
+// resolves its tier. Every malformed base fails as bad_request, naming what
+// was wrong.
+func planStoreQuery(base tlstatshouse.StoreQueryBase) (*storeQueryPlan, error) {
+	lod := base.Lod
+	p := &storeQueryPlan{base: base, from: lod.FromSec, to: lod.ToSec}
+
+	tier, known := lodStepTiers[lod.StepSec]
+	if lod.StepSec <= 0 || !known {
+		return nil, NewError(ErrCodeBadRequest, "step_sec %d is not a LOD step", lod.StepSec)
+	}
+	p.tier, p.table = tier, TierTable(tier)
+
+	// an absent or oversized row limit takes the shard cap
+	p.rowLimit = int(base.RowLimit)
+	if p.rowLimit <= 0 || p.rowLimit > MaxSeriesRowLimit {
+		p.rowLimit = MaxSeriesRowLimit
+	}
+
+	kinds := base.TagLayout.Kinds
+	if len(kinds) > format.MaxTags {
+		return nil, NewError(ErrCodeBadRequest, "tag layout holds %d kinds, more than the %d tags stored", len(kinds), format.MaxTags)
+	}
+	for i, k := range kinds {
+		if k != tagKindMapped && k != tagKindRaw32 && k != tagKindRaw64 {
+			return nil, NewError(ErrCodeBadRequest, "tag layout kind %d at index %d is not mapped, raw32 or raw64", k, i)
+		}
+	}
+	return p, nil
+}
+
+// layoutIndex resolves one tag reference against the request's layout. The
+// string top's flag alias names slot StringTopTagIndexV3, exactly as the
+// ClickHouse builder's colIntV3 does; anything else outside the layout is a
+// bad_request naming the offending reference.
+func (p *storeQueryPlan) layoutIndex(x int32, what string) (int32, error) {
+	if x == format.StringTopTagIndex {
+		x = format.StringTopTagIndexV3
+	}
+	if x < 0 || int(x) >= format.MaxTags || int(x) >= len(p.base.TagLayout.Kinds) {
+		return 0, NewError(ErrCodeBadRequest, "%s tag %d is outside the tag layout of %d kinds", what, x, len(p.base.TagLayout.Kinds))
+	}
+	return x, nil
+}
+
+// seriesPlan is the validated form of one storeQuerySeries on top of its base.
+type seriesPlan struct {
+	*storeQueryPlan
+	args     tlstatshouse.StoreQuerySeries
 	monthLod bool
 	order    string // "", "ASC" or "DESC"
 	whatMax  bool   // `what` includes max: max_host rides max, else max_count
@@ -121,29 +164,17 @@ type seriesPlan struct {
 	by       []byCol
 }
 
-// planSeriesQuery validates the request and resolves its tier and columns.
-// Every malformed request fails as bad_request, naming what was wrong.
+// planSeriesQuery validates the request and resolves its columns.
 func planSeriesQuery(args tlstatshouse.StoreQuerySeries) (*seriesPlan, error) {
-	base := args.Base
-	lod := base.Lod
-	p := &seriesPlan{args: args, from: lod.FromSec, to: lod.ToSec}
-
-	tier, known := lodStepTiers[lod.StepSec]
-	if lod.StepSec <= 0 || !known {
-		return nil, NewError(ErrCodeBadRequest, "step_sec %d is not a LOD step", lod.StepSec)
+	base, err := planStoreQuery(args.Base)
+	if err != nil {
+		return nil, err
 	}
-	p.tier, p.table = tier, TierTable(tier)
-	p.monthLod = lod.StepSec == monthLodStep
-	if p.monthLod {
-		if _, err := time.LoadLocation(lod.Location); err != nil {
-			return nil, NewError(ErrCodeBadRequest, "location %q is not an IANA time zone: %v", lod.Location, err)
+	p := &seriesPlan{storeQueryPlan: base, args: args}
+	if p.monthLod = args.Base.Lod.StepSec == monthLodStep; p.monthLod {
+		if _, err := time.LoadLocation(args.Base.Lod.Location); err != nil {
+			return nil, NewError(ErrCodeBadRequest, "location %q is not an IANA time zone: %v", args.Base.Lod.Location, err)
 		}
-	}
-
-	// an absent or oversized row limit takes the shard cap
-	p.rowLimit = int(base.RowLimit)
-	if p.rowLimit <= 0 || p.rowLimit > MaxSeriesRowLimit {
-		p.rowLimit = MaxSeriesRowLimit
 	}
 
 	desc, asc := args.IsSetSortDesc(), args.IsSetSortAsc()
@@ -183,23 +214,15 @@ func planSeriesQuery(args tlstatshouse.StoreQuerySeries) (*seriesPlan, error) {
 	p.cols.minHost = args.IsSetMinHost()
 	p.cols.maxHost = args.IsSetMaxHost()
 
-	kinds := base.TagLayout.Kinds
-	if len(kinds) > format.MaxTags {
-		return nil, NewError(ErrCodeBadRequest, "tag layout holds %d kinds, more than the %d tags stored", len(kinds), format.MaxTags)
-	}
-	for i, k := range kinds {
-		if k != tagKindMapped && k != tagKindRaw32 && k != tagKindRaw64 {
-			return nil, NewError(ErrCodeBadRequest, "tag layout kind %d at index %d is not mapped, raw32 or raw64", k, i)
-		}
-	}
-
-	for _, x := range args.By {
-		if x == format.ShardTagIndex {
-			p.by = append(p.by, byCol{index: x})
+	kinds := p.base.TagLayout.Kinds
+	for _, ref := range args.By {
+		if ref == format.ShardTagIndex {
+			p.by = append(p.by, byCol{index: ref})
 			continue
 		}
-		if x < 0 || int(x) >= format.MaxTags || int(x) >= len(kinds) {
-			return nil, NewError(ErrCodeBadRequest, "by tag %d is outside the tag layout of %d kinds", x, len(kinds))
+		x, err := p.layoutIndex(ref, "by")
+		if err != nil {
+			return nil, err
 		}
 		bc := byCol{
 			index:     x,
@@ -252,7 +275,7 @@ func buildSeriesSQL(p *seriesPlan, sources []string) (*seriesQuerySQL, error) {
 		args = append(args, v)
 		return fmt.Sprintf("$%d", len(args))
 	}
-	base := p.args.Base
+	base := p.base
 	lod := base.Lod
 
 	var sel []string
@@ -377,8 +400,8 @@ func buildSeriesSQL(p *seriesPlan, sources []string) (*seriesQuerySQL, error) {
 // where renders the metric predicate and every tag filter, mirroring the
 // ClickHouse builder: within one filter the mapped/values/empty/re2 arms are
 // OR-ed for an IN filter and AND-ed (each arm negated) for a NOT IN filter.
-func (p *seriesPlan) where(param func(any) string) (string, error) {
-	base := p.args.Base
+func (p *storeQueryPlan) where(param func(any) string) (string, error) {
+	base := p.base
 	var preds []string
 
 	hasIn := base.IsSetMetricIn() && len(base.MetricIn) > 0
@@ -413,30 +436,31 @@ func (p *seriesPlan) where(param func(any) string) (string, error) {
 
 // tagFilterPred renders one storeTagFilter into a parenthesized predicate, or
 // "" for a filter with no arms at all (the builder's Empty() skip).
-func (p *seriesPlan) tagFilterPred(f tlstatshouse.StoreTagFilter, in bool, param func(any) string) (string, error) {
-	kinds := p.args.Base.TagLayout.Kinds
-	if f.TagIndex < 0 || int(f.TagIndex) >= format.MaxTags || int(f.TagIndex) >= len(kinds) {
-		return "", NewError(ErrCodeBadRequest, "filter on tag %d is outside the tag layout of %d kinds", f.TagIndex, len(kinds))
+func (p *storeQueryPlan) tagFilterPred(f tlstatshouse.StoreTagFilter, in bool, param func(any) string) (string, error) {
+	x, err := p.layoutIndex(f.TagIndex, "filter on")
+	if err != nil {
+		return "", err
 	}
-	tagCol := fmt.Sprintf("tag%d", f.TagIndex)
-	stagCol := fmt.Sprintf("stag%d", f.TagIndex)
+	kinds := p.base.TagLayout.Kinds
+	tagCol := fmt.Sprintf("tag%d", x)
+	stagCol := fmt.Sprintf("stag%d", x)
 	valueExpr := tagCol + "::BIGINT"
-	if kinds[f.TagIndex] == tagKindRaw64 {
-		if int(f.TagIndex)+1 >= format.MaxTags || int(f.TagIndex)+1 >= len(kinds) {
-			return "", NewError(ErrCodeBadRequest, "raw64 filter on tag %d has no high half in the tag layout", f.TagIndex)
+	if kinds[x] == tagKindRaw64 {
+		if int(x)+1 >= format.MaxTags || int(x)+1 >= len(kinds) {
+			return "", NewError(ErrCodeBadRequest, "raw64 filter on tag %d has no high half in the tag layout", x)
 		}
-		valueExpr = raw64ValueExpr(f.TagIndex)
+		valueExpr = raw64ValueExpr(x)
 	}
 
 	var arms []string
 	if f.IsSetMapped() && len(f.Mapped) > 0 {
-		if kinds[f.TagIndex] == tagKindRaw64 {
+		if kinds[x] == tagKindRaw64 {
 			arms = append(arms, valueExpr+" = ANY("+param(f.Mapped)+")")
 		} else {
 			arms = append(arms, "list_contains("+param(f.Mapped)+", "+tagCol+"::BIGINT)")
 		}
 	}
-	if kinds[f.TagIndex] == tagKindMapped {
+	if kinds[x] == tagKindMapped {
 		// the string half exists only for a mapped tag; a raw tag's stag
 		// column is unused and these arms are skipped, exactly as the
 		// ClickHouse builder skips them for raw tags
@@ -486,11 +510,37 @@ func (s *Store) RenderSeries(ctx context.Context, shardNum int32, args tlstatsho
 	if err != nil {
 		return tlstatshouse.StoreSeriesResponse{}, err
 	}
+	var resp tlstatshouse.StoreSeriesResponse
+	err = s.withQuerySources(ctx, p.tier, p.from, p.to, func(ctx context.Context, conn *sql.Conn, sources []string) error {
+		q, err := buildSeriesSQL(p, sources)
+		if err != nil {
+			return err
+		}
+		rows, err := conn.QueryContext(ctx, q.sql, q.args...)
+		if err != nil {
+			return fmt.Errorf("duck-store: series query: %w", err)
+		}
+		defer rows.Close()
+		resp, err = scanSeriesRows(rows, p, shardNum)
+		return err
+	})
+	if err != nil {
+		return tlstatshouse.StoreSeriesResponse{}, err
+	}
+	return resp, nil
+}
 
-	// Sources: the active delta plus every served archive window of the tier
-	// overlapping the range, each leased so retention cannot unlink it under
-	// the read. A window whose lease comes back nil was dropped in between
-	// and is simply absent, the same as under ClickHouse after a TTL pass.
+// withQuerySources gathers everything one store query reads — the active
+// delta generation plus every served archive window of the tier overlapping
+// the range — and runs read against them: the delta's connection with one
+// source qualifier per file ("" for the delta itself, a unique alias per
+// attached window). Windows are leased so retention cannot unlink them under
+// the read — a window whose lease comes back nil was dropped in between and
+// is simply absent, the same as under ClickHouse after a TTL pass — attached
+// read-only on demand and detached again after the read: keeping them
+// attached buys latency that is not needed and costs resident memory that
+// is.
+func (s *Store) withQuerySources(ctx context.Context, tier string, from, to int64, read func(ctx context.Context, conn *sql.Conn, sources []string) error) error {
 	type queryWindow struct {
 		alias string
 		path  string
@@ -498,7 +548,7 @@ func (s *Store) RenderSeries(ctx context.Context, shardNum int32, args tlstatsho
 	}
 	var wins []queryWindow
 	for _, wf := range s.Windows() {
-		if wf.Tier != p.tier || wf.WindowStart >= p.to || wf.WindowStart+tierWindowSecs[p.tier] <= p.from {
+		if wf.Tier != tier || wf.WindowStart >= to || wf.WindowStart+tierWindowSecs[tier] <= from {
 			continue
 		}
 		l := s.AcquireWindowLease(wf.Tier, wf.WindowStart)
@@ -521,18 +571,17 @@ func (s *Store) RenderSeries(ctx context.Context, shardNum int32, args tlstatsho
 
 	conn, err := s.deltaConn(ctx)
 	if err != nil {
-		return tlstatshouse.StoreSeriesResponse{}, fmt.Errorf("duck-store: series query connection: %w", err)
+		return fmt.Errorf("duck-store: store query connection: %w", err)
 	}
 	defer conn.Close()
 
-	// Attach on demand, alias unique to this query, and detach again after
-	// the read: keeping windows attached buys latency that is not needed and
-	// costs resident memory that is.
+	// The alias is unique to this query, so two concurrent queries attaching
+	// windows to the shared delta instance never collide on a name.
 	seq := queryAliasSeq.Add(1)
 	for i := range wins {
 		alias := fmt.Sprintf("q%d_a%d", seq, i)
 		if _, err := conn.ExecContext(ctx, fmt.Sprintf("ATTACH %s AS %s (READ_ONLY)", sqlString(wins[i].path), alias)); err != nil {
-			return tlstatshouse.StoreSeriesResponse{}, fmt.Errorf("duck-store: attach %s for series query: %w", wins[i].path, err)
+			return fmt.Errorf("duck-store: attach %s for store query: %w", wins[i].path, err)
 		}
 		wins[i].alias = alias
 	}
@@ -549,16 +598,7 @@ func (s *Store) RenderSeries(ctx context.Context, shardNum int32, args tlstatsho
 	for i := range wins {
 		sources = append(sources, wins[i].alias)
 	}
-	q, err := buildSeriesSQL(p, sources)
-	if err != nil {
-		return tlstatshouse.StoreSeriesResponse{}, err
-	}
-	rows, err := conn.QueryContext(ctx, q.sql, q.args...)
-	if err != nil {
-		return tlstatshouse.StoreSeriesResponse{}, fmt.Errorf("duck-store: series query: %w", err)
-	}
-	defer rows.Close()
-	return scanSeriesRows(rows, p, shardNum)
+	return read(ctx, conn, sources)
 }
 
 // deltaConn checks a connection out of the active delta generation's pool. A
