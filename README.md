@@ -53,6 +53,18 @@ so please check our earlier documents as well:
 - [Internals](./docs/internals.ru.md) (in Russian)
 - [Protocol and data format](./docs/protocol.md)
 - [PromQL implementation notes](./docs/promql.ru.md) (in Russian)
+- [duck-store operator guide](./docs/duck-store.md)
+
+## Storage backends
+
+By default, StatsHouse stores metric data in a ClickHouse cluster. As an
+alternative for small installations, `statshouse-agg` can embed DuckDB as a
+second storage backend, selected per process with `--storage-backend=duck`
+(the aggregator must be built with the `duckdb` build tag, see
+`make build-agg-duckdb`; `statshouse-api` reads it by fanning queries out to
+the aggregator shards via `--duck-shard-query-addrs`). ClickHouse support is
+unchanged. See the [duck-store operator guide](./docs/duck-store.md) for the
+flags, retention, disk sizing and operational limits.
 
 ## Presentations
 
