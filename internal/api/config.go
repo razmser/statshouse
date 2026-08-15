@@ -49,6 +49,15 @@ type Config struct {
 	// and is deliberately not gated on duckstore.Available.
 	StorageBackend duckstore.StorageBackend
 
+	// DuckShardQueryAddrsStr lists the per-shard store-query addresses of the
+	// aggregator shards, as "shard=host:port" pairs — the shard set the duck
+	// backend fans every query out over. Shard numbers are 1-based and must
+	// match the aggregator cluster's own numbering.
+	DuckShardQueryAddrsStr string
+	// DuckShardQueryAddrs is DuckShardQueryAddrsStr parsed: shard number →
+	// store-query address.
+	DuckShardQueryAddrs map[uint32]string
+
 	chutil.RateLimitConfig
 }
 
@@ -97,6 +106,14 @@ func (argv *Config) ValidateConfig() error {
 		}
 		argv.AvailableShards = shards
 	}
+	argv.DuckShardQueryAddrs = nil
+	if argv.DuckShardQueryAddrsStr != "" {
+		addrs, err := parseDuckShardQueryAddrs(argv.DuckShardQueryAddrsStr)
+		if err != nil {
+			return err
+		}
+		argv.DuckShardQueryAddrs = addrs
+	}
 	argv.ReplicaThrottleCfg = nil
 	if argv.ReplicaThrottleCfgStr != "" {
 		var throttleConfig chutil.ReplicaThrottleConfig
@@ -144,6 +161,8 @@ func (argv *Config) Bind(f *flag.FlagSet, defaultI config.Config) {
 	f.IntVar(&argv.HardwareMetricResolution, "hardware-metric-resolution", default_.HardwareMetricResolution, "Statshouse hardware metric resolution")
 	f.IntVar(&argv.HardwareSlowMetricResolution, "hardware-slow-metric-resolution", default_.HardwareSlowMetricResolution, "Statshouse slow hardware metric resolution")
 	f.Var(&argv.StorageBackend, "storage-backend", "storage backend to query: \"clickhouse\" (default) or \"duck\" (aggregator shards over the structured query RPC)")
+	f.StringVar(&argv.DuckShardQueryAddrsStr, "duck-shard-query-addrs", default_.DuckShardQueryAddrsStr,
+		"per-shard store-query addresses of the aggregator shards under the duck backend, as comma-separated shard=host:port pairs with 1-based shard numbers")
 
 	f.BoolVar(&argv.RateLimitDisable, "rate-limit-disable", default_.RateLimitDisable, "disable rate limiting")
 	f.DurationVar(&argv.WindowDuration, "rate-limit-window-duration", default_.WindowDuration, "time window for analyzing ClickHouse requests")
@@ -269,4 +288,34 @@ func parseShardKeys(shardsStr string) ([]uint32, error) {
 		shards = append(shards, uint32(shard))
 	}
 	return shards, nil
+}
+
+// parseDuckShardQueryAddrs parses --duck-shard-query-addrs: comma-separated
+// "shard=host:port" pairs with 1-based shard numbers. An empty address or a
+// repeated shard is a configuration error naming the offending pair.
+func parseDuckShardQueryAddrs(s string) (map[uint32]string, error) {
+	addrs := make(map[uint32]string)
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		shardStr, addr, found := strings.Cut(part, "=")
+		if !found {
+			return nil, fmt.Errorf("invalid --duck-shard-query-addrs entry %q: expected shard=host:port", part)
+		}
+		shard, err := strconv.ParseUint(strings.TrimSpace(shardStr), 10, 32)
+		if err != nil || shard == 0 {
+			return nil, fmt.Errorf("invalid --duck-shard-query-addrs entry %q: shard must be a positive number", part)
+		}
+		addr = strings.TrimSpace(addr)
+		if addr == "" {
+			return nil, fmt.Errorf("invalid --duck-shard-query-addrs entry %q: address is empty", part)
+		}
+		if _, exists := addrs[uint32(shard)]; exists {
+			return nil, fmt.Errorf("invalid --duck-shard-query-addrs entry %q: shard %d is listed twice", part, shard)
+		}
+		addrs[uint32(shard)] = addr
+	}
+	return addrs, nil
 }

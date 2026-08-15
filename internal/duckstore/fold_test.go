@@ -42,7 +42,7 @@ func uniqState(t *testing.T, values ...uint64) []byte {
 // decodePct is the fold result read back the way a query reply decodes it.
 func decodePct(t *testing.T, b []byte) *tdigest.TDigest {
 	t.Helper()
-	td, err := decodeTDigestState(b)
+	td, err := DecodeTDigestState(b)
 	require.NoError(t, err)
 	return td
 }

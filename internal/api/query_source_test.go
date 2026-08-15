@@ -201,11 +201,11 @@ func TestCHQuerySourceSeriesSQLMatchesPreSeamBuilder(t *testing.T) {
 				by:     []int{1},
 			},
 			lod: data_model.LOD{
-				FromSec: 1000,
-				ToSec:   2000,
-				StepSec: _1s,
-				Version: Version6,
-				Metric:  format.BuiltinMetricMetaContributorsLog,
+				FromSec:  1000,
+				ToSec:    2000,
+				StepSec:  _1s,
+				Version:  Version6,
+				Metric:   format.BuiltinMetricMetaContributorsLog,
 				Location: location,
 			},
 			golden: `SELECT toInt64(toStartOfInterval(time+0,INTERVAL 1 second))-0 AS _time,tag1,stag1 FROM statshouse_v6_1s_dist WHERE time>=1000 AND time<2000 AND index_type=0 AND pre_tag=0 AND pre_stag='' AND metric=-61 GROUP BY _time,tag1,stag1 LIMIT 10000000 SETTINGS optimize_aggregation_in_order=1`,
@@ -493,9 +493,9 @@ func TestLoadPointsRoutesThroughQuerySource(t *testing.T) {
 		querySource:    fake,
 	}}
 	pq := &queryBuilder{
-		user: "test-user",
+		user:   "test-user",
 		metric: metric,
-		what:  tsWhat{data_model.DigestSelector{What: data_model.DigestCount}},
+		what:   tsWhat{data_model.DigestSelector{What: data_model.DigestCount}},
 	}
 	lod := data_model.LOD{FromSec: 1000, ToSec: 1010, StepSec: 5, Version: Version6, Metric: metric, Location: location}
 	fake.seriesRows = []tsSelectRow{
@@ -617,11 +617,21 @@ func TestInvalidateCacheThroughQuerySource(t *testing.T) {
 }
 
 func TestNewQuerySourceSelection(t *testing.T) {
-	require.Equal(t, chQuerySource{}, newQuerySource(duckstore.BackendClickHouse))
+	require.Equal(t, chQuerySource{}, newQuerySource(duckstore.BackendClickHouse, nil, nil))
 
-	duck := newQuerySource(duckstore.BackendDuck)
+	duck := newQuerySource(duckstore.BackendDuck, nil, nil)
 	require.ErrorIs(t, duck.querySeries(context.Background(), nil, &seriesDataQuery{}, data_model.LOD{}, func(tsSelectRow) error { return nil }), errDuckQuerySourcePending)
 	require.ErrorIs(t, duck.queryTagValues(context.Background(), nil, &tagValuesDataQuery{}, data_model.LOD{}, func(selectRow) error { return nil }), errDuckQuerySourcePending)
+
+	// duck with shard addresses builds the fan-out source, sorted by shard
+	// number, with the shard-set modulus derived from them
+	src := newQuerySource(duckstore.BackendDuck, map[uint32]string{3: "s3:9099", 1: "s1:9099"}, nil)
+	fan, ok := src.(*duckQuerySource)
+	require.True(t, ok)
+	require.Len(t, fan.clients, 2)
+	require.Equal(t, uint32(1), fan.clients[0].shardNum())
+	require.Equal(t, uint32(3), fan.clients[1].shardNum())
+	require.Equal(t, 3, fan.numShards)
 
 	// handlers without a configured source fall back to ClickHouse
 	require.Equal(t, chQuerySource{}, (&requestHandler{}).querySource())

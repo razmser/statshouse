@@ -42,7 +42,7 @@ func foldPercentiles(blobs [][]byte) ([]byte, error) {
 	}
 	var merged *tdigest.TDigest
 	for _, b := range blobs {
-		td, err := decodeTDigestState(b)
+		td, err := DecodeTDigestState(b)
 		if err != nil {
 			return nil, err
 		}
@@ -86,11 +86,12 @@ func foldUniques(blobs [][]byte) ([]byte, error) {
 	return u.MarshallAppend(nil), nil
 }
 
-// decodeTDigestState decodes one quantilesTDigest state blob into a digest —
+// DecodeTDigestState decodes one quantilesTDigest state blob into a digest —
 // the same wire format ColTDigest decodes: a uvarint centroid count, then per
 // centroid a float32 LE mean and a float32 LE weight. nil (without error)
-// means the blob holds no state.
-func decodeTDigestState(b []byte) (*tdigest.TDigest, error) {
+// means the blob holds no state. Exported because the API's duck query source
+// decodes the very same blobs out of store query responses.
+func DecodeTDigestState(b []byte) (*tdigest.TDigest, error) {
 	if len(b) == 0 {
 		return nil, nil
 	}

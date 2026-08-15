@@ -621,7 +621,7 @@ func NewHandler(staticDir fs.FS, jsSettings JSSettings, showInvisible bool, chV2
 		mappingsStorage:       mappingsStorage,
 		mappingsTracker:       mappingsTracker,
 		ch:                    chV2,
-		querySource:           newQuerySource(cfg.StorageBackend),
+		querySource:           newQuerySource(cfg.StorageBackend, cfg.DuckShardQueryAddrs, metricStorage),
 		metricsStorage:        metricStorage,
 		selectSettings:        cfg.BuildSelectSettings(),
 		blockedMetricPrefixes: cfg.BlockedMetricPrefixes,

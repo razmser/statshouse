@@ -38,12 +38,6 @@ import (
 // SQL text: DuckDB rejects ClickHouse's backslash escaping outright, so there
 // is no transliteration of the existing escaping to fall back on.
 
-// MaxSeriesRowLimit is the per-shard cap on the rows one series query may
-// produce: the default when a request asks for none and the ceiling when it
-// asks for more (≈67 MB of materialized DuckDB result at the measured
-// 67 B/row, the number the 256 MB memory limit is sized against).
-const MaxSeriesRowLimit = 1_000_000
-
 // seriesBatchTargetBytes is the target size of one storeSeriesBatch. It
 // matches the API transport's chunk size, because a batch is the unit a
 // future streaming RPC would emit one at a time. It is a variable only so

@@ -64,10 +64,14 @@ type tagValuesDataQuery struct {
 }
 
 // newQuerySource picks the QuerySource for the configured storage backend.
-func newQuerySource(backend duckstore.StorageBackend) QuerySource {
+// The duck backend needs the per-shard query addresses (and the metrics
+// journal for its mismatch retry); selected without them it stays in the
+// pending state, which reports per query that the backend is not servable.
+func newQuerySource(backend duckstore.StorageBackend, duckAddrs map[uint32]string, journal metricsStorageRef) QuerySource {
 	if backend == duckstore.BackendDuck {
-		// Replaced by the fan-out implementation over the structured query
-		// RPC; until then duck is selected but not yet servable.
+		if src := newDuckQuerySource(duckAddrs, journal); src != nil {
+			return src
+		}
 		return duckQuerySourcePending{}
 	}
 	return chQuerySource{}

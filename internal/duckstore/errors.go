@@ -21,6 +21,14 @@ import (
 //
 // "Shard down" is deliberately absent: it is a client-side classification of
 // a dial or connection failure, not something a shard can report about itself.
+// MaxSeriesRowLimit is the per-shard cap on the rows one series query may
+// produce: the default when a request asks for none and the ceiling when it
+// asks for more (≈67 MB of materialized DuckDB result at the measured
+// 67 B/row, the number the 256 MB memory limit is sized against). The API's
+// fan-out enforces the same number globally after merging shards, so the
+// constant lives in this untagged contract file where both sides see it.
+const MaxSeriesRowLimit = 1_000_000
+
 const (
 	// ErrCodeBadRequest marks a malformed request; never retry.
 	ErrCodeBadRequest int32 = -5100

@@ -171,7 +171,7 @@ func decodeRows(t *testing.T, rows []rawRow) map[decodedKey]*decodedGroup {
 				g.maxCountHost, g.maxCountHostVal = hp, r.maxCount
 			}
 		}
-		if td, err := decodeTDigestState(r.percentiles); err != nil {
+		if td, err := DecodeTDigestState(r.percentiles); err != nil {
 			t.Fatalf("decode percentiles of metric %d: %v", r.metric, err)
 		} else if td != nil {
 			if d := digests[k]; d == nil {
