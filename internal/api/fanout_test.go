@@ -10,11 +10,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"slices"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/VKCOM/tl/pkg/rpc"
 	"github.com/hrissan/tdigest"
 	"github.com/stretchr/testify/require"
 
@@ -818,4 +820,57 @@ func TestFanoutMergeDeterminism(t *testing.T) {
 	distinct, err := mergeShardRows([][]tsSelectRow{{a}, {b}}, fanoutRowCap)
 	require.NoError(t, err)
 	require.Len(t, distinct, 2)
+}
+
+// TestRPCStoreShardClientCryptoKey proves the fan-out client presents the
+// configured RPC crypto key at the handshake: a store-query server that
+// requires the key answers a client built with the same key, and refuses one
+// built with a different key. The api and the aggregator run in different
+// containers in production, so the nonce exchange requires encryption and a
+// keyless client cannot talk to the shards at all — the exact failure the
+// e2e duck stack would hit without the key threaded through.
+func TestRPCStoreShardClientCryptoKey(t *testing.T) {
+	const serverKey = "test-store-query-crypto-key-00000" // 34 bytes >= rpc.MinCryptoKeyLen (32)
+	startServer := func(t *testing.T) string {
+		t.Helper()
+		h := tlstatshouse.Handler{
+			RawStoreQuerySeries: func(_ context.Context, hctx *rpc.HandlerContext) error {
+				var args tlstatshouse.StoreQuerySeries
+				if _, err := args.ReadTL1(hctx.Request); err != nil {
+					return err
+				}
+				var resp tlstatshouse.StoreSeriesResponse
+				hctx.Response, _ = args.WriteResultTL1(hctx.Response, resp)
+				return nil
+			},
+		}
+		srv := rpc.NewServer(rpc.ServerWithCryptoKeys([]string{serverKey}),
+			// production peers sit in different containers, so their nonce
+			// exchange always runs encrypted; force the same on loopback so
+			// the key is actually verified rather than skipped as same-machine
+			rpc.ServerWithForceEncryption(true),
+			rpc.ServerWithLogf(t.Logf),
+			rpc.ServerWithMaxWorkers(8),
+			rpc.ServerWithSyncHandler(h.Handle))
+		ln, err := net.Listen("tcp4", "127.0.0.1:0")
+		require.NoError(t, err)
+		go func() { _ = srv.Serve(ln) }()
+		t.Cleanup(srv.Shutdown)
+		return ln.Addr().String()
+	}
+	addr := startServer(t)
+
+	queryOne := func(key string, timeout time.Duration) error {
+		clients := newRPCStoreShardClients(map[uint32]string{1: addr}, key)
+		require.Len(t, clients, 1)
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		_, err := clients[0].querySeries(ctx, tlstatshouse.StoreQuerySeries{})
+		return err
+	}
+
+	require.NoError(t, queryOne(serverKey, 10*time.Second), "the fan-out client must present the configured key and complete the handshake")
+	// a wrong key fails each handshake attempt; the client retries with
+	// backoff, so a short deadline still proves it can never succeed
+	require.Error(t, queryOne("a-completely-different-key-000000", 2*time.Second), "a client with the wrong key must fail the handshake")
 }

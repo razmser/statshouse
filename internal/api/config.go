@@ -58,6 +58,13 @@ type Config struct {
 	// store-query address.
 	DuckShardQueryAddrs map[uint32]string
 
+	// DuckQueryRPCCryptoKey is the RPC crypto key the fan-out clients present
+	// to the aggregator shards' store-query listeners. Not a flag: the key
+	// already arrives via --rpc-crypto-path, and the command reads that file
+	// and copies the key here, so the same key serves every RPC the process
+	// makes. Empty keeps the transport unencrypted (same-machine peers only).
+	DuckQueryRPCCryptoKey string
+
 	chutil.RateLimitConfig
 }
 

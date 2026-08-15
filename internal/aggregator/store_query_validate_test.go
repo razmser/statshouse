@@ -47,16 +47,16 @@ func validateTestStorage(t *testing.T) *metajournal.MetricsStorage {
 	t.Helper()
 	storage := metajournal.MakeMetricsStorage(func(int32, string) {})
 	applyTestMetric(t, storage, format.MetricMetaValue{
-		Name:      "validate_mapped",
-		MetricID:  validateMetricMapped,
-		Version:   10,
-		Tags:      []format.MetricMetaTag{{}, {}},
+		Name:     "validate_mapped",
+		MetricID: validateMetricMapped,
+		Version:  10,
+		Tags:     []format.MetricMetaTag{{}, {}},
 	})
 	applyTestMetric(t, storage, format.MetricMetaValue{
-		Name:      "validate_raw64",
-		MetricID:  validateMetricRaw64,
-		Version:   11,
-		Tags:      []format.MetricMetaTag{{}, {RawKind: "int64"}, {}},
+		Name:     "validate_raw64",
+		MetricID: validateMetricRaw64,
+		Version:  11,
+		Tags:     []format.MetricMetaTag{{}, {RawKind: "int64"}, {}},
 	})
 	require.Equal(t, []int32{0, 0}, duckstore.TagLayoutKinds(storage.GetMetaMetric(validateMetricMapped)))
 	require.Equal(t, []int32{0, 2, 0}, duckstore.TagLayoutKinds(storage.GetMetaMetric(validateMetricRaw64)),
@@ -146,10 +146,10 @@ func TestValidateStoreQueryMetadataWaitsForJournalVersion(t *testing.T) {
 	// mid-wait, the journal reaches the requested version
 	time.Sleep(200 * time.Millisecond)
 	applyTestMetric(t, storage, format.MetricMetaValue{
-		Name:      "late_metric",
-		MetricID:  validateMetricMapped,
-		Version:   futureVersion,
-		Tags:      []format.MetricMetaTag{{}, {}},
+		Name:     "late_metric",
+		MetricID: validateMetricMapped,
+		Version:  futureVersion,
+		Tags:     []format.MetricMetaTag{{}, {}},
 	})
 
 	select {
@@ -191,4 +191,46 @@ func TestAddressedMetricIDs(t *testing.T) {
 	notIn := validateBase(0, nil, 0)
 	notIn.SetMetricNotIn([]int32{5})
 	require.Empty(t, addressedMetricIDs(notIn))
+}
+
+// Builtin metrics are absent from the journal by construction (their ids are
+// negative and their metadata is compiled into every process), yet their rows
+// land in the store through the same write path and every API query about
+// them — the e2e ledger's __src_ingestion_status, the api healthcheck's
+// __agg_bucket_receive_delay_sec, the cache-invalidation poll's contributors
+// log — must be served, not refused as unknown_metric. Their layout is
+// validated against the registry the API derived its request from.
+func TestValidateStoreQueryMetadataBuiltins(t *testing.T) {
+	storage := validateTestStorage(t) // holds no builtin ids
+
+	for _, id := range []int32{
+		format.BuiltinMetricIDIngestionStatus,
+		format.BuiltinMetricIDAggBucketReceiveDelaySec,
+		format.BuiltinMetricIDContributorsLog,
+	} {
+		builtin, ok := format.BuiltinMetrics[id]
+		require.True(t, ok, "builtin %d must be in the registry", id)
+		// the API derives its layout from the same registry entry, so the
+		// registry's own derivation is exactly what a well-formed request
+		// carries — and it must pass against an empty journal
+		require.NoError(t, validateStoreQueryMetadata(context.Background(), storage,
+			validateBase(id, duckstore.TagLayoutKinds(builtin), 0)),
+			"builtin %d (%s) must validate against the registry, not the journal", id, builtin.Name)
+
+		// a layout the registry disagrees with is the same refusal as a user
+		// metric's: rows would be reinterpreted
+		disagree := append([]int32(nil), duckstore.TagLayoutKinds(builtin)...)
+		if len(disagree) == 0 {
+			disagree = []int32{0}
+		}
+		disagree[0] = (disagree[0] + 1) % 3 // a kind the registry did not derive
+		err := validateStoreQueryMetadata(context.Background(), storage,
+			validateBase(id, disagree, 0))
+		requireErrorCode(t, err, duckstore.ErrCodeMetadataMismatch, "builtin layout disagreement")
+	}
+
+	// the metric_in arm carries builtins too
+	in := validateBase(0, duckstore.TagLayoutKinds(format.BuiltinMetricMetaContributorsLog), 0)
+	in.SetMetricIn([]int32{format.BuiltinMetricIDContributorsLog})
+	require.NoError(t, validateStoreQueryMetadata(context.Background(), storage, in))
 }

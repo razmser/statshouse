@@ -35,8 +35,8 @@ import (
 	"github.com/VKCOM/statshouse/internal/chutil"
 	"github.com/VKCOM/statshouse/internal/config"
 	"github.com/VKCOM/statshouse/internal/data_model"
-	"github.com/VKCOM/statshouse/internal/duckstore"
 	"github.com/VKCOM/statshouse/internal/data_model/gen2/tlmetadata"
+	"github.com/VKCOM/statshouse/internal/duckstore"
 	"github.com/VKCOM/statshouse/internal/format"
 	"github.com/VKCOM/statshouse/internal/metajournal"
 	"github.com/VKCOM/statshouse/internal/trustedsubnets"
@@ -251,6 +251,10 @@ func run() int {
 	if len(rpcCryptoKeys) > 0 {
 		rpcCryptoKey = rpcCryptoKeys[0]
 	}
+	// The duck fan-out clients dial the aggregator shards' store-query
+	// listeners — cross-process peers, so their handshakes need the same key
+	// the metadata client presents.
+	argv.Config.DuckQueryRPCCryptoKey = rpcCryptoKey
 
 	staticFS := statshouseui.FS()
 	if staticFS == nil {

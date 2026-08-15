@@ -617,15 +617,15 @@ func TestInvalidateCacheThroughQuerySource(t *testing.T) {
 }
 
 func TestNewQuerySourceSelection(t *testing.T) {
-	require.Equal(t, chQuerySource{}, newQuerySource(duckstore.BackendClickHouse, nil, nil))
+	require.Equal(t, chQuerySource{}, newQuerySource(duckstore.BackendClickHouse, nil, "", nil))
 
-	duck := newQuerySource(duckstore.BackendDuck, nil, nil)
+	duck := newQuerySource(duckstore.BackendDuck, nil, "", nil)
 	require.ErrorIs(t, duck.querySeries(context.Background(), nil, &seriesDataQuery{}, data_model.LOD{}, func(tsSelectRow) error { return nil }), errDuckQuerySourcePending)
 	require.ErrorIs(t, duck.queryTagValues(context.Background(), nil, &tagValuesDataQuery{}, data_model.LOD{}, func(selectRow) error { return nil }), errDuckQuerySourcePending)
 
 	// duck with shard addresses builds the fan-out source, sorted by shard
 	// number, with the shard-set modulus derived from them
-	src := newQuerySource(duckstore.BackendDuck, map[uint32]string{3: "s3:9099", 1: "s1:9099"}, nil)
+	src := newQuerySource(duckstore.BackendDuck, map[uint32]string{3: "s3:9099", 1: "s1:9099"}, "", nil)
 	fan, ok := src.(*duckQuerySource)
 	require.True(t, ok)
 	require.Len(t, fan.clients, 2)

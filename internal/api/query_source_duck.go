@@ -58,13 +58,15 @@ type duckQuerySource struct {
 }
 
 // newDuckQuerySource builds the source over the configured per-shard query
-// addresses. An empty address set returns nil: the duck backend is then
-// selected but not servable, which newQuerySource reports per query.
-func newDuckQuerySource(addrs map[uint32]string, journal metricsStorageRef) *duckQuerySource {
+// addresses. cryptoKey is the RPC crypto key presented to every shard's
+// store-query listener (cross-machine handshakes require encryption). An
+// empty address set returns nil: the duck backend is then selected but not
+// servable, which newQuerySource reports per query.
+func newDuckQuerySource(addrs map[uint32]string, cryptoKey string, journal metricsStorageRef) *duckQuerySource {
 	if len(addrs) == 0 {
 		return nil
 	}
-	rpcClients := newRPCStoreShardClients(addrs)
+	rpcClients := newRPCStoreShardClients(addrs, cryptoKey)
 	clients := make([]storeShardClient, len(rpcClients))
 	for i, c := range rpcClients {
 		clients[i] = c

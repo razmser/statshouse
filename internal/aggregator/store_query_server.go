@@ -17,6 +17,7 @@ import (
 
 	"github.com/VKCOM/statshouse/internal/data_model/gen2/tlstatshouse"
 	"github.com/VKCOM/statshouse/internal/duckstore"
+	"github.com/VKCOM/statshouse/internal/format"
 	"github.com/VKCOM/statshouse/internal/metajournal"
 	"github.com/VKCOM/statshouse/internal/vkgo/build"
 )
@@ -89,6 +90,19 @@ func validateStoreQueryMetadata(ctx context.Context, storage *metajournal.Metric
 		}
 	}
 	for _, id := range ids {
+		if builtin, ok := format.BuiltinMetrics[id]; ok {
+			// builtin metrics never live in the journal — every process
+			// carries their metadata compiled in, and their rows land in the
+			// store through the same write path as user metrics'. Their tag
+			// layout is fixed at build time, so the registry is the thing to
+			// validate against; a disagreement is the same refusal as a user
+			// metric's (an API binary built from different sources).
+			if !duckstore.TagLayoutsEqual(duckstore.TagLayoutKinds(builtin), base.TagLayout.Kinds) {
+				return duckstore.NewError(duckstore.ErrCodeMetadataMismatch,
+					"tag layout of builtin metric %d disagrees with the registry: refusing to reinterpret rows", id)
+			}
+			continue
+		}
 		metric := storage.GetMetaMetric(id)
 		if metric == nil {
 			return duckstore.NewError(duckstore.ErrCodeUnknownMetric,

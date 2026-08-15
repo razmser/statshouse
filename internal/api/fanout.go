@@ -57,15 +57,18 @@ type rpcStoreShardClient struct {
 }
 
 // newRPCStoreShardClients builds one client per configured shard, sharing a
-// single rpc connection pool. Clients are returned sorted by shard number —
-// the order the merge relies on for its deterministic tie-breaking.
-func newRPCStoreShardClients(addrs map[uint32]string) []*rpcStoreShardClient {
+// single rpc connection pool. cryptoKey is presented at every handshake: the
+// aggregator's store-query listener sits in another container/process, so the
+// nonce exchange requires encryption and rejects a keyless client. Clients
+// are returned sorted by shard number — the order the merge relies on for
+// its deterministic tie-breaking.
+func newRPCStoreShardClients(addrs map[uint32]string, cryptoKey string) []*rpcStoreShardClient {
 	shards := make([]uint32, 0, len(addrs))
 	for shard := range addrs {
 		shards = append(shards, shard)
 	}
 	sort.Slice(shards, func(i, j int) bool { return shards[i] < shards[j] })
-	rpcClient := rpc.NewClient(rpc.ClientWithProtocolVersion(rpc.LatestProtocolVersion))
+	rpcClient := rpc.NewClient(rpc.ClientWithProtocolVersion(rpc.LatestProtocolVersion), rpc.ClientWithCryptoKey(cryptoKey))
 	clients := make([]*rpcStoreShardClient, len(shards))
 	for i, shard := range shards {
 		clients[i] = &rpcStoreShardClient{
