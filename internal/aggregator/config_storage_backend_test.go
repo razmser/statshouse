@@ -16,7 +16,7 @@ import (
 )
 
 func TestValidateConfigAggregatorStorageBackend(t *testing.T) {
-	c := DefaultConfigAggregator()
+	c := validClickHouseAggConfig()
 	require.Equal(t, duckstore.BackendClickHouse, c.StorageBackend, "clickhouse must be the default backend")
 	require.NoError(t, ValidateConfigAggregator(&c))
 
@@ -28,7 +28,8 @@ func TestValidateConfigAggregatorStorageBackend(t *testing.T) {
 	if duckstore.Available {
 		// A duck shard without a query address is a misconfiguration: the
 		// shard would be a write-only sink no API can read.
-		c.StorageBackend = duckstore.BackendDuck
+		c := validDuckAggConfig()
+		c.DuckQueryAddr = ""
 		err := ValidateConfigAggregator(&c)
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "--duck-query-addr")
@@ -77,7 +78,7 @@ func TestValidateConfigAggregatorDuckQuery(t *testing.T) {
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			c := DefaultConfigAggregator()
+			c := validClickHouseAggConfig()
 			tt.set(&c)
 			err := ValidateConfigAggregator(&c)
 			require.Error(t, err)
@@ -87,7 +88,7 @@ func TestValidateConfigAggregatorDuckQuery(t *testing.T) {
 }
 
 func TestValidateConfigAggregatorDuckRetention(t *testing.T) {
-	c := DefaultConfigAggregator()
+	c := validClickHouseAggConfig()
 	require.Equal(t, duckstore.DefaultRetention1s, c.DuckRetention1s)
 	require.Equal(t, duckstore.DefaultRetention1m, c.DuckRetention1m)
 	require.Equal(t, duckstore.DefaultRetention1h, c.DuckRetention1h)
@@ -121,7 +122,7 @@ func TestValidateConfigAggregatorDuckRetention(t *testing.T) {
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			c := DefaultConfigAggregator()
+			c := validClickHouseAggConfig()
 			tt.set(&c)
 			err := ValidateConfigAggregator(&c)
 			require.Error(t, err)

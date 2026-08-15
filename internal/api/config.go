@@ -114,6 +114,16 @@ func (argv *Config) ValidateConfig() error {
 		}
 		argv.DuckShardQueryAddrs = addrs
 	}
+	if argv.StorageBackend == duckstore.BackendDuck {
+		// Every duck query fans out to the aggregator shards' store-query
+		// listeners; an API without their addresses can serve nothing, so it
+		// must refuse to start rather than return errors per request.
+		if len(argv.DuckShardQueryAddrs) == 0 {
+			return fmt.Errorf("--duck-shard-query-addrs must be set when --storage-backend=duck: every query fans out to the aggregator shards' store-query listeners")
+		}
+	} else if argv.DuckShardQueryAddrsStr != "" {
+		return fmt.Errorf("--duck-shard-query-addrs (%s) is set but --storage-backend is not duck", argv.DuckShardQueryAddrsStr)
+	}
 	argv.ReplicaThrottleCfg = nil
 	if argv.ReplicaThrottleCfgStr != "" {
 		var throttleConfig chutil.ReplicaThrottleConfig

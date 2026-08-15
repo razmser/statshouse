@@ -6,7 +6,10 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"os"
 	"text/template"
+
+	"github.com/VKCOM/statshouse/internal/duckstore"
 )
 
 type SchemaParams struct {
@@ -121,20 +124,32 @@ func (itp IncomingTableParams) tableName() string {
 	return itp.NamePrefix + itp.NamePostfix
 }
 
-func parseParams() (params Params) {
+func parseParams(args []string) (params Params, err error) {
 	var schemaParams SchemaParams
 	var basicTagsN int
 	var stringTags bool
 	var cluster string
 	var partitionHours int
 	var tablesPrefix string
+	var backend duckstore.StorageBackend
 	const incomingPostfix = "incoming"
-	flag.IntVar(&basicTagsN, "basic-tags", 48, "number of basic tags")
-	flag.BoolVar(&stringTags, "string-tags", true, "basic tags can be stored as unmapped strings")
-	flag.IntVar(&partitionHours, "partition-hours", 24, "partition by that many hours")
-	flag.StringVar(&cluster, "cluster", "statlogs2", "clickhouse cluster name")
-	flag.StringVar(&tablesPrefix, "prefix", "statshouse_v6_", "prefix for tables")
-	flag.Parse()
+	f := flag.NewFlagSet("ch-table-gen", flag.ContinueOnError)
+	f.IntVar(&basicTagsN, "basic-tags", 48, "number of basic tags")
+	f.BoolVar(&stringTags, "string-tags", true, "basic tags can be stored as unmapped strings")
+	f.IntVar(&partitionHours, "partition-hours", 24, "partition by that many hours")
+	f.StringVar(&cluster, "cluster", "statlogs2", "clickhouse cluster name")
+	f.StringVar(&tablesPrefix, "prefix", "statshouse_v6_", "prefix for tables")
+	f.Var(&backend, "storage-backend", "storage backend the generated tables are for: \"clickhouse\" (default). \"duck\" is rejected: duck-store creates its own schema on first start and has no ClickHouse tables to generate")
+	if err := f.Parse(args); err != nil {
+		return params, err
+	}
+	// This is ClickHouse-only tooling: it emits the DDL for the ClickHouse
+	// cluster's v6 tables. Invoked against the duck backend it must hard-error
+	// rather than print DDL no duck deployment would execute — under duck the
+	// store owns its schema and creates it on first start.
+	if backend == duckstore.BackendDuck {
+		return params, fmt.Errorf("--storage-backend=duck: the table generator is ClickHouse-only tooling, and duck-store needs no generated tables (its store creates the schema on first start)")
+	}
 
 	schemaParams.BasicTags = make([]int, basicTagsN)
 	for i := 0; i < basicTagsN; i++ {
@@ -219,14 +234,17 @@ func parseParams() (params Params) {
 		},
 	}
 
-	return params
+	return params, nil
 }
 
 //go:embed init-statshouse.go.tmpl resolution-tables.go.tmpl table-schema.go.tmpl table-order.go.tmpl
 var embedTemplates embed.FS
 
 func main() {
-	params := parseParams()
+	params, err := parseParams(os.Args[1:])
+	if err != nil {
+		log.Fatal("failed to parse parameters:", err)
+	}
 
 	tmpl, err := template.ParseFS(embedTemplates, "*.go.tmpl")
 	if err != nil {

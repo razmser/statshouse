@@ -17,6 +17,7 @@ import (
 
 	"github.com/VKCOM/statshouse/internal/chutil"
 	"github.com/VKCOM/statshouse/internal/data_model"
+	"github.com/VKCOM/statshouse/internal/duckstore"
 	"github.com/VKCOM/statshouse/internal/format"
 	"github.com/VKCOM/statshouse/internal/metajournal"
 	"github.com/VKCOM/statshouse/internal/vkgo/kittenhouseclient/rowbinary"
@@ -98,7 +99,33 @@ func MakeMigrationV3Data(mappingStorage *metajournal.MappingsStorage) *Migration
 	}
 }
 
+// migrationV3DuckErr reports the error that must stop the v3-to-v6 migration
+// when it is invoked against the duck backend, or nil when there is nothing
+// to refuse (any non-duck backend, or migration simply not enabled).
+func (a *Aggregator) migrationV3DuckErr() error {
+	if a.config.StorageBackend != duckstore.BackendDuck {
+		return nil
+	}
+	a.configMu.RLock()
+	defer a.configMu.RUnlock()
+	if a.configR.MigrationTimeRange == "" {
+		return nil
+	}
+	return fmt.Errorf("--migration (%s) is ClickHouse-only tooling and must not run against --storage-backend=duck", a.configR.MigrationTimeRange)
+}
+
 func (a *Aggregator) goMigrateV3(cancelCtx context.Context) {
+	if err := a.migrationV3DuckErr(); err != nil {
+		// The v3-to-v6 migration is ClickHouse-only tooling: it reads the v3
+		// ClickHouse tables and writes the v6 ones, and there is no
+		// duck-store counterpart. Invoked against the duck backend it must
+		// hard-error rather than run (startup validation already rejects
+		// --migration with duck; this also covers a remote config enabling it
+		// on a running aggregator).
+		log.Printf("[migration_v3] hard error, refusing to run: %v", err)
+		return
+	}
+
 	// DEPRECATED
 	return
 

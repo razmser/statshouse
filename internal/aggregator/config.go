@@ -288,6 +288,16 @@ func ValidateConfigAggregator(c *ConfigAggregator) error {
 		return fmt.Errorf("--duck-memory-limit (%d) must be > 0", c.DuckMemoryLimit)
 	}
 	if c.StorageBackend == duckstore.BackendDuck {
+		// One backend per process, and every flag the duck backend needs is
+		// required while every ClickHouse-only one is refused, so a wrong
+		// combination fails at startup naming the flags instead of surfacing
+		// as empty dashboards or dead writes later.
+		if c.KHAddr != "" {
+			return fmt.Errorf("--kh (%s) must not be set when --storage-backend=duck: the duck backend owns storage and has no ClickHouse to talk to", c.KHAddr)
+		}
+		if c.DuckStoreDir == "" {
+			return fmt.Errorf("--duck-store-dir must be set when --storage-backend=duck: the shard's delta generations and archive windows live there")
+		}
 		// The store directory is what the store itself needs; the query
 		// address is what makes the shard readable as a storage backend
 		// rather than a write-only sink, so a duck shard without one is a
@@ -295,8 +305,27 @@ func ValidateConfigAggregator(c *ConfigAggregator) error {
 		if c.DuckQueryAddr == "" {
 			return fmt.Errorf("--duck-query-addr must be set when --storage-backend=duck: the shard serves store queries on its own address")
 		}
-	} else if c.DuckQueryAddr != "" {
-		return fmt.Errorf("--duck-query-addr (%s) is set but --storage-backend is not duck", c.DuckQueryAddr)
+		if c.RemoteInitial.MigrationTimeRange != "" {
+			return fmt.Errorf("--migration (%s) must not be set when --storage-backend=duck: the v3-to-v6 migration is ClickHouse-only tooling and has no duck-store counterpart", c.RemoteInitial.MigrationTimeRange)
+		}
+		// There is no ClickHouse cluster to autodetect the shard and replica
+		// from, so the local flags are the only source — and both must be set.
+		if c.LocalReplica < 1 || c.LocalReplica > 3 {
+			return fmt.Errorf("--local-replica (%d) must be 1, 2 or 3 when --storage-backend=duck: there is no ClickHouse cluster to autodetect the replica from", c.LocalReplica)
+		}
+		if c.LocalShard < 1 {
+			return fmt.Errorf("--local-shard (%d) must be >= 1 when --storage-backend=duck: there is no ClickHouse cluster to autodetect the shard from", c.LocalShard)
+		}
+	} else {
+		if c.KHAddr == "" {
+			return fmt.Errorf("--kh must be set when --storage-backend=clickhouse: the aggregator has no ClickHouse addresses to write to")
+		}
+		if c.DuckQueryAddr != "" {
+			return fmt.Errorf("--duck-query-addr (%s) is set but --storage-backend is not duck", c.DuckQueryAddr)
+		}
+		if c.DuckStoreDir != "" {
+			return fmt.Errorf("--duck-store-dir (%s) is set but --storage-backend is not duck", c.DuckStoreDir)
+		}
 	}
 	if c.InsertHistoricWhen < 1 {
 		return fmt.Errorf("--insert-historic-when (%d) must be >= 1", c.InsertHistoricWhen)

@@ -203,7 +203,14 @@ func MakeAggregator(fj *os.File, fjCompact *os.File, mappingsCache *pcache.Mappi
 		if config.ExternalPort == "" {
 			config.ExternalPort = listenPort
 		}
-		if config.KHAddr != "" {
+		if config.StorageBackend == duckstore.BackendDuck {
+			// No ClickHouse cluster to autodetect from (validation refuses
+			// --kh under duck): the local flags name the shard and replica
+			// this process owns. ValidateConfigAggregator already checked
+			// their ranges; MakeAggregator callers that bypass validation
+			// still get sane keys, not the 1/1 demo default.
+			shardKey, replicaKey = int32(config.LocalShard), int32(config.LocalReplica)
+		} else if config.KHAddr != "" {
 			shardKey, replicaKey, localAddresses, err = selectShardReplica(config.KHAddr, config.KHUser, config.KHPassword, config.Cluster, config.ExternalPort)
 			if err != nil {
 				return nil, fmt.Errorf("failed to find out local shard and replica in cluster %q, probably wrong --cluster command line parameter set: %v", config.Cluster, err)
