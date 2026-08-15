@@ -109,9 +109,15 @@ type Store struct {
 	// archiveMu serializes read-write maintenance of archive window files:
 	// compaction's appends and the sealer's rewrite must never interleave on
 	// one file — an append landing between a seal's rewrite and its marker
-	// would violate the sealed window's immutability. Ingestion never takes
-	// it, so sealing cannot delay a write; take it before mu, never after.
-	archiveMu sync.Mutex
+	// would violate the sealed window's immutability — and the retainer's
+	// unlinks serialize against both. Queries hold the lock shared for as
+	// long as an archive window is attached to the delta instance: DuckDB
+	// allows a file exactly one handle per process, so a query's read-only
+	// attach and a maintenance open of the same file must never overlap,
+	// while queries still run concurrently with each other. Ingestion never
+	// takes it, so maintenance can never delay a write; take it before mu,
+	// never after.
+	archiveMu sync.RWMutex
 
 	windows     []WindowFile
 	consumed    map[windowKey]map[int64]struct{} // per archive window, the delta generations it already holds
