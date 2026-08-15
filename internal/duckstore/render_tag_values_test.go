@@ -57,9 +57,9 @@ func seedTagValuesRows(t *testing.T, w *Writer, b1 int64) {
 		{Metric: testMetricID, Time: uint32(b1), Tags: tag0(11), Count: 3},
 		{Metric: testMetricID, Time: uint32(b1 + 30), Tags: tag0(11), Count: 4}, // same value, sums
 		{Metric: testMetricID, Time: uint32(b1), Tags: tag0(12), Count: 9},
-		{Metric: testMetricID, Time: uint32(b1), Tags: tag0(13), Count: 0}, // zero-count group is dropped
-		{Metric: testMetricID, Time: uint32(b1), Count: 2},                 // (0, "") — the empty pair
-		{Metric: testMetricID, Time: uint32(b1), Count: 1},                 // (0, "beta") — unmapped string
+		{Metric: testMetricID, Time: uint32(b1), Tags: tag0(13), Count: 0},  // zero-count group is dropped
+		{Metric: testMetricID, Time: uint32(b1), Count: 2},                  // (0, "") — the empty pair
+		{Metric: testMetricID, Time: uint32(b1), Count: 1},                  // (0, "beta") — unmapped string
 		{Metric: testMetricID2, Time: uint32(b1), Tags: tag0(11), Count: 1}, // the other metric
 	}
 	rows[5].STags[0] = "beta"
@@ -261,6 +261,17 @@ func TestRenderTagValuesFilters(t *testing.T) {
 	q = tagValuesReq(testMetricID, twoMappedKinds, 0, b1, b1+60, 60)
 	q.Base.FilterIn = []tlstatshouse.StoreTagFilter{f}
 	require.Equal(t, []int64{11}, renderTagValues(t, s, q).Tag, "the empty arm keeps the row lacking tag1")
+
+	// both arms set — the negative-regex shape: the pattern arm replaces the
+	// values arm (the builder's `else if`), so the enumerated value the
+	// pattern keeps survives a NOT IN instead of being excluded twice
+	f = tlstatshouse.StoreTagFilter{TagIndex: 1}
+	f.SetValues([]string{nasty})
+	f.SetRe2(`^plain`)
+	q = tagValuesReq(testMetricID, twoMappedKinds, 0, b1, b1+60, 60)
+	q.Base.FilterNotIn = []tlstatshouse.StoreTagFilter{f}
+	require.Equal(t, []int64{11, 12}, renderTagValues(t, s, q).Tag,
+		"the values arm yields to the pattern, which nothing matches here")
 }
 
 // TestRenderTagValuesValidation walks the malformed-request table: each entry

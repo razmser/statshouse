@@ -272,6 +272,45 @@ func TestRenderSeriesQuoteHeavyFilterValues(t *testing.T) {
 	require.Equal(t, []int64{12}, r.tags[0])
 }
 
+// TestRenderSeriesRe2FilterReplacesValues pins the builder's arm precedence on
+// a filter carrying both string values and an RE2 pattern. Every PromQL
+// negative-regex matcher arrives exactly this way (the engine enumerates the
+// known non-matching values into Values and sets Re2), and the pattern arm
+// must REPLACE the values arm, as the ClickHouse builder's `else if` does — a
+// values arm alongside NOT-match would exclude the enumerated rows the
+// pattern itself keeps.
+func TestRenderSeriesRe2FilterReplacesValues(t *testing.T) {
+	s, w := newTestWriter(t)
+	b1 := (writerNowUnix - 7200) / 60 * 60
+	rows := []Row{
+		{Metric: testMetricID, Time: uint32(b1), Tags: tag0(11), Count: 1},
+		{Metric: testMetricID, Time: uint32(b1), Tags: tag0(12), Count: 1},
+	}
+	rows[0].STags[1] = "foo"   // a known non-matching value the pattern keeps
+	rows[1].STags[1] = "bar.x" // the only value the pattern rejects
+	require.NoError(t, w.WriteRound(context.Background(), rows))
+
+	// the !~ shape: Values enumerates the non-matching values, Re2 the pattern
+	f := tlstatshouse.StoreTagFilter{TagIndex: 1}
+	f.SetValues([]string{"foo"})
+	f.SetRe2(`^bar`)
+	q := seriesReq(testMetricID, twoMappedKinds, []int32{int32(data_model.DigestCount)}, []int32{1}, b1, b1+60, 60)
+	q.Base.FilterNotIn = []tlstatshouse.StoreTagFilter{f}
+	r := renderSeriesSorted(t, s, 1, q)
+	require.Equal(t, []string{"foo"}, r.stags[0],
+		"the pattern arm alone decides: the enumerated non-matching value survives, as under ClickHouse")
+
+	// the =~ shape: skipping the values arm changes nothing, every enumerated
+	// value matches the pattern anyway
+	f = tlstatshouse.StoreTagFilter{TagIndex: 1}
+	f.SetValues([]string{"foo"})
+	f.SetRe2(`^foo`)
+	q = seriesReq(testMetricID, twoMappedKinds, []int32{int32(data_model.DigestCount)}, []int32{1}, b1, b1+60, 60)
+	q.Base.FilterIn = []tlstatshouse.StoreTagFilter{f}
+	r = renderSeriesSorted(t, s, 1, q)
+	require.Equal(t, []string{"foo"}, r.stags[0])
+}
+
 // withFilterIn returns the request with its IN filters set.
 func withFilterIn(q tlstatshouse.StoreQuerySeries, filters ...tlstatshouse.StoreTagFilter) tlstatshouse.StoreQuerySeries {
 	q.Base.FilterIn = filters
@@ -305,10 +344,12 @@ func TestRenderSeriesEmptyFilterArm(t *testing.T) {
 	require.Equal(t, []float64{1}, flattenSeries(t, resp).count, "NOT Empty keeps the tagged row")
 }
 
-// TestRenderSeriesHostsByIdentifyingValue seeds partial rows whose hosts
-// disagree with the winning value, so a correct host column must pick the
-// host of the extreme row, not any host of the group. max_host switches to
-// the max-count pair exactly when `what` does not include max.
+// TestRenderSeriesHostsByIdentifyingValue seeds partial rows whose skewed
+// state values disagree with the true extremes, so a correct host column must
+// pick the host of the smallest/largest SKEW — the value-weighted sample
+// ClickHouse's argMin/argMax states produce — not the host of the extreme
+// row, and must serve that skew back as the value. max_host switches to the
+// max-count pair exactly when `what` does not include max.
 func TestRenderSeriesHostsByIdentifyingValue(t *testing.T) {
 	s, w := newTestWriter(t)
 	b1 := (writerNowUnix - 7200) / 60 * 60
@@ -316,37 +357,42 @@ func TestRenderSeriesHostsByIdentifyingValue(t *testing.T) {
 		{
 			Metric: testMetricID, Time: uint32(b1), Tags: tag0(11),
 			Count: 3, Min: 1.5, Max: 9.75, Sum: 21,
-			MinHost: HostTag{ID: 7}, MaxHost: HostTag{ID: 7}, MaxCountHost: HostTag{ID: 100},
+			MinHost:      HostPair{Tag: HostTag{ID: 7}, Value: 0.4},
+			MaxHost:      HostPair{Tag: HostTag{ID: 7}, Value: 5},
+			MaxCountHost: HostPair{Tag: HostTag{ID: 100}, Value: 2},
 		},
 		{
 			Metric: testMetricID, Time: uint32(b1), Tags: tag0(11),
 			Count: 9, Min: 0.5, Max: 5, Sum: 9,
-			MinHost: HostTag{ID: 9}, MaxHost: HostTag{S: "big"}, MaxCountHost: HostTag{S: "chost"},
+			MinHost:      HostPair{Tag: HostTag{ID: 9}, Value: 0.9},  // holds the true min, larger skew
+			MaxHost:      HostPair{Tag: HostTag{S: "big"}, Value: 8}, // holds the smaller max, larger skew
+			MaxCountHost: HostPair{Tag: HostTag{S: "chost"}, Value: 1},
 		},
 	}
 	require.NoError(t, w.WriteRound(context.Background(), rows))
 
-	// min_host always rides the min; max_host rides max because `what` has it
+	// min_host always rides its own skew; max_host rides max's because `what`
+	// has max
 	withMax := seriesReq(testMetricID, twoMappedKinds,
 		[]int32{int32(data_model.DigestCount), int32(data_model.DigestMin), int32(data_model.DigestMax)}, nil, b1, b1+60, 60)
 	withMax.SetMinHost(true)
 	withMax.SetMaxHost(true)
 	r := renderSeriesSorted(t, s, 1, withMax)
 	require.Len(t, r.minHostValue, 1)
-	require.Equal(t, 0.5, r.minHostValue[0])
-	require.Equal(t, int32(9), r.minHostTag[0], "the host of the smallest min")
+	require.Equal(t, 0.4, r.minHostValue[0], "the winning skew is served back, argMinMergeState's payload")
+	require.Equal(t, int32(7), r.minHostTag[0], "the host of the smallest skew, not of the smallest min")
 	require.Equal(t, "", r.minHostStag[0])
-	require.Equal(t, 9.75, r.maxHostValue[0])
-	require.Equal(t, int32(7), r.maxHostTag[0], "the host of the largest max")
-	require.Equal(t, "", r.maxHostStag[0])
+	require.Equal(t, 8.0, r.maxHostValue[0])
+	require.Equal(t, "big", r.maxHostStag[0], "the host of the largest skew, not of the largest max")
+	require.Equal(t, int32(0), r.maxHostTag[0])
 
 	// without max in `what`, max_host switches to the max-count pair
 	withoutMax := seriesReq(testMetricID, twoMappedKinds, []int32{int32(data_model.DigestCount)}, nil, b1, b1+60, 60)
 	withoutMax.SetMaxHost(true)
 	r = renderSeriesSorted(t, s, 1, withoutMax)
-	require.Equal(t, 9.0, r.maxHostValue[0], "max_count is the largest count")
-	require.Equal(t, int32(0), r.maxHostTag[0], "the winning host is the string one")
-	require.Equal(t, "chost", r.maxHostStag[0])
+	require.Equal(t, 2.0, r.maxHostValue[0], "the max-count pair's own skew is served")
+	require.Equal(t, int32(100), r.maxHostTag[0], "the winning host is the id one")
+	require.Equal(t, "", r.maxHostStag[0])
 }
 
 // TestRenderSeriesFoldedStates checks the two sketch columns come back as one

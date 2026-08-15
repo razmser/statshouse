@@ -61,8 +61,8 @@ func testRow(metric int32, ts uint32) Row {
 		SumSquare:   101.25,
 		Percentiles: []byte{1, 2, 3, 4},
 		Unique:      []byte{5, 6, 7},
-		MinHost:     HostTag{ID: 7},
-		MaxHost:     HostTag{S: "max host"},
+		MinHost:     HostPair{Tag: HostTag{ID: 7}, Value: 0.7},
+		MaxHost:     HostPair{Tag: HostTag{S: "max host"}, Value: 8.25},
 	}
 	r.Tags[0] = 11
 	r.STags[1] = "raw tag"
@@ -140,17 +140,20 @@ func TestWriterRoundLandsInAllTiersTruncated(t *testing.T) {
 	require.Zero(t, tag47)
 	require.Equal(t, "string top", stag47)
 
-	// hosts and sketches are stored verbatim
+	// hosts and sketches are stored verbatim, skew values included
 	var minHost, maxHost int32
 	var minShost, maxShost string
+	var minHostValue, maxHostValue float64
 	var percentiles, uniq []byte
 	require.NoError(t, s.Delta().QueryRow(
-		`SELECT min_host, min_shost, max_host, max_shost, percentiles, uniq_state FROM s1 WHERE metric = $1`, testMetricID).
-		Scan(&minHost, &minShost, &maxHost, &maxShost, &percentiles, &uniq))
+		`SELECT min_host, min_shost, min_host_value, max_host, max_shost, max_host_value, percentiles, uniq_state FROM s1 WHERE metric = $1`, testMetricID).
+		Scan(&minHost, &minShost, &minHostValue, &maxHost, &maxShost, &maxHostValue, &percentiles, &uniq))
 	require.EqualValues(t, 7, minHost)
 	require.Empty(t, minShost)
 	require.Zero(t, maxHost)
 	require.Equal(t, "max host", maxShost)
+	require.Equal(t, 0.7, minHostValue, "the skewed state value travels with its host")
+	require.Equal(t, 8.25, maxHostValue)
 	require.Equal(t, testRow(testMetricID, ts).Percentiles, percentiles)
 	require.Equal(t, testRow(testMetricID, ts).Unique, uniq)
 }

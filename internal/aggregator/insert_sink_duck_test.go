@@ -137,17 +137,20 @@ func TestDuckSinkRoundLandsInStore(t *testing.T) {
 	require.EqualValues(t, 21, sum)
 	require.EqualValues(t, 101.25, sumsquare)
 
-	// hosts and sketches are stored verbatim
+	// hosts and sketches are stored verbatim, the skewed state values included
 	var minHost, maxHost int32
 	var minShost, maxShost string
+	var minHostValue, maxHostValue float64
 	var percentiles, uniq []byte
 	require.NoError(t, s.Delta().QueryRow(
-		`SELECT min_host, min_shost, max_host, max_shost, percentiles, uniq_state FROM s1 WHERE metric = $1`,
-		sinkTestMetricID).Scan(&minHost, &minShost, &maxHost, &maxShost, &percentiles, &uniq))
+		`SELECT min_host, min_shost, min_host_value, max_host, max_shost, max_host_value, percentiles, uniq_state FROM s1 WHERE metric = $1`,
+		sinkTestMetricID).Scan(&minHost, &minShost, &minHostValue, &maxHost, &maxShost, &maxHostValue, &percentiles, &uniq))
 	require.EqualValues(t, 7, minHost)
 	require.Empty(t, minShost)
 	require.Zero(t, maxHost)
 	require.Equal(t, "max host", maxShost)
+	require.Equal(t, 0.5, minHostValue, "the argMin state's skewed payload must survive the conversion")
+	require.Equal(t, 0.5, maxHostValue)
 	require.Equal(t, []byte{1, 2, 3, 4}, percentiles)
 	require.Equal(t, []byte{5, 6, 7}, uniq)
 }

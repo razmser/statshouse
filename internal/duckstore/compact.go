@@ -164,12 +164,15 @@ type collapsedGroup struct {
 
 	count, min, max, maxCount, sum, sumSquare float64
 
-	minHostID      int32
-	minHostS       string
-	maxHostID      int32
-	maxHostS       string
-	maxCountHostID int32
-	maxCountHostS  string
+	minHostID         int32
+	minHostS          string
+	minHostValue      float64
+	maxHostID         int32
+	maxHostS          string
+	maxHostValue      float64
+	maxCountHostID    int32
+	maxCountHostS     string
+	maxCountHostValue float64
 
 	percentiles []byte
 	uniq        []byte
@@ -181,10 +184,10 @@ type collapsedGroup struct {
 // compaction exists to establish, since insert order never can.
 //
 // Host columns collapse as a single arg_min/arg_max over a packed struct of
-// both halves, so the integer and string halves of a host always resolve to
-// the same row; empty hosts sit out the aggregate the way ClickHouse's empty
-// argMin/argMax states do, and a group with no host at all collapses to the
-// empty host rather than to an arbitrary row's.
+// both halves plus the skewed ordering value, so the halves and the value of a
+// host always resolve to the same row; empty hosts sit out the aggregate the
+// way ClickHouse's empty argMin/argMax states do, and a group with no host at
+// all collapses to the empty host rather than to an arbitrary row's.
 func collapseWindowRows(tx *sql.Tx, tier string, windowStart, windowEnd int64) error {
 	table := tierTables[tier]
 	groups, err := queryCollapsedGroups(tx, deltaSrcAlias, table, windowStart, windowEnd)
@@ -260,8 +263,8 @@ func insertCollapsedGroups(tx *sql.Tx, table string, groups []collapsedGroup) er
 }
 
 // tierColumnCount is the number of columns in a tier table: metric and time,
-// 48 tag pairs, six numerics, three host pairs and the two sketch columns.
-const tierColumnCount = 2 + 2*format.MaxTags + 6 + 6 + 2
+// 48 tag pairs, six numerics, three host triples and the two sketch columns.
+const tierColumnCount = 2 + 2*format.MaxTags + 6 + 9 + 2
 
 // collapsedGroupScan builds the scan target for one collapse query row, in the
 // SELECT list's order. The blob lists land in *any and are normalized by
@@ -274,9 +277,9 @@ func collapsedGroupScan(g *collapsedGroup, pctList, uniqList *any) []any {
 	}
 	scan = append(scan,
 		&g.count, &g.min, &g.max, &g.maxCount, &g.sum, &g.sumSquare,
-		&g.minHostID, &g.minHostS,
-		&g.maxHostID, &g.maxHostS,
-		&g.maxCountHostID, &g.maxCountHostS,
+		&g.minHostID, &g.minHostS, &g.minHostValue,
+		&g.maxHostID, &g.maxHostS, &g.maxHostValue,
+		&g.maxCountHostID, &g.maxCountHostS, &g.maxCountHostValue,
 		pctList, uniqList)
 	return scan
 }
@@ -290,25 +293,28 @@ func appendGroupArgs(args []any, g *collapsedGroup) []any {
 	}
 	args = append(args,
 		g.count, g.min, g.max, g.maxCount, g.sum, g.sumSquare,
-		g.minHostID, g.minHostS,
-		g.maxHostID, g.maxHostS,
-		g.maxCountHostID, g.maxCountHostS,
+		g.minHostID, g.minHostS, g.minHostValue,
+		g.maxHostID, g.maxHostS, g.maxHostValue,
+		g.maxCountHostID, g.maxCountHostS, g.maxCountHostValue,
 		g.percentiles, g.uniq)
 	return args
 }
 
-// hostStruct packs one host pair for the collapse's single arg_min/arg_max —
-// one call, so both halves always come from the same row.
-func hostStruct(idCol, sCol string) string {
-	return fmt.Sprintf("struct_pack(i := %s, s := %s)", idCol, sCol)
+// hostStruct packs one host column for the collapse's single arg_min/arg_max —
+// one call, so the tag halves and the ordering value always come from the same
+// row.
+func hostStruct(idCol, sCol, valCol string) string {
+	return fmt.Sprintf("struct_pack(i := %s, s := %s, v := %s)", idCol, sCol, valCol)
 }
 
 // collapseQuery builds the collapse statement for one tier table, reading it
 // through the src qualifier: the transliteration of the DDL sketch in
-// .scratch/duck-store/03-schema-ddl.sql. The empty-host FILTER mirrors
-// ClickHouse's empty argMin/argMax states, which lose to any real state on
-// merge; the coalesce keeps an all-empty group at the empty host instead of
-// NULL.
+// .scratch/duck-store/03-schema-ddl.sql. Host columns collapse ordered by
+// their skewed state values — not the true min/max/max_count — so a collapsed
+// window merges with later partial rows exactly as the uncollapsed states
+// would under ClickHouse. The empty-host FILTER mirrors ClickHouse's empty
+// argMin/argMax states, which lose to any real state on merge; the coalesce
+// keeps an all-empty group at the empty host instead of NULL.
 func collapseQuery(src, table string) string {
 	var cols []string
 	cols = append(cols, "metric, time")
@@ -322,17 +328,18 @@ func collapseQuery(src, table string) string {
 		"max(max_count) AS max_count",
 		"sum(sum) AS sum",
 		"sum(sumsquare) AS sumsquare")
-	hostCols := []struct{ id, s, by string }{
-		{"min_host", "min_shost", "min"},
-		{"max_host", "max_shost", "max"},
-		{"max_count_host", "max_count_shost", "max_count"},
+	hostCols := []struct{ fn, id, s, val string }{
+		{"arg_min", "min_host", "min_shost", "min_host_value"},
+		{"arg_max", "max_host", "max_shost", "max_host_value"},
+		{"arg_max", "max_count_host", "max_count_shost", "max_count_host_value"},
 	}
 	for _, h := range hostCols {
 		agg := fmt.Sprintf("%s(%s, %s) FILTER (WHERE %s <> 0 OR %s <> '')",
-			argFn(h.by), hostStruct(h.id, h.s), h.by, h.id, h.s)
+			h.fn, hostStruct(h.id, h.s, h.val), h.val, h.id, h.s)
 		cols = append(cols,
 			fmt.Sprintf("coalesce((%s).i, 0) AS %s", agg, h.id),
-			fmt.Sprintf("coalesce((%s).s, '') AS %s", agg, h.s))
+			fmt.Sprintf("coalesce((%s).s, '') AS %s", agg, h.s),
+			fmt.Sprintf("coalesce((%s).v, 0) AS %s", agg, h.val))
 	}
 	cols = append(cols,
 		"list(percentiles) AS percentiles_list",
@@ -340,15 +347,6 @@ func collapseQuery(src, table string) string {
 	return fmt.Sprintf(
 		"SELECT %s FROM %s.%s WHERE time >= $1 AND time < $2 GROUP BY ALL ORDER BY metric, time",
 		strings.Join(cols, ", "), src, table)
-}
-
-// argFn maps each host column's ordering value to its aggregate: min_host is
-// the host of the smallest min, the other two the host of the largest value.
-func argFn(by string) string {
-	if by == "min" {
-		return "arg_min"
-	}
-	return "arg_max"
 }
 
 // blobList normalizes one collapse query row's LIST(BLOB) into a [][]byte the

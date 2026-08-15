@@ -37,6 +37,10 @@ func TestTierTableDDLMatchesResolvedSchema(t *testing.T) {
 			for _, shost := range []string{"min_shost", "max_shost", "max_count_shost"} {
 				require.Contains(t, ddl, fmt.Sprintf("%s varchar not null default ''", shost))
 			}
+			// the skewed argMin/argMax state values the hosts merge and serve by
+			for _, val := range []string{"min_host_value", "max_host_value", "max_count_host_value"} {
+				require.Contains(t, ddl, fmt.Sprintf("%s double not null default 0", val))
+			}
 
 			// all MaxTags tag pairs, flat and wide, with zero-value defaults
 			for i := 0; i < format.MaxTags; i++ {
@@ -51,8 +55,8 @@ func TestTierTableDDLMatchesResolvedSchema(t *testing.T) {
 			}
 
 			// column count: key anchors + 2*MaxTags tags + 6 aggregates +
-			// 6 host halves + 2 sketch blobs
-			wantColumns := 2 + 2*format.MaxTags + 6 + 6 + 2
+			// 3 host triples + 2 sketch blobs
+			wantColumns := 2 + 2*format.MaxTags + 6 + 9 + 2
 			gotColumns := strings.Count(ddl, "not null")
 			require.Equal(t, wantColumns, gotColumns, "every column must be NOT NULL")
 		})

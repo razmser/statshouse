@@ -126,7 +126,7 @@ func TestOpenStoreSchemaIsTransliteratedDDL(t *testing.T) {
 		require.NoError(t, rows.Err())
 		rows.Close()
 
-		wantColumns := 2 + 2*format.MaxTags + 6 + 6 + 2
+		wantColumns := 2 + 2*format.MaxTags + 6 + 9 + 2
 		require.Len(t, got, wantColumns, "%s column count", table)
 
 		// every column NOT NULL with a zero-value default, so NULL
@@ -141,6 +141,9 @@ func TestOpenStoreSchemaIsTransliteratedDDL(t *testing.T) {
 		require.Equal(t, [2]string{"DOUBLE", "NO"}, got["count"])
 		require.Equal(t, [2]string{"INTEGER", "NO"}, got["min_host"])
 		require.Equal(t, [2]string{"VARCHAR", "NO"}, got["min_shost"])
+		require.Equal(t, [2]string{"DOUBLE", "NO"}, got["min_host_value"])
+		require.Equal(t, [2]string{"DOUBLE", "NO"}, got["max_host_value"])
+		require.Equal(t, [2]string{"DOUBLE", "NO"}, got["max_count_host_value"])
 		require.Equal(t, [2]string{"INTEGER", "NO"}, got["max_count_host"])
 		// sketch states stay opaque ClickHouse bytes
 		require.Equal(t, [2]string{"BLOB", "NO"}, got["percentiles"])

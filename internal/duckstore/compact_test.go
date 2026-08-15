@@ -57,12 +57,15 @@ type rawRow struct {
 
 	count, min, max, maxCount, sum, sumSquare float64
 
-	minHostID      int32
-	minHostS       string
-	maxHostID      int32
-	maxHostS       string
-	maxCountHostID int32
-	maxCountHostS  string
+	minHostID         int32
+	minHostS          string
+	minHostValue      float64
+	maxHostID         int32
+	maxHostS          string
+	maxHostValue      float64
+	maxCountHostID    int32
+	maxCountHostS     string
+	maxCountHostValue float64
 
 	percentiles []byte
 	uniq        []byte
@@ -73,7 +76,7 @@ func scanTableRows(t *testing.T, db *sql.DB, table string) []rawRow {
 	t.Helper()
 	rows, err := db.Query(fmt.Sprintf(
 		"SELECT metric, time, %s, count, min, max, max_count, sum, sumsquare, "+
-			"min_host, min_shost, max_host, max_shost, max_count_host, max_count_shost, percentiles, uniq_state FROM %s",
+			"min_host, min_shost, min_host_value, max_host, max_shost, max_host_value, max_count_host, max_count_shost, max_count_host_value, percentiles, uniq_state FROM %s",
 		tagColList(), table))
 	require.NoError(t, err)
 	defer rows.Close()
@@ -87,7 +90,9 @@ func scanTableRows(t *testing.T, db *sql.DB, table string) []rawRow {
 		}
 		scan = append(scan,
 			&r.count, &r.min, &r.max, &r.maxCount, &r.sum, &r.sumSquare,
-			&r.minHostID, &r.minHostS, &r.maxHostID, &r.maxHostS, &r.maxCountHostID, &r.maxCountHostS,
+			&r.minHostID, &r.minHostS, &r.minHostValue,
+			&r.maxHostID, &r.maxHostS, &r.maxHostValue,
+			&r.maxCountHostID, &r.maxCountHostS, &r.maxCountHostValue,
 			&r.percentiles, &r.uniq)
 		require.NoError(t, rows.Scan(scan...))
 		out = append(out, r)
@@ -113,9 +118,9 @@ type hostPairDecoded struct {
 func (h hostPairDecoded) empty() bool { return h.id == 0 && h.s == "" }
 
 // decodedGroup is one key's aggregates the way a query decodes them: the
-// numerics folded, the hosts resolved by value with empty hosts losing the way
-// ClickHouse's empty argMin/argMax states do, and the sketches merged from
-// their decoded states.
+// numerics folded, the hosts resolved by their skewed state values with empty
+// hosts losing the way ClickHouse's empty argMin/argMax states do, and the
+// sketches merged from their decoded states.
 type decodedGroup struct {
 	rows int
 
@@ -129,7 +134,7 @@ type decodedGroup struct {
 }
 
 // decodeRows folds raw rows in Go — the reference "uncollapsed read". Test
-// data must keep host-value ordering unambiguous (no ties), because ties are
+// data must keep skew ordering unambiguous (no ties), because ties are
 // deliberately implementation-ordered.
 func decodeRows(t *testing.T, rows []rawRow) map[decodedKey]*decodedGroup {
 	t.Helper()
@@ -157,18 +162,18 @@ func decodeRows(t *testing.T, rows []rawRow) map[decodedKey]*decodedGroup {
 			g.maxCount = r.maxCount
 		}
 		if hp := (hostPairDecoded{r.minHostID, r.minHostS}); !hp.empty() {
-			if g.minHost.empty() || r.min < g.minHostVal {
-				g.minHost, g.minHostVal = hp, r.min
+			if g.minHost.empty() || r.minHostValue < g.minHostVal {
+				g.minHost, g.minHostVal = hp, r.minHostValue
 			}
 		}
 		if hp := (hostPairDecoded{r.maxHostID, r.maxHostS}); !hp.empty() {
-			if g.maxHost.empty() || r.max > g.maxHostVal {
-				g.maxHost, g.maxHostVal = hp, r.max
+			if g.maxHost.empty() || r.maxHostValue > g.maxHostVal {
+				g.maxHost, g.maxHostVal = hp, r.maxHostValue
 			}
 		}
 		if hp := (hostPairDecoded{r.maxCountHostID, r.maxCountHostS}); !hp.empty() {
-			if g.maxCountHost.empty() || r.maxCount > g.maxCountHostVal {
-				g.maxCountHost, g.maxCountHostVal = hp, r.maxCount
+			if g.maxCountHost.empty() || r.maxCountHostValue > g.maxCountHostVal {
+				g.maxCountHost, g.maxCountHostVal = hp, r.maxCountHostValue
 			}
 		}
 		if td, err := DecodeTDigestState(r.percentiles); err != nil {
@@ -218,6 +223,9 @@ func requireSameDecoded(t *testing.T, want, got map[decodedKey]*decodedGroup) {
 		require.Equal(t, w.minHost, g.minHost, "min_host of metric %d", k.metric)
 		require.Equal(t, w.maxHost, g.maxHost, "max_host of metric %d", k.metric)
 		require.Equal(t, w.maxCountHost, g.maxCountHost, "max_count_host of metric %d", k.metric)
+		require.Equal(t, w.minHostVal, g.minHostVal, "min_host_value of metric %d", k.metric)
+		require.Equal(t, w.maxHostVal, g.maxHostVal, "max_host_value of metric %d", k.metric)
+		require.Equal(t, w.maxCountHostVal, g.maxCountHostVal, "max_count_host_value of metric %d", k.metric)
 		require.InDelta(t, w.pctCount, g.pctCount, 1e-9, "percentile weight of metric %d", k.metric)
 		if w.uniqSize > 0 || g.uniqSize > 0 {
 			require.InDelta(t, float64(w.uniqSize), float64(g.uniqSize), 0.02*float64(w.uniqSize)+1,
@@ -233,30 +241,39 @@ func writeCollapseFixture(t *testing.T, s *Store, w *Writer) {
 	t.Helper()
 	now := uint32(writerNow.Unix())
 
+	// the skews deliberately disagree with the true extremes: a2 holds the
+	// smallest min but a1 the smallest skew, a3 the largest max but a1 the
+	// largest skew — the states, not the values, pick the hosts
 	a1 := partialRow(t, testMetricID, now-5)
 	a1.Count, a1.Min, a1.Max, a1.Sum, a1.SumSquare = 3, 1.5, 9.75, 21, 101.25
 	a1.Percentiles = pctState(t, 10, 20, 30)
 	a1.Unique = uniqState(t, seq(1, 10)...)
-	a1.MinHost, a1.MaxHost, a1.MaxCountHost = HostTag{ID: 7}, HostTag{S: "hostB"}, HostTag{ID: 3}
+	a1.MinHost = HostPair{Tag: HostTag{ID: 7}, Value: 0.4}
+	a1.MaxHost = HostPair{Tag: HostTag{S: "hostB"}, Value: 10}
+	a1.MaxCountHost = HostPair{Tag: HostTag{ID: 3}, Value: 1.5}
 
 	a2 := partialRow(t, testMetricID, now-5)
 	a2.Count, a2.Min, a2.Max, a2.Sum, a2.SumSquare = 4, 0.5, 5, 40, 200
 	a2.Percentiles = pctState(t, 40, 50)
 	a2.Unique = uniqState(t, seq(5, 15)...)
-	a2.MinHost, a2.MaxHost, a2.MaxCountHost = HostTag{ID: 9}, HostTag{S: "hostC"}, HostTag{ID: 4}
+	a2.MinHost = HostPair{Tag: HostTag{ID: 9}, Value: 0.9}
+	a2.MaxHost = HostPair{Tag: HostTag{S: "hostC"}, Value: 6}
+	a2.MaxCountHost = HostPair{Tag: HostTag{ID: 4}, Value: 3.5}
 
 	a3 := partialRow(t, testMetricID, now-5)
 	a3.Count, a3.Min, a3.Max, a3.Sum, a3.SumSquare = 5, 2, 12, 60, 300
 	a3.Percentiles = pctState(t, 60, 70, 80, 90)
 	a3.Unique = uniqState(t, seq(10, 20)...)
-	a3.MinHost, a3.MaxHost, a3.MaxCountHost = HostTag{}, HostTag{S: "hostD"}, HostTag{}
+	a3.MinHost = HostPair{}
+	a3.MaxHost = HostPair{Tag: HostTag{S: "hostD"}, Value: 7}
+	a3.MaxCountHost = HostPair{}
 
 	// a value-stat row: empty sketches, no hosts
 	b := partialRow(t, testMetricID2, now-5)
 	b.Count, b.Min, b.Max, b.Sum, b.SumSquare = 2, 1, 2, 3, 5
 	b.Percentiles = nil
 	b.Unique = nil
-	b.MinHost, b.MaxHost, b.MaxCountHost = HostTag{}, HostTag{}, HostTag{}
+	b.MinHost, b.MaxHost, b.MaxCountHost = HostPair{}, HostPair{}, HostPair{}
 
 	require.NoError(t, w.WriteRound(context.Background(), []Row{a1, a2, a3}))
 	require.NoError(t, w.WriteRound(context.Background(), []Row{b}))
@@ -280,7 +297,7 @@ func expectedRows(t *testing.T, db *sql.DB, tier string) map[decodedKey]*decoded
 // TestCompactionCollapseMatchesUncollapsedRead proves the load-bearing
 // property: a collapsed archive window decodes to exactly what the uncollapsed
 // delta rows decoded to — every partial row counted once, hosts resolved by
-// value, sketches folded — in all three tiers.
+// their skewed state values, sketches folded — in all three tiers.
 func TestCompactionCollapseMatchesUncollapsedRead(t *testing.T) {
 	s, w := newTestWriter(t)
 	writeCollapseFixture(t, s, w)
@@ -305,9 +322,12 @@ func TestCompactionCollapseMatchesUncollapsedRead(t *testing.T) {
 	require.Equal(t, 12.0, g.max)
 	require.Equal(t, 5.0, g.maxCount)
 	require.Equal(t, 601.25, g.sumSquare)
-	require.Equal(t, hostPairDecoded{9, ""}, g.minHost, "the smallest min's host wins")
-	require.Equal(t, hostPairDecoded{0, "hostD"}, g.maxHost, "the largest max's host wins")
+	require.Equal(t, hostPairDecoded{7, ""}, g.minHost, "the smallest skew's host wins, not the smallest min's")
+	require.Equal(t, 0.4, g.minHostVal)
+	require.Equal(t, hostPairDecoded{0, "hostB"}, g.maxHost, "the largest skew's host wins, not the largest max's")
+	require.Equal(t, 10.0, g.maxHostVal)
 	require.Equal(t, hostPairDecoded{4, ""}, g.maxCountHost)
+	require.Equal(t, 3.5, g.maxCountHostVal)
 	require.Equal(t, 9.0, g.pctCount)
 	require.EqualValues(t, 20, g.uniqSize)
 
@@ -329,7 +349,7 @@ func TestCompactionCollapseMatchesUncollapsedRead(t *testing.T) {
 	}
 }
 
-// TestCompactionHostTieKeepsHalvesTogether drives value ties — where two
+// TestCompactionHostTieKeepsHalvesTogether drives skew ties — where two
 // separate arg_min calls could resolve the integer and string halves to
 // different rows — and proves the packed struct keeps each host whole, that an
 // empty host loses to a real one, and that a group with no host at all stays
@@ -340,31 +360,31 @@ func TestCompactionHostTieKeepsHalvesTogether(t *testing.T) {
 
 	tieA := partialRow(t, testMetricID, now)
 	tieA.Count, tieA.Min = 2, 1.5
-	tieA.MinHost = HostTag{ID: 7}
+	tieA.MinHost = HostPair{Tag: HostTag{ID: 7}, Value: 1.5}
 	tieB := partialRow(t, testMetricID, now)
-	tieB.Count, tieB.Min = 3, 1.5 // tied min
-	tieB.MinHost = HostTag{S: "hostB"}
+	tieB.Count, tieB.Min = 3, 0.5 // smaller min, tied skew
+	tieB.MinHost = HostPair{Tag: HostTag{S: "hostB"}, Value: 1.5}
 
 	emptyLoses1 := partialRow(t, testMetricID2, now)
-	emptyLoses1.Count, emptyLoses1.Min = 1, 1 // smallest min, empty host
-	emptyLoses1.MinHost = HostTag{}
+	emptyLoses1.Count, emptyLoses1.Min = 1, 1 // smallest skew, empty host
+	emptyLoses1.MinHost = HostPair{Value: 0.5}
 	emptyLoses2 := partialRow(t, testMetricID2, now)
 	emptyLoses2.Count, emptyLoses2.Min = 1, 2
-	emptyLoses2.MinHost = HostTag{ID: 9}
+	emptyLoses2.MinHost = HostPair{Tag: HostTag{ID: 9}, Value: 0.9}
 
 	noHost1 := partialRow(t, testMetricID2+1, now)
 	noHost1.Count = 1
-	noHost1.MinHost, noHost1.MaxHost, noHost1.MaxCountHost = HostTag{}, HostTag{}, HostTag{}
+	noHost1.MinHost, noHost1.MaxHost, noHost1.MaxCountHost = HostPair{}, HostPair{}, HostPair{}
 	noHost2 := partialRow(t, testMetricID2+1, now)
 	noHost2.Count = 1
-	noHost2.MinHost, noHost2.MaxHost, noHost2.MaxCountHost = HostTag{}, HostTag{}, HostTag{}
+	noHost2.MinHost, noHost2.MaxHost, noHost2.MaxCountHost = HostPair{}, HostPair{}, HostPair{}
 
 	maxTieA := partialRow(t, testMetricID2+2, now)
 	maxTieA.Count, maxTieA.Max = 1, 8
-	maxTieA.MaxHost = HostTag{ID: 5}
+	maxTieA.MaxHost = HostPair{Tag: HostTag{ID: 5}, Value: 8}
 	maxTieB := partialRow(t, testMetricID2+2, now)
-	maxTieB.Count, maxTieB.Max = 1, 8 // tied max
-	maxTieB.MaxHost = HostTag{S: "maxS"}
+	maxTieB.Count, maxTieB.Max = 1, 4 // smaller max, tied skew
+	maxTieB.MaxHost = HostPair{Tag: HostTag{S: "maxS"}, Value: 8}
 
 	require.NoError(t, w.WriteRound(context.Background(), []Row{tieA, emptyLoses1, noHost1, maxTieA}))
 	require.NoError(t, w.WriteRound(context.Background(), []Row{tieB, emptyLoses2, noHost2, maxTieB}))
@@ -383,12 +403,16 @@ func TestCompactionHostTieKeepsHalvesTogether(t *testing.T) {
 		return hostPairDecoded{id, sh}
 	}
 
-	// a tie resolves to one whole input row, never a mix of two
+	// a tie resolves to one whole input row, never a mix of two — and the
+	// winning skew comes back with it
+	var tieVal float64
+	require.NoError(t, db.QueryRow(`SELECT min_host_value FROM s1 WHERE metric = $1`, testMetricID).Scan(&tieVal))
+	require.Equal(t, 1.5, tieVal)
 	h := host(testMetricID)
 	require.Contains(t, []hostPairDecoded{{7, ""}, {0, "hostB"}}, h,
 		"both halves must come from the same row")
 
-	// the empty host loses even though its row holds the smallest min
+	// the empty host loses even though its row holds the smallest skew
 	require.Equal(t, hostPairDecoded{9, ""}, host(testMetricID2))
 	// a group with no host at all stays empty
 	require.Equal(t, hostPairDecoded{}, host(testMetricID2+1))

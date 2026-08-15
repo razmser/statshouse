@@ -319,10 +319,15 @@ func buildSeriesSQL(p *seriesPlan, sources []string) (*seriesQuerySQL, error) {
 	}
 	if p.cols.minHost {
 		// one arg_min over a packed struct, so the value, the mapped id and
-		// the raw string of the winning host always come from the same row;
-		// rows without a host sit the aggregate out, the way ClickHouse's
-		// empty argMin states lose to any real one
-		agg := "arg_min(struct_pack(v := min, i := min_host, s := min_shost), min)" +
+		// the raw string of the winning host always come from the same row.
+		// The order key is the skewed comparison value ClickHouse keeps
+		// inside the argMin state (drawn once per row by the conveyor — host
+		// selection is value-weighted, not a plain extremum), and that skew
+		// is also the value served back: the payload argMinMergeState
+		// carries and every later merge orders by. Rows without a host sit
+		// the aggregate out, the way ClickHouse's empty argMin states lose
+		// to any real one.
+		agg := "arg_min(struct_pack(v := min_host_value, i := min_host, s := min_shost), min_host_value)" +
 			" FILTER (WHERE (min_host <> 0 OR min_shost <> ''))"
 		sel = append(sel,
 			"coalesce(("+agg+").v, 0) AS _min_host_value",
@@ -331,10 +336,11 @@ func buildSeriesSQL(p *seriesPlan, sources []string) (*seriesQuerySQL, error) {
 	}
 	if p.cols.maxHost {
 		// the host of the max value when `what` includes max, else the host
-		// of the max count — the ClickHouse builder's choice
-		valueCol, hostCol, hostSCol := "max", "max_host", "max_shost"
+		// of the max count — the ClickHouse builder's choice — ordered and
+		// served by that column's own skewed state value, as min_host above
+		valueCol, hostCol, hostSCol := "max_host_value", "max_host", "max_shost"
 		if !p.whatMax {
-			valueCol, hostCol, hostSCol = "max_count", "max_count_host", "max_count_shost"
+			valueCol, hostCol, hostSCol = "max_count_host_value", "max_count_host", "max_count_shost"
 		}
 		agg := "arg_max(struct_pack(v := " + valueCol + ", i := " + hostCol + ", s := " + hostSCol + "), " + valueCol + ")" +
 			" FILTER (WHERE (" + hostCol + " <> 0 OR " + hostSCol + " <> ''))"
@@ -458,11 +464,14 @@ func (p *storeQueryPlan) tagFilterPred(f tlstatshouse.StoreTagFilter, in bool, p
 		// the string half exists only for a mapped tag; a raw tag's stag
 		// column is unused and these arms are skipped, exactly as the
 		// ClickHouse builder skips them for raw tags
-		if f.IsSetValues() && len(f.Values) > 0 {
-			arms = append(arms, "list_contains("+param(f.Values)+", "+stagCol+")")
-		}
 		if f.IsSetRe2() && f.Re2 != "" {
+			// the pattern arm replaces the values arm, not adds to it — the
+			// builder's `else if`. Every negative-regex matcher arrives with
+			// both set (the engine enumerates the non-matching values too),
+			// and the values arm would then exclude rows the pattern keeps
 			arms = append(arms, "regexp_matches("+stagCol+", "+param(f.Re2)+")")
+		} else if f.IsSetValues() && len(f.Values) > 0 {
+			arms = append(arms, "list_contains("+param(f.Values)+", "+stagCol+")")
 		}
 		if f.IsSetEmpty() {
 			arms = append(arms, "("+tagCol+" = 0 AND "+stagCol+" = '')")

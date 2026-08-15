@@ -38,6 +38,17 @@ type HostTag struct {
 	S  string
 }
 
+// HostPair is one host column: the tag halves plus the skewed comparison value
+// the conveyor draws once per row and ClickHouse keeps inside the
+// argMin/argMax state (see data_model.SkewMinMaxHost — host selection is
+// value-weighted, not a plain extremum). The value is the state's payload, so
+// it rides the pair through writes, compaction and reads: merges order by it
+// and serve it back, exactly as argMinMergeState/argMaxMergeState do.
+type HostPair struct {
+	Tag   HostTag
+	Value float64
+}
+
 // Row is one resolved aggregator row to write into the delta: the duck-store
 // counterpart of the aggregator's insertRow. Time is the row's own unix
 // seconds; the writer truncates it per tier. The sketch columns carry
@@ -58,9 +69,9 @@ type Row struct {
 	Percentiles []byte
 	Unique      []byte
 
-	MinHost      HostTag
-	MaxHost      HostTag
-	MaxCountHost HostTag
+	MinHost      HostPair
+	MaxHost      HostPair
+	MaxCountHost HostPair
 }
 
 // WriterConfig configures a Writer.
@@ -366,13 +377,13 @@ func (w *Writer) appendTierRow(tier string, r *Row) error {
 	w.vals = append(w.vals, topID, topS)
 	w.vals = append(w.vals,
 		r.Count, r.Min, r.Max, r.Count, r.Sum, r.SumSquare)
-	minID, minS := tagColumnValues(r.MinHost.ID, r.MinHost.S)
-	maxID, maxS := tagColumnValues(r.MaxHost.ID, r.MaxHost.S)
-	mcID, mcS := tagColumnValues(r.MaxCountHost.ID, r.MaxCountHost.S)
+	minID, minS := tagColumnValues(r.MinHost.Tag.ID, r.MinHost.Tag.S)
+	maxID, maxS := tagColumnValues(r.MaxHost.Tag.ID, r.MaxHost.Tag.S)
+	mcID, mcS := tagColumnValues(r.MaxCountHost.Tag.ID, r.MaxCountHost.Tag.S)
 	w.vals = append(w.vals,
-		minID, minS,
-		maxID, maxS,
-		mcID, mcS,
+		minID, minS, r.MinHost.Value,
+		maxID, maxS, r.MaxHost.Value,
+		mcID, mcS, r.MaxCountHost.Value,
 		r.Percentiles, r.Unique)
 	return a.AppendRow(w.vals...)
 }

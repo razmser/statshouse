@@ -24,7 +24,8 @@ import (
 //	1: initial layout — tier tables plus the version stamp
 //	2: every store file also carries duck_store_consumed
 //	3: every store file also carries duck_store_sealed
-const SchemaVersion = 3
+//	4: host columns also carry their skewed argMin/argMax state values
+const SchemaVersion = 4
 
 // VersionTable is the version-stamp table written into every store file
 // (delta generations and archive windows alike). It carries the three version
@@ -120,12 +121,20 @@ func tierTableDDL(table string) string {
 	for _, c := range []string{"count", "min", "max", "max_count", "sum", "sumsquare"} {
 		fmt.Fprintf(&b, "    %s DOUBLE NOT NULL DEFAULT 0,\n", c)
 	}
-	b.WriteString("    min_host        INTEGER NOT NULL DEFAULT 0,\n")
-	b.WriteString("    min_shost       VARCHAR NOT NULL DEFAULT '',\n")
-	b.WriteString("    max_host        INTEGER NOT NULL DEFAULT 0,\n")
-	b.WriteString("    max_shost       VARCHAR NOT NULL DEFAULT '',\n")
-	b.WriteString("    max_count_host  INTEGER NOT NULL DEFAULT 0,\n")
-	b.WriteString("    max_count_shost VARCHAR NOT NULL DEFAULT '',\n")
+	// Each host triple is ClickHouse's AggregateFunction(argMin/argMax, String,
+	// Float32) column unrolled: the tag halves plus the skewed comparison
+	// value the conveyor draws once per row (see data_model.SkewMinMaxHost —
+	// host selection is value-weighted, not a plain extremum). Merges order
+	// by the value and serve it back, exactly as the state does.
+	b.WriteString("    min_host             INTEGER NOT NULL DEFAULT 0,\n")
+	b.WriteString("    min_shost            VARCHAR NOT NULL DEFAULT '',\n")
+	b.WriteString("    min_host_value       DOUBLE NOT NULL DEFAULT 0,\n")
+	b.WriteString("    max_host             INTEGER NOT NULL DEFAULT 0,\n")
+	b.WriteString("    max_shost            VARCHAR NOT NULL DEFAULT '',\n")
+	b.WriteString("    max_host_value       DOUBLE NOT NULL DEFAULT 0,\n")
+	b.WriteString("    max_count_host       INTEGER NOT NULL DEFAULT 0,\n")
+	b.WriteString("    max_count_shost      VARCHAR NOT NULL DEFAULT '',\n")
+	b.WriteString("    max_count_host_value DOUBLE NOT NULL DEFAULT 0,\n")
 	b.WriteString("    percentiles BLOB NOT NULL DEFAULT ''::BLOB,\n")
 	b.WriteString("    uniq_state  BLOB NOT NULL DEFAULT ''::BLOB\n)")
 	return b.String()

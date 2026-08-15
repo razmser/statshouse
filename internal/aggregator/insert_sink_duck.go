@@ -301,17 +301,21 @@ func (s *duckSink) AppendRow(row *insertRow) int {
 	dr.SumSquare = row.sumSquare
 	dr.Percentiles = append([]byte(nil), row.percentiles...)
 	dr.Unique = append([]byte(nil), row.unique...)
-	dr.MinHost = duckHostTag(row.minHost)
-	dr.MaxHost = duckHostTag(row.maxHost)
-	dr.MaxCountHost = duckHostTag(row.maxCountHost)
+	dr.MinHost = duckHostPair(row.minHost)
+	dr.MaxHost = duckHostPair(row.maxHost)
+	dr.MaxCountHost = duckHostPair(row.maxCountHost)
 	s.rows = append(s.rows, dr)
 	n := rowBinarySize(row)
 	s.size += n
 	return n
 }
 
-func duckHostTag(h hostPair) duckstore.HostTag {
-	return duckstore.HostTag{ID: h.tag.I, S: h.tag.S}
+// duckHostPair converts one resolved host column, keeping the skewed
+// comparison value: it is the argMin/argMax state's payload — exactly the
+// value the ClickHouse sink writes into the state — and the store orders and
+// serves hosts by it.
+func duckHostPair(h hostPair) duckstore.HostPair {
+	return duckstore.HostPair{Tag: duckstore.HostTag{ID: h.tag.I, S: h.tag.S}, Value: float64(h.value)}
 }
 
 // Send writes the pending round. Success maps onto ClickHouse's 200 the way
