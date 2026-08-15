@@ -16,6 +16,9 @@
 #   bash e2e/lima.sh                 # full suite, all three clients, fresh stack
 #   bash e2e/lima.sh --keep          # leave the stack up; curl the api from the Mac
 #   bash e2e/lima.sh --client=go     # any harness flag passes through verbatim
+#   bash e2e/lima.sh --conformance   # differential: ClickHouse vs duck-store side
+#                                    # by side over one shared metadata, compared
+#                                    # by decoded value (CI gate; fails non-zero)
 #
 # Idempotent — create-once, run-many:
 #   • The VM is created on first run (downloads the Ubuntu image, ~1 GB) and

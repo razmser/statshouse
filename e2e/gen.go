@@ -79,7 +79,7 @@ func (b *streamBuilder) addValueP() {
 		if n := fullKeyLen(name, ss.tags); n > b.maxKey {
 			b.maxKey = n
 		}
-		m.Series = append(m.Series, seriesModel{Tags: nt, Values: values})
+		m.Series = append(m.Series, seriesModel{Tags: nt, Values: values, GenKind: ss.gen.Kind})
 	}
 	b.metrics = append(b.metrics, m)
 }

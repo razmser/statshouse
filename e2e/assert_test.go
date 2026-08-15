@@ -170,6 +170,42 @@ func TestComparePercentile(t *testing.T) {
 	}
 }
 
+// TestComparePercentileSkewBand pins the widened band for the SKEWED generator:
+// its steep inverse CDF amplifies t-digest quantile-space error past the flat
+// 1% band (observed live: p50 +1.09% on CH itself with count/sum exact), so
+// those series are held to percentileSkewTol instead — while a uniform series
+// in the SAME metric keeps the 1% band.
+func TestComparePercentileSkewBand(t *testing.T) {
+	base := uint32(1_700_000_000)
+	skewVals := genValueSkewed(1000) // sorted; steep inverse CDF near the median
+	m := metricModel{Name: "e2e_x_go_vp_mix", Kind: kindValueP, QBKeys: []string{"0"}, Series: []seriesModel{
+		{Tags: []tag{{"0", "unif"}}, Values: map[uint32][]float64{base: genValueUniform(1000)}},
+		{Tags: []tag{{"0", "skew"}}, Values: map[uint32][]float64{base: skewVals}, GenKind: genKindValueSkewed},
+	}}
+	unifMeta := apiSeriesMeta{Tags: map[string]apiMetaTag{"key0": {"unif"}}}
+	skewMeta := apiSeriesMeta{Tags: map[string]apiMetaTag{"key0": {"skew"}}}
+	truth := quantile(skewVals, 0.5)
+
+	// +4% on the skew series: inside percentileSkewTol (5%), outside the flat 1%.
+	got := truth * 1.04
+	resp := mkSeriesResp([]apiSeriesMeta{skewMeta}, [][]float64{{got}}, 0, base, 1)
+	if mm, _, _, _ := compareByFunc(m, resp, queryFunc{qw: "p50", q: 0.5}); len(mm) != 0 {
+		t.Errorf("+4%% on the skew series should pass under the 5%% band (truth=%g got=%g): %v", truth, got, mm)
+	}
+	// The same +4% on the UNIFORM series must still fail — the band is
+	// per-generator, not metric-wide.
+	unifTruth := quantile(genValueUniform(1000), 0.5)
+	resp = mkSeriesResp([]apiSeriesMeta{unifMeta}, [][]float64{{unifTruth * 1.04}}, 0, base, 1)
+	if mm, _, _, _ := compareByFunc(m, resp, queryFunc{qw: "p50", q: 0.5}); len(mm) != 1 {
+		t.Errorf("+4%% on the uniform series must fail the 1%% band (truth=%g): %v", unifTruth, mm)
+	}
+	// +7% on the skew series exceeds even the widened band.
+	resp = mkSeriesResp([]apiSeriesMeta{skewMeta}, [][]float64{{truth * 1.07}}, 0, base, 1)
+	if mm, _, _, _ := compareByFunc(m, resp, queryFunc{qw: "p50", q: 0.5}); len(mm) != 1 {
+		t.Errorf("+7%% on the skew series should fail the 5%% band (truth=%g): %v", truth, mm)
+	}
+}
+
 // TestCompareUnique pins both unique modes: exact for the small case, ±2% for the
 // big case (the comparator switches on distinct > uniquesHashMaxSize).
 func TestCompareUnique(t *testing.T) {

@@ -56,6 +56,7 @@ func main() {
 		withUI          = flag.Bool("with-ui", false, "build the npm UI in a pinned node container and serve it from the api's --static-dir (default off: no node, no UI build). On apple/container this needs npm on the host to warm the build cache (apple/container has no in-container network); the docker runtime installs online in the node container")
 		apiPortFlag     = flag.String("api-port", "", `override the api published host port: "" uses e2e/config.yaml (default 10888); "auto" picks a free port on 127.0.0.1; or a port number, e.g. "10889", so concurrent runs don't collide`)
 		prewarmRetries  = flag.Int("prewarm-retries", 2, "extra attempts when a client's pre-warm times out (driver exit 3, a transient journal-longpoll stall); 0 fails immediately (pre-change behavior)")
+		conformance     = flag.Bool("conformance", false, "differential conformance run: boot ClickHouse plus TWO daemon stacks (ch-backed and duck-backed) over one shared metadata, seed the identical deterministic stream to both agents from the harness itself, and compare both apis' decoded answers to every query shape (CH is the reference; divergence fails the run)")
 		clientSel       clientFlag
 	)
 	flag.Var(&clientSel, "client", "client(s) to drive (repeatable; one of: go, rust, cpp). Default: all three")
@@ -66,7 +67,20 @@ func main() {
 		fmt.Fprintf(os.Stderr, "FAIL: %v\n", err)
 		os.Exit(2)
 	}
-	os.Exit(realMain(*runtimeFlag, *runIDFlag, *archFlag, backend, *keep, *verbose, *timeout, clientSel, *skipClientBuild, *withUI, *apiPortFlag, *prewarmRetries))
+	if *conformance {
+		// Conformance compares the ch and duck backends side by side, so its
+		// CH stack must run on ClickHouse (the duck stack is started
+		// internally), and it seeds its own stream — no client drivers.
+		if backend != backendClickHouse {
+			fmt.Fprintf(os.Stderr, "FAIL: --conformance compares clickhouse vs duck and boots its own ClickHouse stack; do not pass --storage-backend (leave it at the default)\n")
+			os.Exit(2)
+		}
+		if len(clientSel) != 0 {
+			fmt.Fprintf(os.Stderr, "FAIL: --conformance seeds its stream from the harness itself; --client is not valid in this mode\n")
+			os.Exit(2)
+		}
+	}
+	os.Exit(realMain(*runtimeFlag, *runIDFlag, *archFlag, backend, *keep, *verbose, *timeout, clientSel, *skipClientBuild, *withUI, *apiPortFlag, *prewarmRetries, *conformance))
 }
 
 // clientFlag is a repeatable --client selector (flag.Var). Each Set appends, so
@@ -185,7 +199,7 @@ func driverTags(drivers []clientDriver) string {
 	return strings.Join(tags, ", ")
 }
 
-func realMain(runtimeFlag, runIDFlag, archFlag string, backend storageBackend, keep, verbose bool, timeout time.Duration, clientSel clientFlag, skipClientBuild, withUI bool, apiPortFlag string, prewarmRetries int) int {
+func realMain(runtimeFlag, runIDFlag, archFlag string, backend storageBackend, keep, verbose bool, timeout time.Duration, clientSel clientFlag, skipClientBuild, withUI bool, apiPortFlag string, prewarmRetries int, conformance bool) int {
 	runID := runIDFlag
 	if runID == "" {
 		runID = time.Now().Format("20060102-150405")
@@ -212,7 +226,7 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, backend storageBackend, k
 	// via NAT egress on docker) and its output is mounted into the api as
 	// --static-dir=/ui. Off by default — no node, no UI build.
 
-	rec := &recorder{verbose: verbose, artifactsDir: artifactsDir}
+	rec := &recorder{verbose: verbose, artifactsDir: artifactsDir, runID: runID}
 	rec.logf("runid=%s artifacts=%s", runID, artifactsDir)
 
 	network := e2ePrefix + runID
@@ -476,6 +490,12 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, backend storageBackend, k
 	defer os.Remove(rpcKeyPath)
 
 	start := time.Now()
+	chStackTag := ""
+	if conformance {
+		// Tag the stacks so the ch and duck daemon sets coexist on one network
+		// with distinct container names (e2e-<runid>-ch-agg / -duck-agg).
+		chStackTag = confStackCH
+	}
 	ds, err = startDaemonStack(ctx, rt, rec, daemonStackOpts{
 		network:      network,
 		chIP:         chIP,
@@ -486,6 +506,7 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, backend storageBackend, k
 		apiStaticDir: apiStaticDir,
 		staticMount:  apiMountTarget,
 		backend:      backend,
+		stackTag:     chStackTag,
 	})
 	containers = append(containers, ds.containerNames()...)
 	if err != nil {
@@ -527,6 +548,49 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, backend storageBackend, k
 	}
 	rec.logf("agent↔agg conveyor live (recent %s point)", queryMetric)
 
+	// --- conformance: boot the SECOND (duck) stack over the SHARED metadata ---
+	// buildDaemons is idempotent across backends (one shared bin dir + mtime
+	// cache; only statshouse-agg differs, cached separately as the duckdb-tagged
+	// build), so this second call only cross-compiles the duck aggregator.
+	var duckAPIAddr, duckAgentAddr string
+	if conformance {
+		duckBinDir, err := buildDaemons(ctx, root, arch, backendDuck, rec.logf)
+		if err != nil {
+			return fail(rec, artifactsDir, rt, containers, fmt.Errorf("build duck daemons: %w", err))
+		}
+		rec.logf("conformance: starting the duck stack over shared metadata %s", ds.metadata.name)
+		startDuck := time.Now()
+		dsDuck, err := startDaemonStack(ctx, rt, rec, daemonStackOpts{
+			network:      network,
+			binDir:       duckBinDir,
+			runID:        runID,
+			cfg:          publishConfig{}, // no published port: the harness dials the container IP directly
+			rpcKeyPath:   rpcKeyPath,
+			apiStaticDir: apiStaticDir,
+			staticMount:  apiMountTarget,
+			backend:      backendDuck,
+			stackTag:     confStackDuck,
+			sharedMeta:   ds.metadata,
+		})
+		// The duck stack reuses the shared metadata container (already tracked);
+		// only its own three services are appended.
+		containers = append(containers, dsDuck.agg.name, dsDuck.api.name, dsDuck.agent.name)
+		if err != nil {
+			return fail(rec, artifactsDir, rt, containers, fmt.Errorf("duck daemon stack: %w", err))
+		}
+		rec.logf("duck daemon stack ready (agg+api+agent green in %.1fs)", time.Since(startDuck).Seconds())
+
+		duckAPIAddr = net.JoinHostPort(dsDuck.api.ip, strconv.Itoa(apiPort))
+		if _, err := queryAPI(ctx, duckAPIAddr); err != nil {
+			return fail(rec, artifactsDir, rt, containers, fmt.Errorf("duck api query: %w", err))
+		}
+		if err := waitAggConveyor(ctx, duckAPIAddr); err != nil {
+			return fail(rec, artifactsDir, rt, containers, fmt.Errorf("duck conveyor: %w", err))
+		}
+		duckAgentAddr = net.JoinHostPort(dsDuck.agent.ip, strconv.Itoa(agentPort))
+		rec.logf("duck stack ready: /api/query 200 + conveyor live on %s (agent %s)", duckAPIAddr, duckAgentAddr)
+	}
+
 	// Under -v, stream each daemon container's logs to stderr LIVE while the run
 	// proceeds (-v streams logs live). Stopped before teardown (the stop
 	// defer is registered after teardown's, so it runs first — LIFO) so the tail
@@ -534,7 +598,7 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, backend storageBackend, k
 	// daemons by now; client containers run foreground (their stdout already streams).
 	var stopStreamer func()
 	if verbose {
-		stopStreamer = startLogStreamer(ctx, rt, containers)
+		stopStreamer = startLogStreamer(ctx, rt, containers, runID)
 	}
 	defer func() {
 		if stopStreamer != nil {
@@ -563,10 +627,24 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, backend storageBackend, k
 		prewarmRetries:   prewarmRetries,
 	}
 	var totalPass, totalFail int
-	for _, d := range drivers {
-		p, f := runClientPhase(ctx, rt, rec, d, phaseOpts)
-		totalPass += p
-		totalFail += f
+	if conformance {
+		// The conformance phase replaces the client drivers: the harness itself
+		// seeds the identical stream to BOTH agents in-process (one hostname →
+		// identical _h/max_host across backends), gates on the CH reference
+		// matching the frozen model, then runs the differential request set.
+		totalPass, totalFail = runConformancePhase(ctx, rec, conformancePhaseOpts{
+			runID:     runID,
+			chAPI:     queryAddr,
+			duckAPI:   duckAPIAddr,
+			chAgent:   net.JoinHostPort(ds.agent.ip, strconv.Itoa(agentPort)),
+			duckAgent: duckAgentAddr,
+		})
+	} else {
+		for _, d := range drivers {
+			p, f := runClientPhase(ctx, rt, rec, d, phaseOpts)
+			totalPass += p
+			totalFail += f
+		}
 	}
 	// The run is a failure if any client's assertions failed (non-zero exit) even
 	// though the stack came up. Service logs are dumped on failure for diagnosis.
@@ -587,8 +665,14 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, backend storageBackend, k
 	for _, d := range drivers {
 		names = append(names, d.tag)
 	}
-	summary := fmt.Sprintf("PASS: client(s) [%s] drove the full pipeline, %d metric/func assertion(s) passed, runtime=%s, runid=%s",
-		strings.Join(names, " "), totalPass, rt.Name(), runID)
+	summary := ""
+	if conformance {
+		summary = fmt.Sprintf("PASS: conformance differential — %d assertion(s) passed (frozen-model reference gate + duck-vs-clickhouse by decoded value), runtime=%s, runid=%s",
+			totalPass, rt.Name(), runID)
+	} else {
+		summary = fmt.Sprintf("PASS: client(s) [%s] drove the full pipeline, %d metric/func assertion(s) passed, runtime=%s, runid=%s",
+			strings.Join(names, " "), totalPass, rt.Name(), runID)
+	}
 	rec.logf("%s", summary)
 	writeRunArtifacts(artifactsDir, rec)
 	fmt.Println(summary)
@@ -971,6 +1055,7 @@ type recorder struct {
 	lines        []string
 	verbose      bool
 	artifactsDir string
+	runID        string // the e2e-<runID>- prefix of THIS run's containers (stripped by serviceLogName)
 
 	fqMu          sync.Mutex
 	failedQueries []failedQuery
@@ -1135,7 +1220,7 @@ func dumpServiceLogs(rec *recorder, rt Runtime, containers []string, artifactsDi
 			rec.logf("could not capture logs for %s: %v", c, lerr)
 			continue
 		}
-		name := serviceLogName(c)
+		name := serviceLogName(c, rec.runID)
 		if werr := os.WriteFile(filepath.Join(artifactsDir, name+".log"), []byte(logs), 0o644); werr != nil {
 			rec.logf("could not write %s.log: %v", name, werr)
 			continue
@@ -1144,9 +1229,15 @@ func dumpServiceLogs(rec *recorder, rt Runtime, containers []string, artifactsDi
 	}
 }
 
-// serviceLogName reduces a container name to its service role: the last dash-
-// separated segment (e2e-<runid>-clickhouse -> clickhouse, ...-metadata -> metadata).
-func serviceLogName(container string) string {
+// serviceLogName reduces a container name to its service role. With the run id
+// known it strips e2e-<runid>- and keeps the whole remainder, so the conformance
+// mode's two stacks stay distinct (e2e-<runid>-ch-agg -> ch-agg, ...-duck-agg ->
+// duck-agg); without one (older callers) it falls back to the last dash segment
+// (e2e-<runid>-clickhouse -> clickhouse).
+func serviceLogName(container string, runID string) string {
+	if prefix := e2ePrefix + runID + "-"; runID != "" && strings.HasPrefix(container, prefix) {
+		return strings.TrimPrefix(container, prefix)
+	}
 	if i := strings.LastIndex(container, "-"); i >= 0 {
 		return container[i+1:]
 	}
@@ -1176,7 +1267,7 @@ func writeRunArtifacts(artifactsDir string, rec *recorder) {
 // daemon log line from the harness's own [e2e] progress lines. Best-effort: any
 // fetch error is swallowed (a transient CLI hiccup must not abort the run). Returns
 // a stop func that cancels the tail goroutine; the caller stops it before teardown.
-func startLogStreamer(ctx context.Context, rt Runtime, containers []string) (stop func()) {
+func startLogStreamer(ctx context.Context, rt Runtime, containers []string, runID string) (stop func()) {
 	sctx, cancel := context.WithCancel(ctx)
 	var once sync.Once
 	stop = func() { once.Do(cancel) }
@@ -1198,7 +1289,7 @@ func startLogStreamer(ctx context.Context, rt Runtime, containers []string) (sto
 					}
 					delta := logs[last[c]:]
 					last[c] = len(logs)
-					svc := serviceLogName(c)
+					svc := serviceLogName(c, runID)
 					for _, line := range strings.Split(strings.TrimRight(delta, "\n"), "\n") {
 						if line != "" {
 							fmt.Fprintf(os.Stderr, "[%s] %s\n", svc, line)

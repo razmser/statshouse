@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 )
@@ -181,12 +180,15 @@ const (
 // the map matching the metric's kind is populated; the asserter reads the right
 // one. Each map is keyed by absolute bucket timestamp and fully populated for
 // every bucket the series wrote (numBuckets, or bigUniqueBuckets for the stress
-// case).
+// case). GenKind records the generator for loop-payload series (empty for
+// literal payloads) — the percentile asserter widens its band for the skewed
+// generator, whose inverse CDF amplifies quantile-space error into value space.
 type seriesModel struct {
 	Tags    []tag
 	Counts  map[uint32]float64   // counter / stag: expected count
 	Values  map[uint32][]float64 // value / value_p: merged values (sorted for value_p)
 	Uniques map[uint32]int       // unique: expected distinct count
+	GenKind string               // genSpec.Kind for generator series; "" for literal
 }
 
 // metricModel is the expected model for one metric: Kind drives the asserter
@@ -477,11 +479,5 @@ func fullKeyLen(metric string, tags []tag) int {
 	return n
 }
 
-func sortedKeys(set map[string]bool) []string {
-	keys := make([]string, 0, len(set))
-	for k := range set {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys
-}
+// (sortedKeys now lives in conformance.go as a generic over map[string]V,
+// covering this file's map[string]bool uses)

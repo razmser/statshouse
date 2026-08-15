@@ -103,13 +103,24 @@ type daemonStackOpts struct {
 	binDir       string // host dir holding the four compiled daemon binaries
 	runID        string
 	cfg          publishConfig
-	rpcKeyPath   string // host path to the shared RPC crypto key (mounted into all four)
-	apiStaticDir string // host dir with index.html (mounted into the api at staticMount)
-	staticMount  string // in-container mount target = --static-dir value (apiStaticMount or apiUIMount)
+	rpcKeyPath   string         // host path to the shared RPC crypto key (mounted into all four)
+	apiStaticDir string         // host dir with index.html (mounted into the api at staticMount)
+	staticMount  string         // in-container mount target = --static-dir value (apiStaticMount or apiUIMount)
 	backend      storageBackend // clickhouse: the usual stack; duck: DuckDB in the aggregator, no ClickHouse
+	stackTag     string         // "" default; else a tag between runID and role ("ch"/"duck") so two stacks coexist on one network
+	sharedMeta   *service       // non-nil: skip starting metadata and reuse this already-running service (conformance's shared-metadata stacks)
 }
 
-func (o daemonStackOpts) cname(role string) string { return e2ePrefix + o.runID + "-" + role }
+// cname renders a container name. With a stackTag the role is prefixed
+// "tag-role" (e2e-<runid>-ch-agg), keeping the e2ePrefix+runID prefix that
+// pruneStale, teardown and the log streamer match on; without one it is the
+// plain historical shape (e2e-<runid>-agg).
+func (o daemonStackOpts) cname(role string) string {
+	if o.stackTag != "" {
+		role = o.stackTag + "-" + role
+	}
+	return e2ePrefix + o.runID + "-" + role
+}
 
 // keyVol is the read-only volume spec mounting the shared RPC crypto key into a
 // daemon container at rpcKeyMount.
@@ -127,41 +138,49 @@ func startDaemonStack(ctx context.Context, rt Runtime, rec *recorder, o daemonSt
 	ds := &daemonStack{}
 
 	// --- metadata ---
-	// First boot only: --create-binlog initializes the binlog and EXITS, then the
-	// server starts without it (verified in cmd/statshouse-metadata: the
-	// create-binlog path returns nil immediately). Both run in ONE container
-	// sharing its writable layer, so the init step's binlog is present for the
-	// server. metadata is the root service, so all its flags are static literals.
-	metaC := o.cname("metadata")
-	// mkdir (child) -> create-binlog (child, exits 0) -> exec server (replaces
-	// shell, becomes PID 1). Only the server is exec'd: exec'ing create-binlog
-	// would make the (exiting) init step PID 1 and stop the container before the
-	// server starts.
-	metaScript := "mkdir -p /var/lib/meta/binlog && " +
-		`/statshouse-metadata -p 2442 --db-path=/var/lib/meta/db --binlog-prefix=/var/lib/meta/binlog/bl --create-binlog "0,1"` +
-		" && exec " +
-		"/statshouse-metadata -p 2442 --db-path=/var/lib/meta/db --binlog-prefix=/var/lib/meta/binlog/bl" +
-		" --rpc-crypto-path=" + rpcKeyMount
-	if err := rt.Run(ctx, RunOpts{
-		Name:    metaC,
-		Image:   alpineBase,
-		Network: o.network,
-		Volumes: []string{
-			filepath.Join(o.binDir, "statshouse-metadata") + ":/statshouse-metadata:ro",
-			o.keyVol(),
-		},
-		Cmd:    []string{"/bin/sh", "-c", metaScript},
-		Detach: true,
-	}); err != nil {
-		return ds, fmt.Errorf("start metadata: %w", err)
-	}
-	// Track+inspect+probe in one step (shared with agg/api/agent). The helper tracks
-	// the container on the stack BEFORE the inspect so a mid-probe failure still
-	// tears down the already-running container (an untracked service blocks
-	// NetworkRemove while it stays attached). ds.metadata.ip is the canonical IP;
-	// later blocks read it from there.
-	if err := startServiceProbe(ctx, rt, rec, &ds.metadata, "metadata", metaC, o.network, metaPort, ""); err != nil {
-		return ds, err
+	// Conformance runs TWO daemon stacks over ONE shared metadata (both aggs
+	// auto-create into it; both apis journal from it) — the second stack skips
+	// the start and reuses the first's service.
+	if o.sharedMeta != nil {
+		ds.metadata = o.sharedMeta
+		rec.logf("reusing shared metadata %s at %s", ds.metadata.name, ds.metadata.ip)
+	} else {
+		// First boot only: --create-binlog initializes the binlog and EXITS, then the
+		// server starts without it (verified in cmd/statshouse-metadata: the
+		// create-binlog path returns nil immediately). Both run in ONE container
+		// sharing its writable layer, so the init step's binlog is present for the
+		// server. metadata is the root service, so all its flags are static literals.
+		metaC := o.cname("metadata")
+		// mkdir (child) -> create-binlog (child, exits 0) -> exec server (replaces
+		// shell, becomes PID 1). Only the server is exec'd: exec'ing create-binlog
+		// would make the (exiting) init step PID 1 and stop the container before the
+		// server starts.
+		metaScript := "mkdir -p /var/lib/meta/binlog && " +
+			`/statshouse-metadata -p 2442 --db-path=/var/lib/meta/db --binlog-prefix=/var/lib/meta/binlog/bl --create-binlog "0,1"` +
+			" && exec " +
+			"/statshouse-metadata -p 2442 --db-path=/var/lib/meta/db --binlog-prefix=/var/lib/meta/binlog/bl" +
+			" --rpc-crypto-path=" + rpcKeyMount
+		if err := rt.Run(ctx, RunOpts{
+			Name:    metaC,
+			Image:   alpineBase,
+			Network: o.network,
+			Volumes: []string{
+				filepath.Join(o.binDir, "statshouse-metadata") + ":/statshouse-metadata:ro",
+				o.keyVol(),
+			},
+			Cmd:    []string{"/bin/sh", "-c", metaScript},
+			Detach: true,
+		}); err != nil {
+			return ds, fmt.Errorf("start metadata: %w", err)
+		}
+		// Track+inspect+probe in one step (shared with agg/api/agent). The helper tracks
+		// the container on the stack BEFORE the inspect so a mid-probe failure still
+		// tears down the already-running container (an untracked service blocks
+		// NetworkRemove while it stays attached). ds.metadata.ip is the canonical IP;
+		// later blocks read it from there.
+		if err := startServiceProbe(ctx, rt, rec, &ds.metadata, "metadata", metaC, o.network, metaPort, ""); err != nil {
+			return ds, err
+		}
 	}
 
 	// --- aggregator ---
