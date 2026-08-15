@@ -2962,7 +2962,23 @@ func (c *seriesQuery) rowAtPoint(i int) pSelectRow {
 	var row pSelectRow
 	c.valuesAt(i, &row.tsValues)
 	for j := range c.tag {
-		row.tag[c.tag[j].tagX] = c.tag[j].dataInt64[i]
+		// writeSelectInt registers a mapped tag column as Int32 and only an
+		// aliased expression as Int64; rowAt has always guarded both. Reading
+		// dataInt64 unguarded panicked the api (index out of range on the nil
+		// slice) on any /api/point query grouping by a mapped tag — a path
+		// nothing exercised until the e2e conformance suite issued one.
+		if c.tag[j].dataInt32 != nil {
+			row.tag[c.tag[j].tagX] = int64(c.tag[j].dataInt32[i])
+		} else {
+			row.tag[c.tag[j].tagX] = c.tag[j].dataInt64[i]
+		}
+	}
+	for j := range c.stag {
+		start := c.stag[j].data.Pos[i].Start
+		end := c.stag[j].data.Pos[i].End
+		if start < end && end <= len(c.stag[j].data.Buf) {
+			row.stag[c.stag[j].tagX] = string(c.stag[j].data.Buf[start:end])
+		}
 	}
 	if len(c.minHostV2) != 0 {
 		row.minHost = c.minHostV2[i]
