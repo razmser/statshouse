@@ -1,0 +1,184 @@
+package main
+
+// The harness's storage-backend selection: the same suite drives either the
+// usual ClickHouse stack (the default) or the duck stack, where DuckDB lives
+// inside the aggregator, no ClickHouse container exists, and the api reads
+// through the aggregator's structured query RPC. Everything backend-specific
+// resolves through the helpers here so the boot code in main.go/daemons.go
+// stays a branch on one value, and the choice is unit-testable without any
+// container.
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"os"
+	"os/exec"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/VKCOM/tl/pkg/rpc"
+
+	"github.com/VKCOM/statshouse/internal/data_model/gen2/tlstatshouse"
+)
+
+// storageBackend names the metric-data backend a run drives.
+type storageBackend string
+
+const (
+	// backendClickHouse is the default stack: a ClickHouse container plus the
+	// four daemons pointed at it.
+	backendClickHouse storageBackend = "clickhouse"
+	// backendDuck runs the aggregator with DuckDB embedded (the duckdb
+	// build-tagged binary): no ClickHouse container, the aggregator serves
+	// store queries on its own second address, and the api fans every query
+	// out to it over the structured query RPC.
+	backendDuck storageBackend = "duck"
+)
+
+// parseStorageBackend resolves the --storage-backend flag. An empty value (the
+// flag's default) selects clickhouse; anything but the two known names is a
+// hard error naming the flag and both choices.
+func parseStorageBackend(v string) (storageBackend, error) {
+	switch v {
+	case "":
+		return backendClickHouse, nil
+	case string(backendClickHouse):
+		return backendClickHouse, nil
+	case string(backendDuck):
+		return backendDuck, nil
+	default:
+		return "", fmt.Errorf("unknown --storage-backend %q (want %q or %q)", v, backendClickHouse, backendDuck)
+	}
+}
+
+// daemonSpecsFor returns the daemons to cross-compile for a backend. The two
+// backends differ in exactly one daemon: under duck the aggregator is built
+// from the same package with the `duckdb` build tag and the verified static
+// cgo link, and is cached under its own binary name so it never collides with
+// (or rebuilds over) the pure-Go aggregator of a clickhouse run sharing the
+// same cache dir.
+func daemonSpecsFor(backend storageBackend) []daemonSpec {
+	specs := make([]daemonSpec, len(daemonCmds))
+	copy(specs, daemonCmds)
+	if backend == backendDuck {
+		for i := range specs {
+			if specs[i].bin == "statshouse-agg" {
+				specs[i] = daemonSpec{
+					bin:    aggBinName(backend),
+					pkg:    specs[i].pkg,
+					cgo:    true,
+					duckDB: true,
+				}
+			}
+		}
+	}
+	return specs
+}
+
+// aggBinName is the cached binary name of the aggregator for a backend: the
+// pure-Go build under clickhouse, the DuckDB-tagged static build under duck.
+// The container mounts either one at /statshouse-agg, so the entrypoint script
+// never varies with the backend.
+func aggBinName(backend storageBackend) string {
+	if backend == backendDuck {
+		return "statshouse-agg-duck"
+	}
+	return "statshouse-agg"
+}
+
+// duckDBExtLDFlags computes the verified static-link flags for the
+// DuckDB-tagged aggregator cross-compile (the recipe from
+// .scratch/duck-store/02-cgo-build-research.md, mirroring the Makefile's
+// build-agg-duckdb): a naive -static links but then segfaults at DuckDB
+// startup, because under a pre-2.34 glibc libstdc++ probes weak pthread
+// symbols and only the pthread archive members that resolved some reference
+// get linked in — leaving DuckDB's scheduler with no-op mutexes.
+// Whole-archiving libpthread.a fixes it; --allow-multiple-definition absorbs
+// the byte-identical members Go's own -lpthread already pulled in. The archive
+// must be passed by explicit path (resolved via the cross CC), not -lpthread.
+func duckDBExtLDFlags(cc string) (string, error) {
+	out, err := exec.Command(cc, "-print-file-name=libpthread.a").Output()
+	if err != nil {
+		return "", fmt.Errorf("resolve libpthread.a from %s: %w", cc, err)
+	}
+	p := strings.TrimSpace(string(out))
+	if p == "" || !strings.HasSuffix(p, "libpthread.a") {
+		// gcc prints the argument back unchanged when it cannot resolve the
+		// file; treat that as a broken toolchain rather than a link flag.
+		return "", fmt.Errorf("%s -print-file-name=libpthread.a returned %q (no libpthread.a in the toolchain?)", cc, p)
+	}
+	return fmt.Sprintf("-static -Wl,--allow-multiple-definition -Wl,--whole-archive %s -Wl,--no-whole-archive", p), nil
+}
+
+// storeQueryProbeRequest builds the readiness probe's series request: an
+// empty, one-minute, 1-second-LOD query with no metric, no filters and no
+// aggregations. It addresses no metric id, so the aggregator's journal
+// validation has nothing to check, and the renderer answers zero rows from an
+// empty store — which is exactly what makes a successful round-trip proof that
+// the whole path (TL parse → admission → DuckDB → response) is live, rather
+// than proof that a TCP port is open.
+func storeQueryProbeRequest(now time.Time) tlstatshouse.StoreQuerySeries {
+	return tlstatshouse.StoreQuerySeries{
+		Base: tlstatshouse.StoreQueryBase{
+			Lod: tlstatshouse.StoreLod{
+				FromSec: now.Add(-time.Minute).Unix(),
+				ToSec:   now.Unix(),
+				StepSec: 1,
+			},
+		},
+	}
+}
+
+// waitStoreQueryReady proves the aggregator's store-query RPC is serving by
+// issuing a real storeQuerySeries from the harness and waiting for a clean
+// answer. Under duck this replaces "the ClickHouse schema finished loading" as
+// the storage-readiness gate: the daemons wire by IP, so the probe dials the
+// aggregator's container IP directly from the host (the same reachability
+// waitTCP relies on). rpcKeyPath is the shared RPC crypto key file; the probe
+// runs on the host, not the run network, so the nonce exchange requires
+// encryption and the client must present the same key the aggregator holds.
+func waitStoreQueryReady(ctx context.Context, rt Runtime, container, addr, rpcKeyPath string) error {
+	key, err := os.ReadFile(rpcKeyPath)
+	if err != nil {
+		return fmt.Errorf("read RPC crypto key for the store-query probe: %w", err)
+	}
+	client := &tlstatshouse.Client{
+		Client: rpc.NewClient(
+			rpc.ClientWithProtocolVersion(rpc.LatestProtocolVersion),
+			rpc.ClientWithCryptoKey(string(key)),
+		),
+		Network: "tcp4",
+		Address: addr,
+	}
+	defer func() { _ = client.Client.Close() }()
+
+	const (
+		timeout  = 3 * time.Minute
+		interval = 2 * time.Second
+	)
+	var lastErr string
+	args := storeQueryProbeRequest(time.Now())
+	if perr := poll(ctx, timeout, interval, func() (bool, error) {
+		cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		var resp tlstatshouse.StoreSeriesResponse
+		err := client.StoreQuerySeries(cctx, args, nil, &resp)
+		if err == nil {
+			return true, nil
+		}
+		lastErr = err.Error()
+		return false, nil
+	}); perr != nil {
+		return fmt.Errorf("agg store-query rpc (%s) did not answer a real storeQuerySeries within %s: %v\n%s",
+			addr, timeout, perr, diagnose(ctx, rt, container, lastErr))
+	}
+	return nil
+}
+
+// storeQueryAddr renders the aggregator's store-query address on the run
+// network for a given aggregator IP.
+func storeQueryAddr(aggIP string) string {
+	return net.JoinHostPort(aggIP, strconv.Itoa(aggQueryPort))
+}

@@ -6,6 +6,10 @@
 # so nothing here is consumed yet. Later phases load this file and let flags
 # override the values where a flag exists.
 #
+# The publish map is storage-backend-independent: under --storage-backend=duck
+# no ClickHouse container exists (the aggregator is the storage, queried over
+# its own run-network address), and the api publishes exactly the same port.
+#
 # Default publish map: the API alone. ClickHouse ports are present as commented
 # examples (they are only needed when debugging CH from the host).
 publish:

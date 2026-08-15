@@ -28,6 +28,18 @@ const (
 	apiRPCPort = 10889 // api RPC
 	agentPort  = 13337 // agent client: raw UDP + RPC TCP
 
+	// aggQueryPort is the aggregator's SECOND listener under the duck backend:
+	// the store-query RPC the api fans out to (duck-store's bounded,
+	// admission-controlled query endpoint). Unused under clickhouse.
+	aggQueryPort = 13338
+
+	// duckStoreMount is the in-container directory the aggregator's duck-store
+	// owns under the duck backend (delta generations + archive windows are
+	// created inside on first start). The container's writable layer is enough —
+	// the store lives and dies with the run, exactly like the ClickHouse data
+	// dir of a clickhouse run.
+	duckStoreMount = "/store"
+
 	// rpcKeyMount is where the shared RPC crypto key is mounted inside every
 	// daemon container. The agg/agent read it from this default path
 	// (defaultPathToPwd = "/etc/engine/pass"); the metadata/api read it via
@@ -87,13 +99,14 @@ func (ds *daemonStack) containerNames() []string {
 // daemonStackOpts configures startDaemonStack.
 type daemonStackOpts struct {
 	network      string
-	chIP         string // ClickHouse IPv4 on the run network
+	chIP         string // ClickHouse IPv4 on the run network; "" under the duck backend (no ClickHouse exists)
 	binDir       string // host dir holding the four compiled daemon binaries
 	runID        string
 	cfg          publishConfig
 	rpcKeyPath   string // host path to the shared RPC crypto key (mounted into all four)
 	apiStaticDir string // host dir with index.html (mounted into the api at staticMount)
 	staticMount  string // in-container mount target = --static-dir value (apiStaticMount or apiUIMount)
+	backend      storageBackend // clickhouse: the usual stack; duck: DuckDB in the aggregator, no ClickHouse
 }
 
 func (o daemonStackOpts) cname(role string) string { return e2ePrefix + o.runID + "-" + role }
@@ -180,33 +193,13 @@ func startDaemonStack(ctx context.Context, rt Runtime, rec *recorder, o daemonSt
 	// ChangeUserGroup only no-ops for non-root, so it would fatally setuid to the
 	// missing user otherwise (see the agent block for the full rationale).
 	aggC := o.cname("agg")
-	metaAggAddr := net.JoinHostPort(ds.metadata.ip, strconv.Itoa(metaPort))
-	aggScript := fmt.Sprintf(`set -e
-mkdir -p /cache
-AGG_IP=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
-[ -n "$AGG_IP" ] || { echo 'e2e: could not determine aggregator run-network IP' >&2; exit 1; }
-exec /statshouse-agg \
-  --agg-addr=0.0.0.0:%[1]d \
-  --cluster=statlogs2 \
-  --kh=%[2]s:8123 \
-  --auto-create \
-  --auto-create-default-namespace \
-  --deny-old-agents=false \
-  --metadata-addr=%[3]s \
-  --cache-dir=/cache \
-  --receive-budget-warming=0 \
-  --disable-receive-sample-budget \
-  --cluster-shards-addrs=${AGG_IP}:%[1]d,${AGG_IP}:%[1]d,${AGG_IP}:%[1]d \
-  --insert-budget=100000000 \
-  --min-insert-budget=100000000 \
-  -u root -g root`,
-		aggPort, o.chIP, metaAggAddr)
+	aggScript := aggRunScript(o, ds.metadata.ip)
 	if err := rt.Run(ctx, RunOpts{
 		Name:    aggC,
 		Image:   alpineBase,
 		Network: o.network,
 		Volumes: []string{
-			filepath.Join(o.binDir, "statshouse-agg") + ":/statshouse-agg:ro",
+			filepath.Join(o.binDir, aggBinName(o.backend)) + ":/statshouse-agg:ro",
 			o.keyVol(),
 		},
 		Cmd:    []string{"/bin/sh", "-c", aggScript},
@@ -217,6 +210,15 @@ exec /statshouse-agg \
 	if err := startServiceProbe(ctx, rt, rec, &ds.agg, "agg", aggC, o.network, aggPort, ""); err != nil {
 		return ds, err
 	}
+	// Under duck the agg IS the storage: the stack is not ready until the
+	// store-query RPC answers a real query (the replacement for "ClickHouse
+	// schema finished loading" as the storage-readiness gate).
+	if o.backend == backendDuck {
+		if err := waitStoreQueryReady(ctx, rt, aggC, storeQueryAddr(ds.agg.ip), o.rpcKeyPath); err != nil {
+			return ds, err
+		}
+		rec.logf("agg store-query rpc ready (real storeQuerySeries round-trip on :%d)", aggQueryPort)
+	}
 
 	// --- api (+ published port from config) ---
 	apiC := o.cname("api")
@@ -225,26 +227,7 @@ exec /statshouse-agg \
 	if !fileExists(apiStatic) {
 		return ds, fmt.Errorf("missing api static asset %q (the api needs index.html to parse at startup)", apiStatic)
 	}
-	chV2 := strings.Repeat(o.chIP+":9000,", 3)
-	chV2 = strings.TrimSuffix(chV2, ",") // <ch-ip>:9000 three times (cluster config shape)
-	apiCmd := joinSh(
-		"mkdir -p /cache",
-		"/statshouse-api",
-		"--local-mode",
-		"--insecure-mode",
-		"--clickhouse-v2-addrs="+chV2,
-		"--listen-addr=0.0.0.0:"+strconv.Itoa(apiPort),
-		"--listen-rpc-addr=0.0.0.0:"+strconv.Itoa(apiRPCPort),
-		"--metadata-addr="+net.JoinHostPort(ds.metadata.ip, strconv.Itoa(metaPort)),
-		"--available-shards=1",
-		"--cache-dir=/cache",
-		"--rpc-crypto-path="+rpcKeyMount,
-		// The api is built without the `embed` tag, so statshouseui.FS() is nil
-		// and it loads index.html from --static-dir. The mount target is the
-		// placeholder /static by default, or /ui when --with-ui built the npm UI;
-		// either way index.html (a valid Go template) sits at its root.
-		"--static-dir="+o.staticMount,
-	)
+	apiCmd := joinSh("mkdir -p /cache", "/statshouse-api", apiDaemonFlags(o, ds.metadata.ip, ds.agg.ip)...)
 	apiRun := RunOpts{
 		Name:    apiC,
 		Image:   alpineBase,
@@ -343,6 +326,94 @@ exec /statshouse-agg \
 	}
 
 	return ds, nil
+}
+
+// aggRunScript builds the aggregator container's /bin/sh entrypoint. metaIP is
+// the metadata container's run-network IP. The script is extracted so its flags
+// are unit-testable per backend without a container; the two backends differ
+// only in the storage block:
+//
+//   - clickhouse: `--kh=<ch-ip>:8123` names the ClickHouse to write to.
+//   - duck: no ClickHouse exists. `--storage-backend=duck` selects the embedded
+//     DuckDB store (the binary mounted at /statshouse-agg is the duckdb-tagged
+//     build), `--duck-store-dir` owns the store, `--duck-query-addr` opens the
+//     second, query-only listener, and `--local-shard/--local-replica` name the
+//     shard this single process is (the CH cluster autodetect the clickhouse
+//     stack relies on has nothing to read under duck).
+//
+// The budget/sampling flags are shared verbatim: the duck write path rides the
+// same insert-budget and receive-budget machinery, so the known e2e hazards
+// (insert sampler, receive-budget warming) are neutralized identically.
+func aggRunScript(o daemonStackOpts, metaIP string) string {
+	metaAggAddr := net.JoinHostPort(metaIP, strconv.Itoa(metaPort))
+	mkdirDirs := "/cache"
+	var storageFlags string
+	switch o.backend {
+	case backendDuck:
+		mkdirDirs += " " + duckStoreMount
+		storageFlags = fmt.Sprintf(` \
+  --storage-backend=duck \
+  --duck-store-dir=%[1]s \
+  --duck-query-addr=0.0.0.0:%[2]d \
+  --local-shard=1 \
+  --local-replica=1`, duckStoreMount, aggQueryPort)
+	default:
+		storageFlags = fmt.Sprintf(` \
+  --kh=%[1]s:8123`, o.chIP)
+	}
+	return fmt.Sprintf(`set -e
+mkdir -p %[4]s
+AGG_IP=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+[ -n "$AGG_IP" ] || { echo 'e2e: could not determine aggregator run-network IP' >&2; exit 1; }
+exec /statshouse-agg \
+  --agg-addr=0.0.0.0:%[1]d \
+  --cluster=statlogs2 \
+  --auto-create \
+  --auto-create-default-namespace \
+  --deny-old-agents=false \
+  --metadata-addr=%[3]s \
+  --cache-dir=/cache \
+  --receive-budget-warming=0 \
+  --disable-receive-sample-budget \
+  --cluster-shards-addrs=${AGG_IP}:%[1]d,${AGG_IP}:%[1]d,${AGG_IP}:%[1]d \
+  --insert-budget=100000000 \
+  --min-insert-budget=100000000%[2]s \
+  -u root -g root`,
+		aggPort, storageFlags, metaAggAddr, mkdirDirs)
+}
+
+// apiDaemonFlags builds the api daemon's flag list (everything after the
+// binary; joinSh turns it into the exec argv). metaIP and aggIP are the
+// metadata/aggregator container IPs. The storage flags branch on the backend:
+// under clickhouse the api reads ClickHouse directly (`--clickhouse-v2-addrs`),
+// under duck it fans every query out to the aggregator's store-query listener
+// (`--storage-backend=duck` + `--duck-shard-query-addrs`, the same single
+// shard the aggregator owns, numbered 1).
+func apiDaemonFlags(o daemonStackOpts, metaIP, aggIP string) []string {
+	flags := []string{
+		"--local-mode",
+		"--insecure-mode",
+		"--listen-addr=0.0.0.0:" + strconv.Itoa(apiPort),
+		"--listen-rpc-addr=0.0.0.0:" + strconv.Itoa(apiRPCPort),
+		"--metadata-addr=" + net.JoinHostPort(metaIP, strconv.Itoa(metaPort)),
+		"--available-shards=1",
+		"--cache-dir=/cache",
+		"--rpc-crypto-path=" + rpcKeyMount,
+		// The api is built without the `embed` tag, so statshouseui.FS() is nil
+		// and it loads index.html from --static-dir. The mount target is the
+		// placeholder /static by default, or /ui when --with-ui built the npm UI;
+		// either way index.html (a valid Go template) sits at its root.
+		"--static-dir=" + o.staticMount,
+	}
+	if o.backend == backendDuck {
+		flags = append(flags,
+			"--storage-backend=duck",
+			"--duck-shard-query-addrs=1="+storeQueryAddr(aggIP))
+	} else {
+		chV2 := strings.TrimSuffix(strings.Repeat(o.chIP+":9000,", 3), ",") // <ch-ip>:9000 three times (cluster config shape)
+		flags = append(flags, "--clickhouse-v2-addrs="+chV2)
+	}
+	return flags
 }
 
 // startServiceProbe is the repeated tail of every daemon start: track the freshly-

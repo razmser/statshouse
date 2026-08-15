@@ -48,6 +48,7 @@ func main() {
 		runtimeFlag     = flag.String("runtime", "", "container runtime: \"container\" (apple, default on macOS) or \"docker\" (default on Linux); auto-detected if empty")
 		runIDFlag       = flag.String("run-id", "", "run identifier (default: local datetime 20060102-150405)")
 		archFlag        = flag.String("arch", "", "GOARCH to cross-compile daemons for (default arm64; the apple/container + lima/arm64 verification path)")
+		backendFlag     = flag.String("storage-backend", "clickhouse", "storage backend the daemons run: \"clickhouse\" (default; the usual stack) or \"duck\" (DuckDB embedded in the aggregator; no ClickHouse container, the api reads through the aggregator's store-query RPC)")
 		keep            = flag.Bool("keep", false, "keep containers+network after the run for debugging")
 		verbose         = flag.Bool("v", false, "verbose: stream container logs live and dump raw API responses to artifacts")
 		timeout         = flag.Duration("timeout", 10*time.Minute, "overall run timeout")
@@ -60,7 +61,12 @@ func main() {
 	flag.Var(&clientSel, "client", "client(s) to drive (repeatable; one of: go, rust, cpp). Default: all three")
 	flag.Parse()
 
-	os.Exit(realMain(*runtimeFlag, *runIDFlag, *archFlag, *keep, *verbose, *timeout, clientSel, *skipClientBuild, *withUI, *apiPortFlag, *prewarmRetries))
+	backend, err := parseStorageBackend(*backendFlag)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "FAIL: %v\n", err)
+		os.Exit(2)
+	}
+	os.Exit(realMain(*runtimeFlag, *runIDFlag, *archFlag, backend, *keep, *verbose, *timeout, clientSel, *skipClientBuild, *withUI, *apiPortFlag, *prewarmRetries))
 }
 
 // clientFlag is a repeatable --client selector (flag.Var). Each Set appends, so
@@ -179,7 +185,7 @@ func driverTags(drivers []clientDriver) string {
 	return strings.Join(tags, ", ")
 }
 
-func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeout time.Duration, clientSel clientFlag, skipClientBuild, withUI bool, apiPortFlag string, prewarmRetries int) int {
+func realMain(runtimeFlag, runIDFlag, archFlag string, backend storageBackend, keep, verbose bool, timeout time.Duration, clientSel clientFlag, skipClientBuild, withUI bool, apiPortFlag string, prewarmRetries int) int {
 	runID := runIDFlag
 	if runID == "" {
 		runID = time.Now().Format("20060102-150405")
@@ -408,42 +414,53 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeo
 		apiMountTarget = apiUIMount
 	}
 
-	// --- ClickHouse ---
-	start := time.Now()
-	ch, err := startClickHouse(ctx, rt, chContainer, network, root)
-	containers = append(containers, chContainer)
-	if ch != nil && ch.ip != "" {
-		rec.logf("clickhouse container=%s ip=%s", chContainer, ch.ip)
+	// --- ClickHouse (clickhouse backend only) ---
+	// Under duck no ClickHouse container starts and nothing replaces it: the
+	// aggregator IS the storage (DuckDB embedded in the duckdb-tagged build),
+	// so the stack is one container shorter and the agg's own store-query RPC
+	// (probed in startDaemonStack) replaces the ClickHouse schema probe as the
+	// storage-readiness gate.
+	var chIP string
+	if backend == backendDuck {
+		rec.logf("storage backend=duck: no ClickHouse container (DuckDB embedded in the aggregator)")
 	} else {
-		rec.logf("clickhouse container=%s", chContainer)
-	}
-	if err != nil {
-		return fail(rec, artifactsDir, rt, containers, fmt.Errorf("clickhouse: %w", err))
-	}
-	if ch.ip == "" {
-		// An earlier phase treated a missing IP as non-fatal (it probed CH via Exec). The
-		// daemon stack wires to CH by IP, so here it is fatal.
-		return fail(rec, artifactsDir, rt, containers, fmt.Errorf("clickhouse has no inspected IP on %s; daemons wire to it by IP", network))
-	}
-	rec.logf("clickhouse ready (probes green in %.1fs)", time.Since(start).Seconds())
-
-	tables, err := ch.tables(ctx, rt)
-	if err != nil {
-		return fail(rec, artifactsDir, rt, containers, fmt.Errorf("read tables: %w", err))
-	}
-	hasReady := false
-	for _, t := range tables {
-		if t == chReadyTable {
-			hasReady = true
+		start := time.Now()
+		ch, err := startClickHouse(ctx, rt, chContainer, network, root)
+		containers = append(containers, chContainer)
+		if ch != nil && ch.ip != "" {
+			rec.logf("clickhouse container=%s ip=%s", chContainer, ch.ip)
+		} else {
+			rec.logf("clickhouse container=%s", chContainer)
 		}
-	}
-	rec.logf("schema loaded: %d tables (%s)", len(tables), strings.Join(tables, ", "))
-	if !hasReady {
-		return fail(rec, artifactsDir, rt, containers, fmt.Errorf("readiness table %s missing from SHOW TABLES", chReadyTable))
+		if err != nil {
+			return fail(rec, artifactsDir, rt, containers, fmt.Errorf("clickhouse: %w", err))
+		}
+		if ch.ip == "" {
+			// An earlier phase treated a missing IP as non-fatal (it probed CH via Exec). The
+			// daemon stack wires to CH by IP, so here it is fatal.
+			return fail(rec, artifactsDir, rt, containers, fmt.Errorf("clickhouse has no inspected IP on %s; daemons wire to it by IP", network))
+		}
+		chIP = ch.ip
+		rec.logf("clickhouse ready (probes green in %.1fs)", time.Since(start).Seconds())
+
+		tables, err := ch.tables(ctx, rt)
+		if err != nil {
+			return fail(rec, artifactsDir, rt, containers, fmt.Errorf("read tables: %w", err))
+		}
+		hasReady := false
+		for _, t := range tables {
+			if t == chReadyTable {
+				hasReady = true
+			}
+		}
+		rec.logf("schema loaded: %d tables (%s)", len(tables), strings.Join(tables, ", "))
+		if !hasReady {
+			return fail(rec, artifactsDir, rt, containers, fmt.Errorf("readiness table %s missing from SHOW TABLES", chReadyTable))
+		}
 	}
 
 	// --- build the four daemons (cached across runs) ---
-	binDir, err := buildDaemons(ctx, root, arch, rec.logf)
+	binDir, err := buildDaemons(ctx, root, arch, backend, rec.logf)
 	if err != nil {
 		return fail(rec, artifactsDir, rt, containers, fmt.Errorf("build daemons: %w", err))
 	}
@@ -458,16 +475,17 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, keep, verbose bool, timeo
 	}
 	defer os.Remove(rpcKeyPath)
 
-	start = time.Now()
+	start := time.Now()
 	ds, err = startDaemonStack(ctx, rt, rec, daemonStackOpts{
 		network:      network,
-		chIP:         ch.ip,
+		chIP:         chIP,
 		binDir:       binDir,
 		runID:        runID,
 		cfg:          cfg,
 		rpcKeyPath:   rpcKeyPath,
 		apiStaticDir: apiStaticDir,
 		staticMount:  apiMountTarget,
+		backend:      backend,
 	})
 	containers = append(containers, ds.containerNames()...)
 	if err != nil {

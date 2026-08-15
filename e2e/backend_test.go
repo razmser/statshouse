@@ -1,0 +1,323 @@
+package main
+
+// Unit tests for the harness's storage-backend swap: flag parsing, daemon
+// spec selection (which aggregator binary a backend cross-compiles and how),
+// and the per-backend daemon flag wiring (aggregator + api). Everything here
+// is pure host-side construction — no container, no daemon, no network — so a
+// wiring regression (a duck flag missing from the agg script, the api still
+// pointed at ClickHouse, the wrong binary mounted) fails in milliseconds
+// instead of after the full stack bring-up.
+
+import (
+	"os/exec"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestParseStorageBackend(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    storageBackend
+		wantErr bool
+	}{
+		{"", backendClickHouse, false}, // flag default
+		{"clickhouse", backendClickHouse, false},
+		{"duck", backendDuck, false},
+		{"CH", "", true},
+		{"Duck", "", true},
+		{"duckdb", "", true}, // the build tag is not a backend name
+		{"postgres", "", true},
+	}
+	for _, c := range cases {
+		got, err := parseStorageBackend(c.in)
+		if c.wantErr {
+			if err == nil {
+				t.Errorf("parseStorageBackend(%q) = %q, want an error", c.in, got)
+			} else if !strings.Contains(err.Error(), "--storage-backend") || !strings.Contains(err.Error(), "duck") || !strings.Contains(err.Error(), "clickhouse") {
+				t.Errorf("parseStorageBackend(%q) error %q must name the flag and both choices", c.in, err)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("parseStorageBackend(%q) unexpected error: %v", c.in, err)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("parseStorageBackend(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// TestDaemonSpecsFor pins the per-backend build list: clickhouse builds the
+// usual four (one cgo daemon: metadata), duck swaps only the aggregator for
+// the duckdb-tagged static-cgo build cached under its own name, and the other
+// three daemons are byte-identical between backends.
+func TestDaemonSpecsFor(t *testing.T) {
+	ch := daemonSpecsFor(backendClickHouse)
+	if len(ch) != 4 {
+		t.Fatalf("clickhouse: got %d specs, want 4", len(ch))
+	}
+	if len(ch) != len(daemonCmds) {
+		t.Fatalf("clickhouse: got %d specs, want %d (the default list)", len(ch), len(daemonCmds))
+	}
+	for i := range ch {
+		if ch[i] != daemonCmds[i] {
+			t.Errorf("clickhouse: spec %d differs from the default list: %+v vs %+v", i, ch[i], daemonCmds[i])
+		}
+	}
+
+	duck := daemonSpecsFor(backendDuck)
+	if len(duck) != 4 {
+		t.Fatalf("duck: got %d specs, want 4", len(duck))
+	}
+	var agg *daemonSpec
+	for i := range duck {
+		if duck[i].pkg == "./cmd/statshouse-agg" {
+			agg = &duck[i]
+		}
+	}
+	if agg == nil {
+		t.Fatal("duck: no aggregator spec found")
+	}
+	if agg.bin != "statshouse-agg-duck" {
+		t.Errorf("duck: agg bin %q, want statshouse-agg-duck (own cache name so the two aggs never collide)", agg.bin)
+	}
+	if !agg.cgo || !agg.duckDB {
+		t.Errorf("duck: agg spec %+v must be cgo+duckDB (duckdb build tag + verified static link)", *agg)
+	}
+	for i := range duck {
+		if duck[i].pkg == "./cmd/statshouse-agg" {
+			continue
+		}
+		if duck[i] != ch[i] {
+			t.Errorf("duck: spec %d (%s) differs from clickhouse: %+v vs %+v — only the aggregator may change with the backend",
+				i, duck[i].bin, duck[i], ch[i])
+		}
+	}
+}
+
+func TestAggBinName(t *testing.T) {
+	if got := aggBinName(backendClickHouse); got != "statshouse-agg" {
+		t.Errorf("aggBinName(clickhouse) = %q, want statshouse-agg", got)
+	}
+	if got := aggBinName(backendDuck); got != "statshouse-agg-duck" {
+		t.Errorf("aggBinName(duck) = %q, want statshouse-agg-duck", got)
+	}
+}
+
+// findSpec returns the spec whose pkg matches, from the backend's build list.
+func findSpec(t *testing.T, backend storageBackend, pkg string) daemonSpec {
+	t.Helper()
+	for _, d := range daemonSpecsFor(backend) {
+		if d.pkg == pkg {
+			return d
+		}
+	}
+	t.Fatalf("no spec for %q under %s", pkg, backend)
+	return daemonSpec{}
+}
+
+// TestDuckAggSpecCrossCompileFlags asserts the duck aggregator builds with the
+// duckdb tag and the verified static-link flags embedded in buildOneDaemon's
+// recipe. The extldflags computation itself needs a real toolchain and is
+// covered separately (TestDuckDBExtLDFlags); here the spec the build branches
+// on is what matters.
+func TestDuckAggSpecCrossCompileFlags(t *testing.T) {
+	agg := findSpec(t, backendDuck, "./cmd/statshouse-agg")
+	if !agg.duckDB {
+		t.Fatal("the duck agg spec must carry duckDB (the -tags duckdb + static-link path in buildOneDaemon)")
+	}
+	plain := findSpec(t, backendClickHouse, "./cmd/statshouse-agg")
+	if plain.duckDB || plain.cgo {
+		t.Fatalf("the clickhouse agg spec %+v must stay the pure-Go CGO_ENABLED=0 build", plain)
+	}
+}
+
+// TestDuckDBExtLDFlags exercises the verified static-link flag computation
+// against a real compiler: the flags must contain the whole-archive pthread
+// recipe with the archive resolved by explicit path. Skipped when no compiler
+// is on PATH (not the machine that runs the harness).
+func TestDuckDBExtLDFlags(t *testing.T) {
+	cc := ""
+	for _, cand := range []string{"cc", "clang", "gcc"} {
+		if _, err := exec.LookPath(cand); err == nil {
+			cc = cand
+			break
+		}
+	}
+	if cc == "" {
+		t.Skip("no C compiler on PATH to resolve libpthread.a")
+	}
+	flags, err := duckDBExtLDFlags(cc)
+	if err != nil {
+		t.Fatalf("duckDBExtLDFlags(%s): %v", cc, err)
+	}
+	for _, want := range []string{"-static", "-Wl,--allow-multiple-definition", "-Wl,--whole-archive", "-Wl,--no-whole-archive"} {
+		if !strings.Contains(flags, want) {
+			t.Errorf("flags %q missing %s", flags, want)
+		}
+	}
+	if !strings.Contains(flags, "libpthread.a") {
+		t.Errorf("flags %q must pass the pthread archive by explicit path, not -lpthread", flags)
+	}
+
+	// A CC that cannot resolve the archive (or does not exist) must fail the
+	// build loudly rather than emit a broken link line.
+	if _, err := duckDBExtLDFlags("definitely-not-a-compiler"); err == nil {
+		t.Error("duckDBExtLDFlags with a nonexistent CC must fail")
+	}
+}
+
+func testStackOpts(backend storageBackend) daemonStackOpts {
+	return daemonStackOpts{
+		network:      "e2e-testnet",
+		chIP:         "10.77.0.9",
+		binDir:       "/cache/bin",
+		runID:        "test",
+		rpcKeyPath:   "/tmp/key",
+		apiStaticDir: "/static",
+		staticMount:  apiStaticMount,
+		backend:      backend,
+	}
+}
+
+// TestAggRunScriptDuckFlags pins the duck aggregator's entrypoint: the duck
+// block is present with the store dir and the second (query) listener, the
+// shard/replica is named locally (there is no ClickHouse cluster to autodetect
+// from), and no --kh may survive (duck validation rejects it).
+func TestAggRunScriptDuckFlags(t *testing.T) {
+	script := aggRunScript(testStackOpts(backendDuck), "10.77.0.2")
+	for _, want := range []string{
+		"--storage-backend=duck",
+		"--duck-store-dir=" + duckStoreMount,
+		"--duck-query-addr=0.0.0.0:" + strconv.Itoa(aggQueryPort),
+		"--local-shard=1",
+		"--local-replica=1",
+		"mkdir -p /cache " + duckStoreMount,
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("duck agg script missing %q\nscript:\n%s", want, script)
+		}
+	}
+	if strings.Contains(script, "--kh=") {
+		t.Errorf("duck agg script must not pass --kh (duck validation rejects ClickHouse addresses)\nscript:\n%s", script)
+	}
+}
+
+// TestAggRunScriptSharedFlags pins the flags both backends share verbatim —
+// the known e2e hazards (insert sampler, receive-budget warming, agent
+// sampling) must be neutralized identically under duck, whose write path
+// rides the same machinery.
+func TestAggRunScriptSharedFlags(t *testing.T) {
+	for _, backend := range []storageBackend{backendClickHouse, backendDuck} {
+		script := aggRunScript(testStackOpts(backend), "10.77.0.2")
+		for _, want := range []string{
+			"--agg-addr=0.0.0.0:" + strconv.Itoa(aggPort),
+			"--metadata-addr=10.77.0.2:" + strconv.Itoa(metaPort),
+			"--receive-budget-warming=0",
+			"--disable-receive-sample-budget",
+			"--insert-budget=100000000",
+			"--min-insert-budget=100000000",
+			"--cluster-shards-addrs=${AGG_IP}:" + strconv.Itoa(aggPort),
+			"--auto-create",
+		} {
+			if !strings.Contains(script, want) {
+				t.Errorf("%s agg script missing %q\nscript:\n%s", backend, want, script)
+			}
+		}
+	}
+}
+
+// TestAggRunScriptClickHouseFlags pins the clickhouse aggregator's entrypoint:
+// the ClickHouse address is present and no duck flag leaks in.
+func TestAggRunScriptClickHouseFlags(t *testing.T) {
+	script := aggRunScript(testStackOpts(backendClickHouse), "10.77.0.2")
+	if !strings.Contains(script, "--kh=10.77.0.9:8123") {
+		t.Errorf("clickhouse agg script missing --kh=<ch-ip>:8123\nscript:\n%s", script)
+	}
+	for _, banned := range []string{"--storage-backend", "--duck-"} {
+		if strings.Contains(script, banned) {
+			t.Errorf("clickhouse agg script must not contain %q\nscript:\n%s", banned, script)
+		}
+	}
+}
+
+// TestAPIDaemonFlagsDuck pins the duck api wiring: the api reads through the
+// aggregator's store-query listener (shard 1 = the single agg the stack runs)
+// instead of ClickHouse.
+func TestAPIDaemonFlagsDuck(t *testing.T) {
+	flags := strings.Join(apiDaemonFlags(testStackOpts(backendDuck), "10.77.0.2", "10.77.0.3"), " ")
+	for _, want := range []string{
+		"--storage-backend=duck",
+		"--duck-shard-query-addrs=1=10.77.0.3:" + strconv.Itoa(aggQueryPort),
+	} {
+		if !strings.Contains(flags, want) {
+			t.Errorf("duck api flags missing %q\ngot: %s", want, flags)
+		}
+	}
+	if strings.Contains(flags, "--clickhouse-v2-addrs") {
+		t.Errorf("duck api flags must not address ClickHouse\ngot: %s", flags)
+	}
+}
+
+// TestAPIDaemonFlagsShared pins the flags both backends share, and the
+// clickhouse storage wiring (three-replica cluster shape, no duck flags).
+func TestAPIDaemonFlagsSharedAndClickHouse(t *testing.T) {
+	for _, backend := range []storageBackend{backendClickHouse, backendDuck} {
+		flags := strings.Join(apiDaemonFlags(testStackOpts(backend), "10.77.0.2", "10.77.0.3"), " ")
+		for _, want := range []string{
+			"--local-mode",
+			"--insecure-mode",
+			"--listen-addr=0.0.0.0:" + strconv.Itoa(apiPort),
+			"--listen-rpc-addr=0.0.0.0:" + strconv.Itoa(apiRPCPort),
+			"--metadata-addr=10.77.0.2:" + strconv.Itoa(metaPort),
+			"--available-shards=1",
+			"--cache-dir=/cache",
+			"--rpc-crypto-path=" + rpcKeyMount,
+			"--static-dir=" + apiStaticMount,
+		} {
+			if !strings.Contains(flags, want) {
+				t.Errorf("%s api flags missing %q\ngot: %s", backend, want, flags)
+			}
+		}
+	}
+	chFlags := strings.Join(apiDaemonFlags(testStackOpts(backendClickHouse), "10.77.0.2", "10.77.0.3"), " ")
+	if want := "--clickhouse-v2-addrs=10.77.0.9:9000,10.77.0.9:9000,10.77.0.9:9000"; !strings.Contains(chFlags, want) {
+		t.Errorf("clickhouse api flags missing %q\ngot: %s", want, chFlags)
+	}
+	for _, banned := range []string{"--storage-backend", "--duck-"} {
+		if strings.Contains(chFlags, banned) {
+			t.Errorf("clickhouse api flags must not contain %q\ngot: %s", banned, chFlags)
+		}
+	}
+}
+
+// TestStoreQueryProbeRequest pins the readiness probe's request shape: a
+// one-minute 1-second-LOD window that addresses no metric, so a clean answer
+// proves the store path end-to-end without depending on any journal state.
+func TestStoreQueryProbeRequest(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	args := storeQueryProbeRequest(now)
+	if args.Base.Lod.StepSec != 1 {
+		t.Errorf("probe StepSec = %d, want 1", args.Base.Lod.StepSec)
+	}
+	if got := args.Base.Lod.ToSec - args.Base.Lod.FromSec; got != 60 {
+		t.Errorf("probe window = %d seconds, want 60", got)
+	}
+	if args.Base.MetricId != 0 || args.Base.IsSetMetricIn() || args.Base.IsSetMetricNotIn() {
+		t.Errorf("probe must address no metric (journal-independent), got id=%d metric_in=%v metric_not_in=%v",
+			args.Base.MetricId, args.Base.IsSetMetricIn(), args.Base.IsSetMetricNotIn())
+	}
+	if len(args.Base.FilterIn) != 0 || len(args.Base.FilterNotIn) != 0 || len(args.What) != 0 || len(args.By) != 0 {
+		t.Errorf("probe must be the empty query: filter_in=%v filter_not_in=%v what=%v by=%v",
+			args.Base.FilterIn, args.Base.FilterNotIn, args.What, args.By)
+	}
+}
+
+func TestStoreQueryAddr(t *testing.T) {
+	if got := storeQueryAddr("10.77.0.3"); got != "10.77.0.3:"+strconv.Itoa(aggQueryPort) {
+		t.Errorf("storeQueryAddr = %q", got)
+	}
+}

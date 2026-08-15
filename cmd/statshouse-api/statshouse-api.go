@@ -35,6 +35,7 @@ import (
 	"github.com/VKCOM/statshouse/internal/chutil"
 	"github.com/VKCOM/statshouse/internal/config"
 	"github.com/VKCOM/statshouse/internal/data_model"
+	"github.com/VKCOM/statshouse/internal/duckstore"
 	"github.com/VKCOM/statshouse/internal/data_model/gen2/tlmetadata"
 	"github.com/VKCOM/statshouse/internal/format"
 	"github.com/VKCOM/statshouse/internal/metajournal"
@@ -566,9 +567,11 @@ func parseCommandLine() (err error) {
 	if len(flag.Args()) != 0 {
 		return fmt.Errorf("unexpected command line arguments, check command line for typos: %q", flag.Args())
 	}
-	if len(argv.chV2Addrs) == 0 {
-		return fmt.Errorf("--clickhouse-v2-addrs must be specified")
+	chV2Addrs, err := chV2AddrsOrDefault(argv.chV2Addrs, argv.Config.StorageBackend)
+	if err != nil {
+		return err
 	}
+	argv.chV2Addrs = chV2Addrs
 	if argv.cacheDir == "" {
 		return fmt.Errorf("--cache-dir must be specified")
 	}
@@ -597,4 +600,26 @@ func parseCommandLine() (err error) {
 	}
 
 	return argv.HandlerOptions.Parse()
+}
+
+// duckChV2PlaceholderAddr is the inert loopback address the ClickHouse-v2 pool
+// is built over under the duck backend, where no ClickHouse exists. The pool
+// dials nothing on its own (it creates no idle connections and the health
+// check only maintains the — zero — minimum), and no query reaches it either:
+// under duck every read goes through the QuerySource seam to the aggregator
+// shards. OpenClickHouse merely refuses an empty address list, so the
+// placeholder only exists to satisfy that.
+const duckChV2PlaceholderAddr = "127.0.0.1:9"
+
+// chV2AddrsOrDefault validates the ClickHouse-v2 address list against the
+// selected storage backend: clickhouse needs a real list, duck runs without
+// one (--duck-shard-query-addrs names where its queries go instead).
+func chV2AddrsOrDefault(addrs []string, backend duckstore.StorageBackend) ([]string, error) {
+	if len(addrs) > 0 {
+		return addrs, nil
+	}
+	if backend != duckstore.BackendDuck {
+		return nil, fmt.Errorf("--clickhouse-v2-addrs must be specified")
+	}
+	return []string{duckChV2PlaceholderAddr}, nil
 }

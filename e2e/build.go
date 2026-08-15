@@ -34,15 +34,22 @@ type daemonSpec struct {
 	bin string
 	pkg string
 	cgo bool
+	// duckDB marks the DuckDB-tagged aggregator build (--storage-backend=duck):
+	// compiled with -tags duckdb and linked with the verified static cgo recipe
+	// (duckDBExtLDFlags), following the same cross-CC precedent as the metadata
+	// daemon. Cached under its own bin name (see daemonSpecsFor).
+	duckDB bool
 }
 
-// buildDaemons cross-compiles the four daemons for the runtime arch:
+// buildDaemons cross-compiles the daemons for the runtime arch:
 // GOOS=linux GOARCH=<arch>) into a cache dir shared across runs
 // (~/.cache/statshouse-e2e/bin/<arch>/). A binary whose cached copy is newer than
 // the newest source file is reused verbatim, so a no-change rerun is instant and
-// any source edit triggers a (fast, Go-build-cache-backed) rebuild. log receives
-// a one-line summary. Returns the cache dir holding the four binaries.
-func buildDaemons(ctx context.Context, repoRoot, arch string, log func(string, ...any)) (string, error) {
+// any source edit triggers a (fast, Go-build-cache-backed) rebuild. Under the
+// duck backend the aggregator builds as the DuckDB-tagged static binary
+// (statshouse-agg-duck) alongside the unchanged metadata/api/agent. log receives
+// a one-line summary. Returns the cache dir holding the binaries.
+func buildDaemons(ctx context.Context, repoRoot, arch string, backend storageBackend, log func(string, ...any)) (string, error) {
 	binDir, err := daemonBinDir(arch)
 	if err != nil {
 		return "", err
@@ -50,6 +57,7 @@ func buildDaemons(ctx context.Context, repoRoot, arch string, log func(string, .
 	if err := os.MkdirAll(binDir, 0o755); err != nil {
 		return "", fmt.Errorf("create daemon bin cache %s: %w", binDir, err)
 	}
+	specs := daemonSpecsFor(backend)
 	newest, err := newestSourceMtime(repoRoot)
 	if err != nil {
 		return "", fmt.Errorf("scan daemon source mtimes: %w", err)
@@ -62,7 +70,7 @@ func buildDaemons(ctx context.Context, repoRoot, arch string, log func(string, .
 		out string
 	}
 	var stale []pending
-	for _, d := range daemonCmds {
+	for _, d := range specs {
 		out := filepath.Join(binDir, d.bin)
 		if fi, statErr := os.Stat(out); statErr == nil && fi.ModTime().After(newest) {
 			continue // cached copy is fresher than any source
@@ -91,18 +99,34 @@ func buildDaemons(ctx context.Context, repoRoot, arch string, log func(string, .
 			return "", results[i]
 		}
 	}
-	log("daemon binaries: %s (arch=%s, built %d/%d, %.1fs)", binDir, arch, len(stale), len(daemonCmds), time.Since(start).Seconds())
+	log("daemon binaries: %s (arch=%s, backend=%s, built %d/%d, %.1fs)", binDir, arch, backend, len(stale), len(specs), time.Since(start).Seconds())
 	return binDir, nil
 }
 
 // buildOneDaemon runs `go build` for one command with the right CGO env. CGO
 // daemons are linked static (-static) against the C cross-toolchain's libc so the
 // result is a single self-contained binary that runs on the alpine base image.
+// The DuckDB-tagged aggregator additionally uses the verified whole-archive
+// pthread recipe via -extldflags — environment CGO_LDFLAGS is emitted before the
+// package's own LDFLAGS on the link line, so a static flag there cannot satisfy
+// DuckDB's archive (verified with go build -x; see
+// .scratch/duck-store/02-cgo-build-research.md).
 func buildOneDaemon(ctx context.Context, repoRoot, arch string, d daemonSpec, out string) error {
-	cmd := exec.CommandContext(ctx, "go", "build", "-o", out, d.pkg)
-	cmd.Dir = repoRoot
 	env := append(os.Environ(), "GOOS=linux", "GOARCH="+arch)
-	if d.cgo {
+	args := []string{"build", "-o", out}
+	switch {
+	case d.duckDB:
+		cc, err := crossCC(arch)
+		if err != nil {
+			return fmt.Errorf("build %s: %w", d.pkg, err)
+		}
+		ext, err := duckDBExtLDFlags(cc)
+		if err != nil {
+			return fmt.Errorf("build %s: %w", d.pkg, err)
+		}
+		args = append(args, "-tags", "duckdb", "-ldflags", "-s -extldflags '"+ext+"'")
+		env = append(env, "CGO_ENABLED=1", "CC="+cc)
+	case d.cgo:
 		cc, err := crossCC(arch)
 		if err != nil {
 			return fmt.Errorf("build %s: %w", d.pkg, err)
@@ -110,9 +134,12 @@ func buildOneDaemon(ctx context.Context, repoRoot, arch string, d daemonSpec, ou
 		// CGO_LDFLAGS=-static makes the external (C) link static; the resulting
 		// binary carries no dynamic libc, so it runs on alpine (musl) unchanged.
 		env = append(env, "CGO_ENABLED=1", "CC="+cc, "CGO_LDFLAGS=-static -s")
-	} else {
+	default:
 		env = append(env, "CGO_ENABLED=0")
 	}
+	args = append(args, d.pkg)
+	cmd := exec.CommandContext(ctx, "go", args...)
+	cmd.Dir = repoRoot
 	cmd.Env = env
 	var b strings.Builder
 	cmd.Stdout = &b
