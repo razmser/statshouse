@@ -152,7 +152,7 @@ func TestStoreQueryTagValuesRoundTrip(t *testing.T) {
 	require.True(t, dst.IsSetIdsOnly())
 
 	// and without the ids-only flag
-	var src2 tlstatshouse.StoreQueryTagValues = src
+	src2 := src
 	src2.FieldsMask = 0
 	var dst2 tlstatshouse.StoreQueryTagValues
 	_, err = dst2.ReadTL1Boxed(src2.WriteTL1Boxed(nil))
@@ -292,5 +292,5 @@ func TestStoreErrorCodes(t *testing.T) {
 	require.False(t, ok)
 
 	// the panic guard really guards
-	require.Panics(t, func() { NewError(-5000, "not ours") })
+	require.Panics(t, func() { _ = NewError(-5000, "not ours") })
 }

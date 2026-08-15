@@ -255,16 +255,14 @@ func goldenRowCases() []goldenRowCase {
 	appendMulti := func(rnd *rand.Rand, appendCtx appendContext, sink InsertSink, key *data_model.Key, top data_model.TagUnion, value *data_model.MultiValue, sf float64) []byte {
 		sink.Reset()
 		var row insertRow
-		var scratch []byte
-		row, scratch = resolveMultiValueRow(rnd, key, top, value, sf, appendCtx, scratch)
+		row, _ = resolveMultiValueRow(rnd, key, top, value, sf, appendCtx, nil)
 		sink.AppendRow(&row)
 		return append([]byte(nil), sinkRoundBody(sink)...)
 	}
 	appendValue := func(rnd *rand.Rand, appendCtx appendContext, sink InsertSink, key *data_model.Key, v data_model.ItemValue) []byte {
 		sink.Reset()
 		var row insertRow
-		var scratch []byte
-		row, scratch, _ = resolveValueStatRow(rnd, key, v, appendCtx, scratch)
+		row, _, _ = resolveValueStatRow(rnd, key, v, appendCtx, nil)
 		sink.AppendRow(&row)
 		return append([]byte(nil), sinkRoundBody(sink)...)
 	}
@@ -575,7 +573,7 @@ func TestInsertRowScratchIsolation(t *testing.T) {
 	sink.AppendRow(&row)
 
 	// a second row through the same scratch rewrites the sketch slices
-	row, scratch = resolveMultiValueRow(rnd, key, data_model.TagUnion{}, rich(9.75, 99), 1, appendCtx, scratch)
+	row, _ = resolveMultiValueRow(rnd, key, data_model.TagUnion{}, rich(9.75, 99), 1, appendCtx, scratch)
 	sink.AppendRow(&row)
 
 	if &row.percentiles[0] != firstArray {
