@@ -37,7 +37,7 @@ Folding rows that share a key into one. ClickHouse gets this free from `Aggregat
 _Avoid_: merge, dedup
 
 **Delta file**:
-`delta.duckdb` — the one file per aggregator shard that receives *all* writes, holding a table per LOD. Append-only, unsorted, deliberately small; every query full-scans it, so its size is bounded by how often **compaction** drains it. Chosen on-disk rather than in-memory so that acking a contributor keeps meaning "durable", as it does today when ClickHouse returns 200.
+`delta-<generation>.duckdb` — the one file per aggregator shard that receives *all* writes, holding a table per LOD. Append-only, unsorted, deliberately small; every query full-scans it, so its size is bounded by how often **compaction** drains it. Compaction rolls it to a new generation rather than deleting rows in place. Chosen on-disk rather than in-memory so that acking a contributor keeps meaning "durable", as it does today when ClickHouse returns 200.
 _Avoid_: WAL, L0, buffer table, staging table
 
 **Archive window file**:
@@ -66,10 +66,12 @@ upgrades a file in place, in either direction.
 _Avoid_: corrupt file, incompatible file, stale file
 
 **Differential conformance run**:
-An e2e run that executes the unchanged suite against both **storage backends** and compares the
-results by *decoded value* — never by state bytes, since two valid merge orders of the same
-**aggregate state** serialize differently. The only thing keeping the ClickHouse and DuckDB SQL
-renderers honest with each other.
+A mode of the e2e harness (`go run ./e2e --conformance`) that boots ClickHouse plus *two* daemon
+stacks — CH-backed and duck-backed — over one shared metadata, seeds the identical deterministic
+stream to both agents from the harness itself, and compares the two APIs' decoded answers to every
+query shape, with ClickHouse as the reference. Comparison is by *decoded value* — never by state
+bytes, since two valid merge orders of the same **aggregate state** serialize differently. The only
+thing keeping the ClickHouse and DuckDB SQL renderers honest with each other.
 _Avoid_: dual-write, shadow read, backend diff
 
 **Small installation**:

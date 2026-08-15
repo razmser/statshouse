@@ -50,9 +50,12 @@ const (
 	// DefaultMemoryLimitBytes is DuckDB's memory_limit per store file.
 	DefaultMemoryLimitBytes int64 = 256 << 20
 	// DefaultMaxTempDirBytes is DuckDB's max_temp_directory_size per store
-	// file: the bound that makes "spill to disk instead of OOM" terminate
-	// with an out-of-memory error instead of filling the volume. It defaults
-	// to the memory limit rather than DuckDB's own 90%-of-disk.
+	// file when nothing is set at all: the bound that makes "spill to disk
+	// instead of OOM" terminate with an out-of-memory error instead of
+	// filling the volume. An unset bound tracks the memory limit rather than
+	// DuckDB's own 90%-of-disk — including an operator-set memory limit, so
+	// raising --duck-memory-limit does not silently leave the spill bound
+	// pinned to this default.
 	DefaultMaxTempDirBytes int64 = 256 << 20
 )
 
@@ -65,12 +68,14 @@ type ResourcesConfig struct {
 	MemoryLimitBytes int64
 	// MaxTempDirBytes is DuckDB's max_temp_directory_size per opened store
 	// file. Each file spills into its own temp directory next to itself.
+	// Unset (0) tracks MemoryLimitBytes, whatever it resolved to.
 	MaxTempDirBytes int64
 }
 
 // WithDefaults returns res with unset fields filled from the defaults, so a
-// zero ResourcesConfig behaves like DefaultResources() and a partially set one
-// keeps its explicit values.
+// zero ResourcesConfig behaves like the defaults and a partially set one
+// keeps its explicit values — except MaxTempDirBytes, whose unset value tracks
+// the memory limit rather than a fixed default.
 func (res ResourcesConfig) WithDefaults() ResourcesConfig {
 	if res.Threads <= 0 {
 		res.Threads = DefaultDuckDBThreads
@@ -79,14 +84,9 @@ func (res ResourcesConfig) WithDefaults() ResourcesConfig {
 		res.MemoryLimitBytes = DefaultMemoryLimitBytes
 	}
 	if res.MaxTempDirBytes <= 0 {
-		res.MaxTempDirBytes = DefaultMaxTempDirBytes
+		res.MaxTempDirBytes = res.MemoryLimitBytes
 	}
 	return res
-}
-
-// DefaultResources returns the default DuckDB resource bounds.
-func DefaultResources() ResourcesConfig {
-	return ResourcesConfig{}.WithDefaults()
 }
 
 // StorageBackend selects which storage backend metric data is written to and

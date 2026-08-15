@@ -17,7 +17,6 @@ import (
 	"os"
 	"sort"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -91,25 +90,11 @@ type RetentionConfig struct {
 	Logf func(format string, args ...any)
 }
 
-// RetentionStats is a snapshot of what a Retainer has done; observability
-// (see metrics.go) reads it to publish the counters.
-type RetentionStats struct {
-	// ExpiredUnlinked counts windows unlinked because their contents passed
-	// the tier's retention.
-	ExpiredUnlinked int64
-	// EarlyEvicted counts windows evicted before their retention because free
-	// space fell below the watermark.
-	EarlyEvicted int64
-	// LeaseDeferred counts expired windows whose unlink a reader's lease
-	// deferred to a later pass.
-	LeaseDeferred int64
-}
-
-// DefaultRetentionConfig returns the spec's retention defaults — 52 h (1s),
+// defaultRetentionConfig returns the spec's retention defaults — 52 h (1s),
 // 33 d (1m), unbounded (1h), the free-space watermark off — for callers that
 // configure some knobs and want the documented values for the rest. Fields
 // left zero in a bare RetentionConfig mean unbounded, not default.
-func DefaultRetentionConfig() RetentionConfig {
+func defaultRetentionConfig() RetentionConfig {
 	return RetentionConfig{
 		Retention1s:        DefaultRetention1s,
 		Retention1m:        DefaultRetention1m,
@@ -125,10 +110,6 @@ func DefaultRetentionConfig() RetentionConfig {
 type Retainer struct {
 	store *Store
 	cfg   RetentionConfig
-
-	expiredUnlinked atomic.Int64
-	earlyEvicted    atomic.Int64
-	leaseDeferred   atomic.Int64
 
 	mu sync.Mutex // one pass at a time
 }
@@ -176,15 +157,6 @@ func (r *Retainer) Run(ctx context.Context) error {
 	}
 }
 
-// Stats returns a snapshot of the retainer's counters.
-func (r *Retainer) Stats() RetentionStats {
-	return RetentionStats{
-		ExpiredUnlinked: r.expiredUnlinked.Load(),
-		EarlyEvicted:    r.earlyEvicted.Load(),
-		LeaseDeferred:   r.leaseDeferred.Load(),
-	}
-}
-
 // RetainOnce lands one pass: every served window past its tier's retention is
 // unlinked — unless a reader's lease defers it — and, when free space is
 // below the watermark, the oldest windows go early until it recovers or
@@ -210,12 +182,10 @@ func (r *Retainer) retainOnce(ctx context.Context) error {
 		}
 		switch err := r.store.DropWindow(wf.Tier, wf.WindowStart); {
 		case err == nil:
-			r.expiredUnlinked.Add(1)
 			recordMaintenanceWindow(r.cfg.Metrics, WindowUnlinked, wf.Tier)
 			r.cfg.Logf("[info] duck-store: unlinked %s: %s-tier window is past its %s retention",
 				wf.Path, wf.Tier, r.tierRetention(wf.Tier))
 		case errors.Is(err, ErrWindowLeased):
-			r.leaseDeferred.Add(1)
 			recordMaintenanceWindow(r.cfg.Metrics, WindowLeaseDeferred, wf.Tier)
 			r.cfg.Logf("[info] duck-store: deferred unlink of %s: a reader still holds the window", wf.Path)
 		case errors.Is(err, ErrWindowNotServed):
@@ -260,7 +230,6 @@ func (r *Retainer) evictForFreeSpace() {
 		err := r.store.DropWindow(wf.Tier, wf.WindowStart)
 		switch {
 		case err == nil:
-			r.earlyEvicted.Add(1)
 			recordMaintenanceWindow(r.cfg.Metrics, WindowEarlyEvicted, wf.Tier)
 			r.cfg.Logf("[warning] duck-store: early-evicted %s: free space was below the watermark", wf.Path)
 		case errors.Is(err, ErrWindowLeased), errors.Is(err, ErrWindowNotServed):

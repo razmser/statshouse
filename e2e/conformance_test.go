@@ -361,13 +361,13 @@ func TestCompareConfTable(t *testing.T) {
 	t.Run("order insensitive identical", func(t *testing.T) {
 		ref := build(false, r1, r2)
 		got := build(false, r2, r1)
-		require.Empty(t, compareConfTable(ref, got))
+		require.Empty(t, compareConfTable(ref, got, "count"))
 	})
 	t.Run("cell and row divergence", func(t *testing.T) {
 		bad, _ := row(100, "a", 6)
 		ref := build(false, r1, r2)
 		got := build(false, bad)
-		diffs := compareConfTable(ref, got)
+		diffs := compareConfTable(ref, got, "count")
 		require.Len(t, diffs, 2)
 		joined := strings.Join(diffs, "\n")
 		require.Contains(t, joined, "cell=0 reference=5 duck=6")
@@ -376,9 +376,24 @@ func TestCompareConfTable(t *testing.T) {
 	t.Run("truncation flag", func(t *testing.T) {
 		ref := build(false, r1)
 		got := build(true, r1)
-		diffs := compareConfTable(ref, got)
+		diffs := compareConfTable(ref, got, "count")
 		require.Len(t, diffs, 1)
 		require.Contains(t, diffs[0], "more=")
+	})
+	t.Run("sum cells use the float-ordering band", func(t *testing.T) {
+		// the live differential observed ~1e-16 relative drift on large sums —
+		// float64 addition order, not a semantic divergence
+		a, _ := row(100, "a", 644601.744)
+		b, _ := row(100, "a", 644601.7439999995)
+		require.Empty(t, compareConfTable(build(false, a), build(false, b), "sum"))
+		// a real divergence (0.01%) stays far above the 1e-9 band
+		big, _ := row(101, "b", 1e6)
+		wrong, _ := row(101, "b", 1.0001e6)
+		require.NotEmpty(t, compareConfTable(build(false, big), build(false, wrong), "sum"))
+		// the band is for sum/avg only: count stays exact
+		c1, _ := row(102, "c", 5)
+		c2, _ := row(102, "c", 5.0000000001)
+		require.NotEmpty(t, compareConfTable(build(false, c1), build(false, c2), "count"))
 	})
 }
 

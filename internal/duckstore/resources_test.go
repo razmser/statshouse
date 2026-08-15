@@ -30,7 +30,7 @@ func currentSetting(t *testing.T, db *sql.DB, name string) string {
 // a query — can run outside them.
 func TestOpenStoreAppliesResourceBounds(t *testing.T) {
 	s, _ := openTestStore(t, t.TempDir())
-	require.Equal(t, DefaultResources(), s.cfg.Resources, "a store without explicit resources takes the defaults")
+	require.Equal(t, ResourcesConfig{}.WithDefaults(), s.cfg.Resources, "a store without explicit resources takes the defaults")
 
 	db := s.Delta()
 	require.Equal(t, "1", currentSetting(t, db, "threads"), "DuckDB must be single-threaded")
@@ -59,11 +59,15 @@ func TestOpenStoreHonoursExplicitResources(t *testing.T) {
 }
 
 // The zero ResourcesConfig is the defaults, and a partially set one keeps its
-// explicit values.
+// explicit values — except an unset temp-directory bound, which tracks the
+// memory limit it resolved to: raising the memory limit must not leave the
+// spill bound pinned to the fixed default.
 func TestResourcesWithDefaults(t *testing.T) {
-	require.Equal(t, DefaultResources(), ResourcesConfig{}.WithDefaults())
-	require.Equal(t, ResourcesConfig{Threads: 2, MemoryLimitBytes: 1 << 30, MaxTempDirBytes: DefaultMaxTempDirBytes},
-		ResourcesConfig{Threads: 2, MemoryLimitBytes: 1 << 30}.WithDefaults())
+	require.Equal(t, ResourcesConfig{Threads: DefaultDuckDBThreads, MemoryLimitBytes: DefaultMemoryLimitBytes, MaxTempDirBytes: DefaultMemoryLimitBytes},
+		ResourcesConfig{}.WithDefaults(), "the zero config takes the defaults")
+	require.Equal(t, ResourcesConfig{Threads: 2, MemoryLimitBytes: 1 << 30, MaxTempDirBytes: 1 << 30},
+		ResourcesConfig{Threads: 2, MemoryLimitBytes: 1 << 30}.WithDefaults(),
+		"an unset temp-dir bound tracks the operator-set memory limit")
 	require.Equal(t, ResourcesConfig{Threads: DefaultDuckDBThreads, MemoryLimitBytes: 1 << 30, MaxTempDirBytes: 1 << 20},
 		ResourcesConfig{MemoryLimitBytes: 1 << 30, MaxTempDirBytes: 1 << 20}.WithDefaults())
 }

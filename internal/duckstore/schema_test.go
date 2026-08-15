@@ -17,11 +17,11 @@ import (
 )
 
 func TestTierTableDDLMatchesResolvedSchema(t *testing.T) {
-	for _, tier := range Tiers() {
+	for _, tier := range allTiers() {
 		t.Run(tier, func(t *testing.T) {
 			// whitespace-normalized, so the DDL's column alignment is free to
 			// change without breaking the schema contract
-			ddl := strings.Join(strings.Fields(strings.ToLower(TierTableDDL(TierTable(tier)))), " ")
+			ddl := strings.Join(strings.Fields(strings.ToLower(tierTableDDL(TierTable(tier)))), " ")
 
 			// the anchor columns of the transliterated 03-schema-ddl.sql
 			require.Contains(t, ddl, "metric integer not null")
@@ -61,19 +61,19 @@ func TestTierTableDDLMatchesResolvedSchema(t *testing.T) {
 
 func TestTierTableDDLDistinctPerTier(t *testing.T) {
 	seen := map[string]string{}
-	for _, tier := range Tiers() {
+	for _, tier := range allTiers() {
 		table := TierTable(tier)
 		require.NotEmpty(t, table)
-		require.Equal(t, 1, strings.Count(TierTableDDL(table), "CREATE TABLE"))
+		require.Equal(t, 1, strings.Count(tierTableDDL(table), "CREATE TABLE"))
 		seen[table] = tier
 	}
 	require.Equal(t, map[string]string{"s1": Tier1s, "s1m": Tier1m, "s1h": Tier1h}, seen)
 }
 
 func TestTierSeconds(t *testing.T) {
-	require.EqualValues(t, 1, TierSeconds(Tier1s))
-	require.EqualValues(t, 60, TierSeconds(Tier1m))
-	require.EqualValues(t, 3600, TierSeconds(Tier1h))
+	require.EqualValues(t, 1, tierSecondsOf(Tier1s))
+	require.EqualValues(t, 60, tierSecondsOf(Tier1m))
+	require.EqualValues(t, 3600, tierSecondsOf(Tier1h))
 }
 
 func TestDeltaFileNames(t *testing.T) {
@@ -100,7 +100,7 @@ func TestDeltaFileNames(t *testing.T) {
 }
 
 func TestArchiveFileNames(t *testing.T) {
-	for _, tier := range Tiers() {
+	for _, tier := range allTiers() {
 		name := archiveFileName(tier, 1700000000)
 		gotTier, gotStart, ok := parseArchiveFileName(name)
 		require.True(t, ok, name)

@@ -62,9 +62,12 @@ alternative for small installations, `statshouse-agg` can embed DuckDB as a
 second storage backend, selected per process with `--storage-backend=duck`
 (the aggregator must be built with the `duckdb` build tag, see
 `make build-agg-duckdb`; `statshouse-api` reads it by fanning queries out to
-the aggregator shards via `--duck-shard-query-addrs`). ClickHouse support is
-unchanged. See the [duck-store operator guide](./docs/duck-store.md) for the
-flags, retention, disk sizing and operational limits.
+the aggregator shards via `--duck-shard-query-addrs`). ClickHouse behaviour is
+unchanged except for one flag: `--kh` no longer defaults to
+`127.0.0.1:13338,127.0.0.1:13339` — it is now required with
+`--storage-backend=clickhouse`. See the
+[duck-store operator guide](./docs/duck-store.md) for the flags, retention,
+disk sizing and operational limits.
 
 ## Presentations
 

@@ -245,7 +245,7 @@ func (s *Store) rewriteWindowRuns(ctx context.Context, conn *sql.Conn, tier, tab
 		return fail(fmt.Errorf("collapse %s: %w", table, err))
 	}
 	sealedTable := table + "_sealed"
-	if _, err := tx.Exec(TierTableDDL(sealedTable)); err != nil {
+	if _, err := tx.Exec(tierTableDDL(sealedTable)); err != nil {
 		return fail(fmt.Errorf("create %s: %w", sealedTable, err))
 	}
 	if err := insertCollapsedGroups(tx, sealedTable, groups); err != nil {

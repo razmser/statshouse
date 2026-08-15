@@ -176,7 +176,7 @@ func TestWriterDropsRowsOutsideIngestGuard(t *testing.T) {
 	require.NoError(t, w.WriteRound(context.Background(), rows))
 
 	// the two survivors are in every tier; the three dropped rows in none
-	for _, tier := range Tiers() {
+	for _, tier := range allTiers() {
 		require.Equal(t, 1, tierCount(t, s, tier, testMetricID), "%s: boundary-old row", tier)
 		require.Equal(t, 0, tierCount(t, s, tier, testMetricID+1), "%s: one-second-too-old row", tier)
 		require.Equal(t, 0, tierCount(t, s, tier, testMetricID+2), "%s: far-past row", tier)
@@ -210,8 +210,71 @@ func TestWriterFailedRoundSurfacesError(t *testing.T) {
 	// the failed round left nothing behind, and the writer still takes rounds
 	require.Equal(t, 0, tierCount(t, s, Tier1s, testMetricID2), "the failed round must not land")
 	require.NoError(t, w.WriteRound(context.Background(), []Row{testRow(testMetricID2, now)}))
-	for _, tier := range Tiers() {
+	for _, tier := range allTiers() {
 		require.Equal(t, 1, tierCount(t, s, tier, testMetricID2), "%s must hold the recovered round", tier)
+	}
+}
+
+// TestWriterFlushJoinsRoundTransaction pins the duckdb-go behaviour the whole
+// round atomicity rests on: an appender flush executes inside the connection's
+// open transaction rather than auto-committing, so a ROLLBACK discards rows a
+// flush already pushed. If a driver upgrade ever breaks this, rounds are no
+// longer all-or-nothing and this test must fail before anything in production
+// notices double counts.
+func TestWriterFlushJoinsRoundTransaction(t *testing.T) {
+	s, _ := newTestWriter(t)
+	ctx := context.Background()
+	conn, err := s.Delta().Conn(ctx)
+	require.NoError(t, err)
+	defer func() { _ = conn.Close() }()
+	appenders, err := createTierAppenders(conn)
+	require.NoError(t, err)
+	wa := &Writer{appenders: appenders, conn: conn}
+
+	row := testRow(testMetricID, uint32(writerNow.Unix()))
+	_, err = conn.ExecContext(ctx, "BEGIN TRANSACTION")
+	require.NoError(t, err)
+	require.NoError(t, wa.appendTierRow(Tier1s, &row))
+	require.NoError(t, appenders[Tier1s].FlushWithCancel(ctx))
+	var n int
+	require.NoError(t, conn.QueryRowContext(ctx, "SELECT count(*) FROM s1 WHERE metric = $1", testMetricID).Scan(&n))
+	require.Equal(t, 1, n, "the flushed row must be visible inside the transaction")
+	_, err = conn.ExecContext(ctx, "ROLLBACK")
+	require.NoError(t, err)
+	require.NoError(t, conn.QueryRowContext(ctx, "SELECT count(*) FROM s1 WHERE metric = $1", testMetricID).Scan(&n))
+	require.Zero(t, n, "ROLLBACK must discard rows the appender flushed — round atomicity depends on it")
+}
+
+// TestWriterFailedMidRoundCommitsNothing fails a round BETWEEN the tiers'
+// flushes — the shape a real storage error takes — and proves the failed round
+// is absent from every tier (not just the unflushed ones), so the conveyor's
+// resend cannot double-count, and that the writer takes the next round.
+func TestWriterFailedMidRoundCommitsNothing(t *testing.T) {
+	s, w := newTestWriterCfg(t, WriterConfig{
+		NowFunc: func() time.Time { return writerNow },
+		FlushTierFault: func(round int64, tier string) error {
+			if round == 1 && tier == Tier1m { // 1s already flushed when this fires
+				return fmt.Errorf("round %d: simulated %s flush failure", round, tier)
+			}
+			return nil
+		},
+	})
+	now := uint32(writerNow.Unix())
+
+	err := w.WriteRound(context.Background(), []Row{testRow(testMetricID, now)})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "simulated 1m flush failure")
+
+	// the failed round must be absent from ALL three tiers: 1s flushed fine,
+	// but the round rolled back with it
+	for _, tier := range allTiers() {
+		require.Zero(t, tierCount(t, s, tier, testMetricID), "%s must not hold any of the failed round", tier)
+	}
+
+	// the writer recovers and the resent round lands exactly once
+	require.NoError(t, w.WriteRound(context.Background(), []Row{testRow(testMetricID, now)}))
+	for _, tier := range allTiers() {
+		require.Equal(t, 1, tierCount(t, s, tier, testMetricID), "%s must hold the recovered round once", tier)
 	}
 }
 
@@ -319,7 +382,7 @@ func TestWithinIngestGuard(t *testing.T) {
 func TestWriterEmptyRoundIsNoop(t *testing.T) {
 	s, w := newTestWriter(t)
 	require.NoError(t, w.WriteRound(context.Background(), nil))
-	for _, tier := range Tiers() {
+	for _, tier := range allTiers() {
 		require.Equal(t, 0, tierCount(t, s, tier, testMetricID))
 	}
 }

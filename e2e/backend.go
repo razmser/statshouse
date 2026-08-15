@@ -14,6 +14,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -104,9 +105,11 @@ func duckDBExtLDFlags(cc string) (string, error) {
 		return "", fmt.Errorf("resolve libpthread.a from %s: %w", cc, err)
 	}
 	p := strings.TrimSpace(string(out))
-	if p == "" || !strings.HasSuffix(p, "libpthread.a") {
+	if p == "" || !strings.HasSuffix(p, "libpthread.a") || filepath.Base(p) == p {
 		// gcc prints the argument back unchanged when it cannot resolve the
-		// file; treat that as a broken toolchain rather than a link flag.
+		// file — a bare file name with no directory — which a suffix check
+		// alone would wave through as a bogus relative link path. Treat
+		// anything that is not a resolved path as a broken toolchain.
 		return "", fmt.Errorf("%s -print-file-name=libpthread.a returned %q (no libpthread.a in the toolchain?)", cc, p)
 	}
 	return fmt.Sprintf("-static -Wl,--allow-multiple-definition -Wl,--whole-archive %s -Wl,--no-whole-archive", p), nil

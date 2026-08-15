@@ -73,6 +73,12 @@ type WriterConfig struct {
 	// non-nil error fails the round before any DuckDB call, the way a real
 	// storage failure would. It exists for tests; production leaves it nil.
 	FlushFault func(round int64) error
+
+	// FlushTierFault, when set, is consulted before each tier's flush inside
+	// the round transaction; a non-nil error skips that flush and fails the
+	// round mid-way, standing in for a storage failure that lands between the
+	// tiers' commits. It exists for tests; production leaves it nil.
+	FlushTierFault func(round int64, tier string) error
 }
 
 // writeRequest is one round submitted to the writer goroutine — or, with
@@ -94,11 +100,14 @@ var errWriterClosed = errors.New("duck-store: writer is closed")
 // fan-out happen here — rows land in conveyor order, all three tiers per row,
 // and read-time GROUP BY remains the correctness mechanism.
 //
-// WriteRound returns only after the round's appenders have flushed. A flush
-// executes an appending statement that commits as its own transaction, and
-// DuckDB fsyncs the write-ahead log of every commit, so an acknowledged round
-// is durable exactly when ClickHouse's 200 made it durable — a reopen (which
-// replays the WAL) keeps the data.
+// Every round runs inside one explicit transaction on the writer's connection:
+// appender flushes join it (verified against duckdb-go), so the three tier
+// writes commit — and fsync the write-ahead log — together at COMMIT. A failed
+// round rolls back and has written nothing, which is what makes the conveyor's
+// at-least-once resend safe: an acknowledged round is durable exactly when
+// ClickHouse's 200 made it durable, and a failed one is absent from all three
+// tiers, never just some of them (a partial round would double-count counts
+// and sums once the conveyor retries it).
 type Writer struct {
 	cfg WriterConfig
 
@@ -254,14 +263,22 @@ func (w *Writer) switchDelta(db *sql.DB) error {
 	old := w.conn
 	w.conn = conn
 	w.appenders = appenders
-	if err := old.Close(); err != nil {
-		return fmt.Errorf("duck-store: release the previous generation connection: %w", err)
-	}
+	// The switch itself has committed by now: everything above was fallible
+	// and ran before any writer state moved, while closing the previous
+	// generation's pool cannot un-write anything — its writer connection went
+	// back with the swap and the file is consumed or unlinked later whatever
+	// the close returns. Failing the roll HERE would strand the writer on a
+	// generation the store does not track, so the error is dropped, exactly
+	// like the store-side roll drops its own close error.
+	_ = old.Close()
 	return nil
 }
 
 // writeRound appends every guard-passing row to all three tier appenders and
-// flushes them. Runs on the writer goroutine only.
+// commits them as one transaction, so a round is either entirely in the delta
+// or entirely absent from it — the atomicity ClickHouse gets from a single
+// INSERT, and what makes the conveyor's at-least-once resend of a failed round
+// safe. Runs on the writer goroutine only.
 func (w *Writer) writeRound(ctx context.Context, rows []Row) error {
 	if err := w.ensureAppenders(); err != nil {
 		return err
@@ -272,6 +289,22 @@ func (w *Writer) writeRound(ctx context.Context, rows []Row) error {
 			return fmt.Errorf("duck-store: round %d failed: %w", w.round, err)
 		}
 	}
+	// Appender flushes join the connection's open transaction (the tx-probe
+	// test pins this), so no tier can commit without the others. The rollbacks
+	// below run on a background context by necessity — the round's own context
+	// may be exactly what died — and are best-effort: a connection too broken
+	// to roll back fails the next round's BEGIN too, so the store stays loud
+	// rather than quietly wrong.
+	if _, err := w.conn.ExecContext(context.Background(), "BEGIN TRANSACTION"); err != nil {
+		return fmt.Errorf("duck-store: begin round %d: %w", w.round, err)
+	}
+	rollback := func() {
+		// The appenders are dropped while the transaction is still open, so
+		// their Close — which flushes leftovers — flushes INTO the transaction
+		// the rollback is about to discard, never past it.
+		w.dropAppenders()
+		_, _ = w.conn.ExecContext(context.Background(), "ROLLBACK")
+	}
 	nowUnix := w.cfg.NowFunc().Unix()
 	for i := range rows {
 		r := &rows[i]
@@ -280,19 +313,28 @@ func (w *Writer) writeRound(ctx context.Context, rows []Row) error {
 		}
 		for _, tier := range tiers {
 			if err := w.appendTierRow(tier, r); err != nil {
-				w.dropAppenders() // a failed appender is invalidated; recreate next round
+				rollback() // a failed appender is invalidated; recreate next round
 				return fmt.Errorf("duck-store: append %s row (metric %d, time %d): %w", tier, r.Metric, r.Time, err)
 			}
 		}
 	}
 	for _, tier := range tiers {
-		// Flush commits the appended rows as one statement per tier, which
-		// fsyncs the delta's WAL before returning — the durability point of
-		// the whole write path.
+		if w.cfg.FlushTierFault != nil {
+			if err := w.cfg.FlushTierFault(w.round, tier); err != nil {
+				rollback()
+				return fmt.Errorf("duck-store: flush %s: %w", tier, err)
+			}
+		}
 		if err := w.appenders[tier].FlushWithCancel(ctx); err != nil {
-			w.dropAppenders()
+			rollback() // the appender is invalidated; recreate next round
 			return fmt.Errorf("duck-store: flush %s: %w", tier, err)
 		}
+	}
+	// COMMIT is the durability point of the whole write path: it makes all
+	// three tiers' rows visible together and fsyncs the delta's WAL.
+	if _, err := w.conn.ExecContext(context.Background(), "COMMIT"); err != nil {
+		rollback()
+		return fmt.Errorf("duck-store: commit round %d: %w", w.round, err)
 	}
 	return nil
 }
@@ -386,14 +428,18 @@ func createTierAppenders(conn *sql.Conn) (map[string]*duckdb.Appender, error) {
 	return appenders, nil
 }
 
-// dropAppenders destroys the appenders (discarding anything still buffered in
-// them) so the next round starts from fresh ones. Called on the writer
-// goroutine after an append or flush failure.
+// dropAppenders destroys the appenders so the next round starts from fresh
+// ones. Called on the writer goroutine after an append or flush failure, while
+// the failed round's transaction is still open: an appender's Close flushes
+// its leftovers, so anything still buffered lands INSIDE that transaction —
+// where the rollback waiting right after it discards it, keeping the failed
+// round out of every tier. The other caller, a generation switch or shutdown,
+// runs between rounds when nothing is buffered.
 func (w *Writer) dropAppenders() {
 	for tier, a := range w.appenders {
 		if a != nil {
-			// Close flushes leftovers (none are expected mid-failure) and
-			// destroys the appender; errors are irrelevant on this path.
+			// Close flushes leftovers and destroys the appender; errors are
+			// irrelevant on this path.
 			_ = a.CloseWithCancel(context.Background())
 		}
 		delete(w.appenders, tier)

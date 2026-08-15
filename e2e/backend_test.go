@@ -9,7 +9,9 @@ package main
 // instead of after the full stack bring-up.
 
 import (
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -137,8 +139,12 @@ func TestDuckAggSpecCrossCompileFlags(t *testing.T) {
 
 // TestDuckDBExtLDFlags exercises the verified static-link flag computation
 // against a real compiler: the flags must contain the whole-archive pthread
-// recipe with the archive resolved by explicit path. Skipped when no compiler
-// is on PATH (not the machine that runs the harness).
+// recipe with the archive resolved by explicit path. A toolchain that has no
+// libpthread.a at all (e.g. Apple clang, where pthread lives in libSystem)
+// answers with the bare-name echo-back, which must surface as an error — the
+// production path only ever passes a linux cross-compiler, which ships the
+// archive. Skipped when no compiler is on PATH (not the machine that runs the
+// harness).
 func TestDuckDBExtLDFlags(t *testing.T) {
 	cc := ""
 	for _, cand := range []string{"cc", "clang", "gcc"} {
@@ -150,9 +156,31 @@ func TestDuckDBExtLDFlags(t *testing.T) {
 	if cc == "" {
 		t.Skip("no C compiler on PATH to resolve libpthread.a")
 	}
+
+	// A CC that cannot resolve the archive (or does not exist) must fail the
+	// build loudly rather than emit a broken link line — no real toolchain
+	// needed for either check.
+	if _, err := duckDBExtLDFlags("definitely-not-a-compiler"); err == nil {
+		t.Error("duckDBExtLDFlags with a nonexistent CC must fail")
+	}
+
+	// gcc's cannot-resolve behaviour is to echo the argument back unchanged —
+	// a bare file name with no directory, which passes a suffix check and
+	// would ride into the link flags as a bogus relative path. It must be
+	// rejected as a broken toolchain.
+	echoBack := filepath.Join(t.TempDir(), "cc-echo")
+	if err := os.WriteFile(echoBack, []byte("#!/bin/sh\necho libpthread.a\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := duckDBExtLDFlags(echoBack); err == nil {
+		t.Error("duckDBExtLDFlags must reject the bare-name echo-back of libpthread.a")
+	}
+
 	flags, err := duckDBExtLDFlags(cc)
 	if err != nil {
-		t.Fatalf("duckDBExtLDFlags(%s): %v", cc, err)
+		// legitimate on a toolchain without libpthread.a; everything below
+		// assumes one that ships it
+		t.Skipf("%s cannot resolve libpthread.a (%v) — not a toolchain this recipe applies to", cc, err)
 	}
 	for _, want := range []string{"-static", "-Wl,--allow-multiple-definition", "-Wl,--whole-archive", "-Wl,--no-whole-archive"} {
 		if !strings.Contains(flags, want) {
@@ -161,12 +189,6 @@ func TestDuckDBExtLDFlags(t *testing.T) {
 	}
 	if !strings.Contains(flags, "libpthread.a") {
 		t.Errorf("flags %q must pass the pthread archive by explicit path, not -lpthread", flags)
-	}
-
-	// A CC that cannot resolve the archive (or does not exist) must fail the
-	// build loudly rather than emit a broken link line.
-	if _, err := duckDBExtLDFlags("definitely-not-a-compiler"); err == nil {
-		t.Error("duckDBExtLDFlags with a nonexistent CC must fail")
 	}
 }
 

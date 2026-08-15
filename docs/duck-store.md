@@ -3,7 +3,9 @@
 duck-store is a second storage backend for StatsHouse: DuckDB embedded in
 `statshouse-agg`, selected by a flag. It exists for small installations — the
 deployment that cannot justify provisioning a ClickHouse cluster. ClickHouse
-remains the default backend and is unchanged; an operator picks one backend
+remains the default backend and behaves as before, with one flag change:
+`--kh` no longer defaults to `127.0.0.1:13338,127.0.0.1:13339` — it is now
+required with `--storage-backend=clickhouse`. An operator picks one backend
 per process with a single explicit flag, and there is no dual-write or
 read-comparison mode.
 
@@ -47,6 +49,24 @@ replica numbers come from `--local-shard` / `--local-replica` instead. For
 several shards, list every shard's query address in
 `--duck-shard-query-addrs` as comma-separated `shard=host:port` pairs with
 1-based shard numbers.
+
+When the API and the aggregators run on different machines, the store-query
+RPC handshakes are encrypted and both sides must present the same key: pass
+the key file to the API with `--rpc-crypto-path` and to the aggregators with
+`--aes-pwd-file` (the aggregator defaults to reading `/etc/engine/pass`).
+Without a shared key the API cannot talk to the shards at all — every query
+fails the handshake.
+
+Two caveats for sharded installs:
+
+- the shard count is part of the by-metric-id routing (`metric_id % shards`).
+  If the cluster is later resized, rows of a by-metric-id metric written
+  before the resize live on their old shard while the API prunes queries to
+  the new one, so old data answers as missing until retention expires it.
+  Changing the shard count is a fresh-start operation.
+- the API derives the shard count from the highest shard number configured in
+  `--duck-shard-query-addrs`, so that list must cover every shard of the
+  cluster, not a subset.
 
 Nonsensical combinations fail at startup with a message naming the offending
 flags: `--kh` with duck, duck without `--duck-store-dir` or

@@ -14,7 +14,8 @@ budget (ADR-0003) rather than by provisioning more.
 
 ## Consequences
 
-Under load duck-store will refuse work — a fourth concurrent query gets `overloaded` — where a
+Under load duck-store will refuse work — a third concurrent query gets `overloaded` (the default
+concurrency is two) — where a
 tuned-to-the-box configuration would have served it. That is the intended trade: predictable small
 resident cost over peak throughput. Any future benchmark that concludes "duck-store is slower than it
 could be" should check whether it is measuring this decision before treating it as a defect.

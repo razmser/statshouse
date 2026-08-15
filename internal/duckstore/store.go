@@ -62,7 +62,7 @@ type StoreConfig struct {
 
 	// Resources are the DuckDB resource bounds applied to every store file
 	// the store opens: single-threaded, a memory limit and a bounded temp
-	// directory. The zero value takes DefaultResources().
+	// directory. The zero value takes the defaults.
 	Resources ResourcesConfig
 }
 
@@ -502,7 +502,7 @@ func createFile(path string, tables []string, st stamp, res ResourcesConfig) err
 		return err
 	}
 	for _, t := range tables {
-		if _, err := tx.Exec(TierTableDDL(t)); err != nil {
+		if _, err := tx.Exec(tierTableDDL(t)); err != nil {
 			_ = tx.Rollback()
 			return fmt.Errorf("create %s in %s: %w", t, path, err)
 		}

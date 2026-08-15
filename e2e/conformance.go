@@ -524,9 +524,10 @@ func indexConfSeries(r *confSeriesResp) map[string]confSeriesRow {
 
 // compareConfTable compares two /api/table replies order-insensitively: rows
 // keyed by (bucket, tagSignature), What columns and the truncation flag equal,
-// per-cell values exact (only exact-tolerance kinds are issued as table
-// requests).
-func compareConfTable(ref, got *confTableResp) []string {
+// per-cell values under confValueMatches — the same tolerance table the
+// series comparator applies, because a table cell of sum/avg aggregates the
+// same float multiset in different orders as a series bucket does.
+func compareConfTable(ref, got *confTableResp, qw string) []string {
 	var diffs []string
 	if strings.Join(ref.Data.What, ",") != strings.Join(got.Data.What, ",") {
 		diffs = append(diffs, fmt.Sprintf("what columns differ: reference %v duck %v", ref.Data.What, got.Data.What))
@@ -557,8 +558,8 @@ func compareConfTable(ref, got *confTableResp) []string {
 			continue
 		}
 		for i, rv := range rd {
-			if rv != gd[i] {
-				diffs = append(diffs, fmt.Sprintf("table row{%s,%d} cell=%d reference=%g duck=%g", k.sig, k.ts, i, rv, gd[i]))
+			if !confValueMatches(qw, rv, gd[i]) {
+				diffs = append(diffs, fmt.Sprintf("table row{%s,%d} cell=%d reference=%s duck=%g", k.sig, k.ts, i, formatConfRef(qw, rv), gd[i]))
 			}
 		}
 	}
@@ -648,7 +649,7 @@ func compareConfRequest(req confRequest, ref, got confDecoded) []string {
 	case confSeries:
 		return compareConfSeries(ref.series, got.series, req.qw)
 	case confTable:
-		return compareConfTable(ref.table, got.table)
+		return compareConfTable(ref.table, got.table, req.qw)
 	case confPoint:
 		return compareConfPoint(ref.point, got.point, req.qw)
 	case confTagValues:
@@ -758,8 +759,10 @@ func fetchConf(ctx context.Context, apiAddr string, req confRequest) (dec confDe
 // their data, so a disagreement will not self-heal; it is confirmed after
 // confDivergenceSamples consecutive polls (absorbs transient per-api cache
 // staleness) and then FAILs loudly with both raw responses recorded to the
-// artifacts (failed-queries.json). Returns pass/fail counts.
-func runConformanceDifferential(ctx context.Context, rec *recorder, chAPI, duckAPI string, reqs []confRequest) (passed, failed int) {
+// artifacts (failed-queries.json). Returns pass/fail counts and whether the
+// context died mid-run, leaving requests unexecuted — a cancelled run must
+// not be reported as a pass.
+func runConformanceDifferential(ctx context.Context, rec *recorder, chAPI, duckAPI string, reqs []confRequest) (passed, failed int, cancelled bool) {
 	for _, req := range reqs {
 		var (
 			diffs       []string
@@ -774,7 +777,7 @@ func runConformanceDifferential(ctx context.Context, rec *recorder, chAPI, duckA
 		for !done {
 			if cerr := ctx.Err(); cerr != nil {
 				// The run is tearing down (deadline/signal) — not a divergence.
-				return passed, failed
+				return passed, failed, true
 			}
 			ref, rb, _, rerr := fetchConf(ctx, chAPI, req)
 			refBody = rb
@@ -810,7 +813,7 @@ func runConformanceDifferential(ctx context.Context, rec *recorder, chAPI, duckA
 				} else {
 					select {
 					case <-ctx.Done():
-						return passed, failed
+						return passed, failed, true
 					case <-time.After(conformancePollInterval):
 					}
 				}
@@ -838,7 +841,7 @@ func runConformanceDifferential(ctx context.Context, rec *recorder, chAPI, duckA
 		rec.logf("FAIL conformance %s\n%s", req.label, detail)
 		fmt.Printf("FAIL conformance %s\n%s\n", req.label, indent(detail))
 	}
-	return passed, failed
+	return passed, failed, false
 }
 
 // --- live: in-process seeding -------------------------------------------
@@ -1046,20 +1049,21 @@ type conformancePhaseOpts struct {
 // shared metadata serves both stacks), seed both agents in-process, verify the
 // CH reference still matches the frozen model (a broken reference must abort
 // the differential rather than bless a coincidence), then run the differential
-// request set. Returns pass/fail counts.
-func runConformancePhase(ctx context.Context, rec *recorder, o conformancePhaseOpts) (passed, failed int) {
+// request set. Returns pass/fail counts and whether the run was cancelled
+// mid-differential (deadline or signal), leaving requests unexecuted.
+func runConformancePhase(ctx context.Context, rec *recorder, o conformancePhaseOpts) (passed, failed int, cancelled bool) {
 	stream := generateStream(o.runID, conformanceClientTag, time.Now())
 
 	if err := createValuePMetrics(ctx, rec, o.chAPI, stream); err != nil {
 		rec.logf("FAIL conformance: pre-create value_p metrics: %v", err)
 		fmt.Printf("FAIL conformance pre-create value_p metrics: %v\n", err)
-		return 0, 1
+		return 0, 1, false
 	}
 
 	if err := seedConformanceStream(ctx, rec, stream, [2]string{o.chAPI, o.duckAPI}, [2]string{o.chAgent, o.duckAgent}); err != nil {
 		rec.logf("FAIL conformance: seed stream: %v", err)
 		fmt.Printf("FAIL conformance seed stream: %v\n", err)
-		return 0, 1
+		return 0, 1, false
 	}
 
 	// Reference gate: ClickHouse must match the frozen model before its answers
@@ -1068,11 +1072,11 @@ func runConformancePhase(ctx context.Context, rec *recorder, o conformancePhaseO
 	if refFail > 0 {
 		rec.logf("FAIL conformance: the ClickHouse reference does not match the expected model (%d assertion(s) failed) — aborting the differential; the reference itself is broken", refFail)
 		fmt.Printf("FAIL conformance reference gate: %d CH assertion(s) failed; differential aborted\n", refFail)
-		return refPass, refFail
+		return refPass, refFail, false
 	}
 
 	reqs := buildConformanceRequests(stream)
 	rec.logf("conformance: comparing %d semantic request(s) between clickhouse (reference) and duck", len(reqs))
-	diffPass, diffFail := runConformanceDifferential(ctx, rec, o.chAPI, o.duckAPI, reqs)
-	return refPass + diffPass, diffFail
+	diffPass, diffFail, cancelled := runConformanceDifferential(ctx, rec, o.chAPI, o.duckAPI, reqs)
+	return refPass + diffPass, diffFail, cancelled
 }

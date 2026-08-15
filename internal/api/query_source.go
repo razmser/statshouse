@@ -65,31 +65,34 @@ type tagValuesDataQuery struct {
 
 // newQuerySource picks the QuerySource for the configured storage backend.
 // The duck backend needs the per-shard query addresses, the RPC crypto key
-// their handshakes present, and the metrics journal for its mismatch retry;
-// selected without addresses it stays in the pending state, which reports
-// per query that the backend is not servable.
+// their handshakes present, and the metrics journal for its mismatch retry.
+// Startup validation rejects duck without addresses, so the stub below is a
+// defensive backstop for a handler built bypassing validation — it reports
+// the misconfiguration per query instead of answering empty.
 func newQuerySource(backend duckstore.StorageBackend, duckAddrs map[uint32]string, duckCryptoKey string, journal metricsStorageRef) QuerySource {
 	if backend == duckstore.BackendDuck {
 		if src := newDuckQuerySource(duckAddrs, duckCryptoKey, journal); src != nil {
 			return src
 		}
-		return duckQuerySourcePending{}
+		return duckQuerySourceMisconfigured{}
 	}
 	return chQuerySource{}
 }
 
-// duckQuerySourcePending rejects every query until the duck source lands.
-type duckQuerySourcePending struct{}
+// duckQuerySourceMisconfigured rejects every query on a duck backend whose
+// shard addresses never arrived — reachable only by constructing a handler
+// around unvalidated config.
+type duckQuerySourceMisconfigured struct{}
 
-func (duckQuerySourcePending) querySeries(ctx context.Context, h *requestHandler, q *seriesDataQuery, lod data_model.LOD, onRow func(tsSelectRow) error) error {
-	return errDuckQuerySourcePending
+func (duckQuerySourceMisconfigured) querySeries(ctx context.Context, h *requestHandler, q *seriesDataQuery, lod data_model.LOD, onRow func(tsSelectRow) error) error {
+	return errDuckQuerySourceMisconfigured
 }
 
-func (duckQuerySourcePending) queryTagValues(ctx context.Context, h *requestHandler, q *tagValuesDataQuery, lod data_model.LOD, onRow func(selectRow) error) error {
-	return errDuckQuerySourcePending
+func (duckQuerySourceMisconfigured) queryTagValues(ctx context.Context, h *requestHandler, q *tagValuesDataQuery, lod data_model.LOD, onRow func(selectRow) error) error {
+	return errDuckQuerySourceMisconfigured
 }
 
-var errDuckQuerySourcePending = fmt.Errorf("the duck storage backend does not serve API queries in this build yet")
+var errDuckQuerySourceMisconfigured = fmt.Errorf("--storage-backend=duck without --duck-shard-query-addrs: rejected at startup, so the handler was built from unvalidated config")
 
 // querySource returns the storage backend this API process reads metric data
 // from. Handlers constructed without one (tests) fall back to ClickHouse,

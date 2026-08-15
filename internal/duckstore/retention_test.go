@@ -49,12 +49,30 @@ func farFutureClock() func() time.Time {
 	return func() time.Time { return time.Unix(now+60*86400, 0) }
 }
 
-// specDefaultRetainer is the spec's retention defaults under a chosen clock,
-// the configuration a plain --storage-backend=duck aggregator runs with.
-func specDefaultRetainer(s *Store, now func() time.Time) *Retainer {
-	cfg := DefaultRetentionConfig()
+// specDefaultRetainer is the spec's retention defaults under a chosen clock
+// with an event recorder attached, the configuration a plain
+// --storage-backend=duck aggregator runs with.
+func specDefaultRetainer(s *Store, now func() time.Time) (*Retainer, *recordingMetrics) {
+	cfg := defaultRetentionConfig()
 	cfg.NowFunc = now
-	return NewRetainer(s, cfg)
+	m := &recordingMetrics{}
+	cfg.Metrics = m
+	return NewRetainer(s, cfg), m
+}
+
+// countWindowEvents counts the recorded window events of one kind. Locked,
+// because the recorder is safe for concurrent use and the ingestion test
+// asserts while the retainer's goroutine still runs.
+func countWindowEvents(m *recordingMetrics, kind WindowEventKind) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, w := range m.windows {
+		if w.kind == kind {
+			n++
+		}
+	}
+	return n
 }
 
 // windowPath is a window's archive file path inside the store.
@@ -70,7 +88,7 @@ func TestRetainerUnlinksExpiredWindows(t *testing.T) {
 	now := writerNowUnix
 	h1 := testWindowStart(Tier1h, now-5)
 
-	retainer := specDefaultRetainer(s, farFutureClock())
+	retainer, m := specDefaultRetainer(s, farFutureClock())
 	require.NoError(t, retainer.RetainOnce(context.Background()))
 
 	survivors := s.Windows()
@@ -87,10 +105,9 @@ func TestRetainerUnlinksExpiredWindows(t *testing.T) {
 		require.True(t, ok && tier == Tier1h, "no expired window file may remain: %s", e.Name())
 	}
 
-	st := retainer.Stats()
-	require.EqualValues(t, 6, st.ExpiredUnlinked, "three 1s and three 1m windows must be unlinked")
-	require.Zero(t, st.EarlyEvicted)
-	require.Zero(t, st.LeaseDeferred)
+	require.Equal(t, 6, countWindowEvents(m, WindowUnlinked), "three 1s and three 1m windows must be unlinked")
+	require.Zero(t, countWindowEvents(m, WindowEarlyEvicted))
+	require.Zero(t, countWindowEvents(m, WindowLeaseDeferred))
 }
 
 // TestRetainerRetentionIsPerTierConfigurable proves each tier's retention is
@@ -101,9 +118,11 @@ func TestRetainerRetentionIsPerTierConfigurable(t *testing.T) {
 	now := writerNowUnix
 	h1 := testWindowStart(Tier1h, now-5)
 
+	m := &recordingMetrics{}
 	retainer := NewRetainer(s, RetentionConfig{
 		Retention1h: 10 * 24 * time.Hour,
 		NowFunc:     farFutureClock(),
+		Metrics:     m,
 	})
 	require.NoError(t, retainer.RetainOnce(context.Background()))
 
@@ -112,7 +131,7 @@ func TestRetainerRetentionIsPerTierConfigurable(t *testing.T) {
 		require.NotEqual(t, Tier1h, wf.Tier, "only the 1h window may be gone")
 		require.FileExists(t, wf.Path)
 	}
-	require.EqualValues(t, 1, retainer.Stats().ExpiredUnlinked)
+	require.Equal(t, 1, countWindowEvents(m, WindowUnlinked))
 }
 
 // TestRetainerLeaseDefersUnlink drives the file lease: an expired window a
@@ -126,7 +145,7 @@ func TestRetainerLeaseDefersUnlink(t *testing.T) {
 	l := s.AcquireWindowLease(Tier1s, leased)
 	require.NotNil(t, l, "the window is served, so the lease must be granted")
 
-	retainer := specDefaultRetainer(s, farFutureClock())
+	retainer, m := specDefaultRetainer(s, farFutureClock())
 	require.NoError(t, retainer.RetainOnce(context.Background()))
 
 	// the leased window survived the pass that expired it
@@ -138,7 +157,7 @@ func TestRetainerLeaseDefersUnlink(t *testing.T) {
 		}
 	}
 	require.True(t, served, "a leased window stays served until its reader finishes")
-	require.EqualValues(t, 1, retainer.Stats().LeaseDeferred)
+	require.Equal(t, 1, countWindowEvents(m, WindowLeaseDeferred))
 
 	// the reader finishes, and the next pass takes the window
 	l.Release()
@@ -171,10 +190,12 @@ func TestRetainerLowWatermarkEvictsOldestFirst(t *testing.T) {
 	sort.Slice(sorted, func(i, j int) bool { return windowEnd(sorted[i]) < windowEnd(sorted[j]) })
 	evicted, survived := sorted[:len(sorted)-keep], sorted[len(sorted)-keep:]
 
+	m := &recordingMetrics{}
 	retainer := NewRetainer(s, RetentionConfig{
 		FreeSpaceWatermark: watermark,
 		FreeSpace:          free,
 		NowFunc:            func() time.Time { return writerNow }, // nothing is past retention under this clock
+		Metrics:            m,
 	})
 	require.NoError(t, retainer.RetainOnce(context.Background()))
 
@@ -185,10 +206,9 @@ func TestRetainerLowWatermarkEvictsOldestFirst(t *testing.T) {
 	for _, wf := range survived {
 		require.FileExists(t, wf.Path, "the newest windows must survive the early eviction")
 	}
-	st := retainer.Stats()
-	require.EqualValues(t, len(evicted), st.EarlyEvicted, "every early eviction must be reported")
-	require.Zero(t, st.ExpiredUnlinked, "nothing was past retention; every unlink is an early eviction")
-	require.Zero(t, st.LeaseDeferred)
+	require.Equal(t, len(evicted), countWindowEvents(m, WindowEarlyEvicted), "every early eviction must be reported")
+	require.Zero(t, countWindowEvents(m, WindowUnlinked), "nothing was past retention; every unlink is an early eviction")
+	require.Zero(t, countWindowEvents(m, WindowLeaseDeferred))
 }
 
 // TestRetainerRunsAlongsideIngestion drives the retainer against a compactor
@@ -213,9 +233,11 @@ func TestRetainerRunsAlongsideIngestion(t *testing.T) {
 	defer cancel()
 	// the spec defaults under a clock four hours past the writer clock: past
 	// the old 1s window's boundary, nowhere near the fresh windows'
-	cfg := DefaultRetentionConfig()
+	cfg := defaultRetentionConfig()
 	cfg.Interval = 10 * time.Millisecond
 	cfg.NowFunc = func() time.Time { return time.Unix(int64(now)+4*3600, 0) }
+	events := &recordingMetrics{}
+	cfg.Metrics = events
 	retainer := NewRetainer(s, cfg)
 	compactor := NewCompactor(s, CompactorConfig{Interval: 10 * time.Millisecond})
 	retDone := make(chan struct{})
@@ -253,7 +275,7 @@ func TestRetainerRunsAlongsideIngestion(t *testing.T) {
 
 	// the expired window went while ingestion ran
 	require.NoFileExists(t, windowPath(s, Tier1s, oldWindow))
-	require.GreaterOrEqual(t, retainer.Stats().ExpiredUnlinked, int64(1), "the expired window must be unlinked")
+	require.GreaterOrEqual(t, countWindowEvents(events, WindowUnlinked), 1, "the expired window must be unlinked")
 
 	// every acknowledged round lands exactly once across the delta and the
 	// surviving windows — retention cost the fresh data nothing
@@ -283,14 +305,15 @@ func TestRetainerUnboundedRetentionKeepsEverything(t *testing.T) {
 	s := agedWindowsFixture(t, 5, 26*3600, 50*3600)
 	before := s.Windows()
 
-	retainer := NewRetainer(s, RetentionConfig{NowFunc: farFutureClock()})
+	m := &recordingMetrics{}
+	retainer := NewRetainer(s, RetentionConfig{NowFunc: farFutureClock(), Metrics: m})
 	require.NoError(t, retainer.RetainOnce(context.Background()))
 
 	require.Len(t, s.Windows(), len(before), "every window is unbounded and must stay")
 	for _, wf := range s.Windows() {
 		require.FileExists(t, wf.Path)
 	}
-	require.Zero(t, retainer.Stats().ExpiredUnlinked)
+	require.Zero(t, countWindowEvents(m, WindowUnlinked))
 }
 
 // TestWindowExpired pins the boundary arithmetic: a window expires at window

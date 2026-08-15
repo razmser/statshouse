@@ -50,11 +50,6 @@ type duckQuerySource struct {
 	// journal re-reads metrics when a shard refuses a query as a metadata
 	// mismatch. Nil (tests without one) makes the retry fail fast.
 	journal metricsStorageRef
-
-	// waitVersionOverride and refreshMetricOverride replace the journal
-	// interactions in tests; production leaves both nil.
-	waitVersionOverride   func(ctx context.Context, version int64) error
-	refreshMetricOverride func(metricID int32) *format.MetricMetaValue
 }
 
 // newDuckQuerySource builds the source over the configured per-shard query
@@ -84,21 +79,22 @@ func newDuckQuerySource(addrs map[uint32]string, cryptoKey string, journal metri
 // whole range starting at fromSec, or -1 when the query must fan out. Fan-out
 // is the always-correct answer — data lands wherever agent-to-aggregator
 // routing put it — so pruning happens only when the assignment provably
-// covers the range: the by-metric-id and fixed-key assignments never move,
-// and a fixed shard assignment holds from the metric's last change onward,
-// so a metric untouched since before the range began sits entirely on its
-// current shard. A metric possibly re-assigned mid-range fans out for
-// correctness.
+// covers the range. The by-metric-id assignment is derived from the immutable
+// metric id, so it never moves and prunes unconditionally. The fixed-key and
+// fixed-shard assignments are admin-editable (an edit can move either
+// mid-range), so they hold only from the metric's last change onward: a
+// metric with an unknown last-change time, or one touched inside the queried
+// range, fans out for correctness.
 func (s *duckQuerySource) shardForRange(m *format.MetricMetaValue, fromSec int64) int {
 	if !m.Sharded() {
 		return -1
 	}
-	if m.ShardFixedKey == 0 && m.ShardStrategy == format.ShardFixed {
+	// The effective assignment, resolved the way Shard() resolves it: the
+	// fixed key wins over the strategy, so a metric carrying both prunes by
+	// the editable key, not by its id.
+	byMetricID := m.ShardFixedKey == 0 && m.ShardStrategy == format.ShardByMetricID
+	if !byMetricID {
 		if m.UpdateTime == 0 || int64(m.UpdateTime) > fromSec {
-			// never pruned on an unknown last-change time, nor when the
-			// metric was touched inside the queried range: an edit may have
-			// moved the assignment mid-range. A fixed-key assignment never
-			// moves, so it needs no such guard.
 			return -1
 		}
 	}
@@ -127,9 +123,26 @@ func (s *duckQuerySource) querySeries(ctx context.Context, h *requestHandler, q 
 			}
 		}
 	}
-	args := buildStoreSeriesArgs(q, lod, storeQueryTimeoutMs(ctx))
+	args, err := buildStoreSeriesArgs(q, lod, storeQueryTimeoutMs(ctx))
+	if err != nil {
+		return err
+	}
 	start := time.Now()
-	resps, err := s.callShards(ctx, clients, args, q, lod)
+	resps, err := retryOnMismatch(s, ctx, clients, singleAddressedMetric(q.metric, q.filterIn),
+		func(ctx context.Context, c storeShardClient) (tlstatshouse.StoreSeriesResponse, error) {
+			return c.querySeries(ctx, args)
+		},
+		func(fresh *format.MetricMetaValue) (func(context.Context, storeShardClient) (tlstatshouse.StoreSeriesResponse, error), error) {
+			retry := *q
+			retry.metric = fresh
+			retryArgs, err := buildStoreSeriesArgs(&retry, lod, storeQueryTimeoutMs(ctx))
+			if err != nil {
+				return nil, err
+			}
+			return func(ctx context.Context, c storeShardClient) (tlstatshouse.StoreSeriesResponse, error) {
+				return c.querySeries(ctx, retryArgs)
+			}, nil
+		})
 	if err != nil {
 		return err
 	}
@@ -167,11 +180,26 @@ func (s *duckQuerySource) queryTagValues(ctx context.Context, h *requestHandler,
 			}
 		}
 	}
-	args := buildStoreTagValuesArgs(q, lod, storeQueryTimeoutMs(ctx))
+	args, err := buildStoreTagValuesArgs(q, lod, storeQueryTimeoutMs(ctx))
+	if err != nil {
+		return err
+	}
 	start := time.Now()
-	resps, err := fanoutCall(ctx, clients, func(ctx context.Context, c storeShardClient) (tlstatshouse.StoreTagValuesResponse, error) {
-		return c.queryTagValues(ctx, args)
-	})
+	resps, err := retryOnMismatch(s, ctx, clients, singleAddressedMetric(q.metric, q.filterIn),
+		func(ctx context.Context, c storeShardClient) (tlstatshouse.StoreTagValuesResponse, error) {
+			return c.queryTagValues(ctx, args)
+		},
+		func(fresh *format.MetricMetaValue) (func(context.Context, storeShardClient) (tlstatshouse.StoreTagValuesResponse, error), error) {
+			retry := *q
+			retry.metric = fresh
+			retryArgs, err := buildStoreTagValuesArgs(&retry, lod, storeQueryTimeoutMs(ctx))
+			if err != nil {
+				return nil, err
+			}
+			return func(ctx context.Context, c storeShardClient) (tlstatshouse.StoreTagValuesResponse, error) {
+				return c.queryTagValues(ctx, retryArgs)
+			}, nil
+		})
 	if err != nil {
 		return err
 	}
@@ -198,42 +226,43 @@ func (s *duckQuerySource) queryTagValues(ctx context.Context, h *requestHandler,
 	return nil
 }
 
-// callShards issues the series request to every shard and, when a shard
-// refuses it as a metadata mismatch, retries the whole fan-out once with a
-// rebuilt request: the mismatch means the two journals disagree about the
-// metric's tag layout, so the API first waits briefly for its own journal to
-// advance past the version the request carried, then re-reads the metric and
-// re-derives the layout. A second mismatch fails the query — rows are never
-// read through a layout either side is unsure of.
-func (s *duckQuerySource) callShards(ctx context.Context, clients []storeShardClient, args tlstatshouse.StoreQuerySeries, q *seriesDataQuery, lod data_model.LOD) ([]tlstatshouse.StoreSeriesResponse, error) {
-	resps, err := fanoutCall(ctx, clients, func(ctx context.Context, c storeShardClient) (tlstatshouse.StoreSeriesResponse, error) {
-		return c.querySeries(ctx, args)
-	})
-	if !duckstore.IsCode(err, duckstore.ErrCodeMetadataMismatch) || q.metric == nil || q.metric.MetricID == 0 {
+// retryOnMismatch issues call to every shard and, when a shard refuses it as a
+// metadata mismatch, retries the whole fan-out once with a rebuilt request:
+// the mismatch means the two journals disagree about the metric's tag layout,
+// so the API first waits briefly for its own journal to advance past the
+// version the request carried, then re-reads the metric and re-derives the
+// layout. A second mismatch fails the query — rows are never read through a
+// layout either side is unsure of. metric is the single metric the request
+// addresses (nil when it addresses several or none, in which case there is no
+// one metric to refresh and the mismatch is final); rebuild re-derives the
+// call from a fresh journal copy of that metric. Both verbs go through it:
+// the shards validate a tag-values request's base exactly like a series one.
+func retryOnMismatch[R any](s *duckQuerySource, ctx context.Context, clients []storeShardClient, metric *format.MetricMetaValue,
+	call func(ctx context.Context, c storeShardClient) (R, error),
+	rebuild func(fresh *format.MetricMetaValue) (func(ctx context.Context, c storeShardClient) (R, error), error)) ([]R, error) {
+	resps, err := fanoutCall(ctx, clients, call)
+	if !duckstore.IsCode(err, duckstore.ErrCodeMetadataMismatch) || metric == nil || metric.MetricID == 0 {
 		return resps, err
 	}
-	if s.waitVersion(ctx, q.metric.Version+1) != nil {
+	if s.waitVersion(ctx, metric.Version+1) != nil {
 		return nil, fmt.Errorf("duck shard refused the query at journal version %d and the metrics journal never reached %d: %w",
-			q.metric.Version, q.metric.Version+1, err)
+			metric.Version, metric.Version+1, err)
 	}
-	fresh := s.refreshMetric(q.metric.MetricID)
+	fresh := s.refreshMetric(metric.MetricID)
 	if fresh == nil {
 		return nil, fmt.Errorf("duck shard refused the query at journal version %d and metric %d left the journal: %w",
-			q.metric.Version, q.metric.MetricID, err)
+			metric.Version, metric.MetricID, err)
 	}
-	retry := *q
-	retry.metric = fresh
-	return fanoutCall(ctx, clients, func(ctx context.Context, c storeShardClient) (tlstatshouse.StoreSeriesResponse, error) {
-		return c.querySeries(ctx, buildStoreSeriesArgs(&retry, lod, storeQueryTimeoutMs(ctx)))
-	})
+	retry, rerr := rebuild(fresh)
+	if rerr != nil {
+		return nil, rerr
+	}
+	return fanoutCall(ctx, clients, retry)
 }
 
 // waitVersion waits — at most fanoutJournalWait — for the API's metrics
 // journal to reach version.
 func (s *duckQuerySource) waitVersion(ctx context.Context, version int64) error {
-	if s.waitVersionOverride != nil {
-		return s.waitVersionOverride(ctx, version)
-	}
 	if s.journal == nil {
 		return fmt.Errorf("no metrics journal to wait on")
 	}
@@ -244,9 +273,6 @@ func (s *duckQuerySource) waitVersion(ctx context.Context, version int64) error 
 
 // refreshMetric re-reads a metric from the API's journal.
 func (s *duckQuerySource) refreshMetric(metricID int32) *format.MetricMetaValue {
-	if s.refreshMetricOverride != nil {
-		return s.refreshMetricOverride(metricID)
-	}
 	if s.journal == nil {
 		return nil
 	}
@@ -257,9 +283,13 @@ func (s *duckQuerySource) refreshMetric(metricID int32) *format.MetricMetaValue 
 // verb: the what kinds, the grouped tags (including the shard and string-top
 // entries the renderer resolves itself), the host flags and the table-view
 // ordering.
-func buildStoreSeriesArgs(q *seriesDataQuery, lod data_model.LOD, timeoutMs int32) tlstatshouse.StoreQuerySeries {
+func buildStoreSeriesArgs(q *seriesDataQuery, lod data_model.LOD, timeoutMs int32) (tlstatshouse.StoreQuerySeries, error) {
+	base, err := buildStoreQueryBase(q.metric, q.filterIn, q.filterNotIn, lod, q.utcOffset, timeoutMs)
+	if err != nil {
+		return tlstatshouse.StoreQuerySeries{}, err
+	}
 	args := tlstatshouse.StoreQuerySeries{
-		Base: buildStoreQueryBase(q.metric, q.filterIn, q.filterNotIn, lod, q.utcOffset, timeoutMs),
+		Base: base,
 		By:   byTagIndices(q.by),
 	}
 	for i := 0; q.what.specifiedAt(i); i++ {
@@ -277,37 +307,54 @@ func buildStoreSeriesArgs(q *seriesDataQuery, lod data_model.LOD, timeoutMs int3
 	case sortAscending:
 		args.SetSortAsc(true)
 	}
-	return args
+	return args, nil
 }
 
 // buildStoreTagValuesArgs lowers a semantic tag-values request onto the RPC's
 // tag-values verb. The user's top N is deliberately not carried: the shards
 // must not apply it (a value ranked below N everywhere can still be globally
 // top-N), the API sums counts across shards and the handler takes the top N.
-func buildStoreTagValuesArgs(q *tagValuesDataQuery, lod data_model.LOD, timeoutMs int32) tlstatshouse.StoreQueryTagValues {
+func buildStoreTagValuesArgs(q *tagValuesDataQuery, lod data_model.LOD, timeoutMs int32) (tlstatshouse.StoreQueryTagValues, error) {
+	base, err := buildStoreQueryBase(q.metric, q.filterIn, q.filterNotIn, lod, q.utcOffset, timeoutMs)
+	if err != nil {
+		return tlstatshouse.StoreQueryTagValues{}, err
+	}
 	args := tlstatshouse.StoreQueryTagValues{
-		Base:     buildStoreQueryBase(q.metric, q.filterIn, q.filterNotIn, lod, q.utcOffset, timeoutMs),
+		Base:     base,
 		TagIndex: int32(q.tag.Index),
 	}
 	if q.idsOnly {
 		args.SetIdsOnly(true)
 	}
-	return args
+	return args, nil
+}
+
+// singleAddressedMetric resolves the one metric a query is about, when there
+// is one: the request's own metric when it carries a real id, else the lone
+// member of the filter-in list. A PromQL aggregate replaces the queried
+// metric with an empty placeholder (the engine's nilMetric) and addresses the
+// real metric through that list, so the placeholder itself never counts —
+// this mirrors the ClickHouse builder, whose metricID() reads the same
+// placeholder as id 0 and lets writeMetricFilter fall through to the list.
+func singleAddressedMetric(metric *format.MetricMetaValue, filterIn data_model.TagFilters) *format.MetricMetaValue {
+	if metric != nil && metric.MetricID != 0 {
+		return metric
+	}
+	if len(filterIn.Metrics) == 1 && filterIn.Metrics[0] != nil && filterIn.Metrics[0].MetricID != 0 {
+		return filterIn.Metrics[0]
+	}
+	return nil
 }
 
 // buildStoreQueryBase fills the shared request base: the addressed metric
 // (single id, or the in/not-in lists a multi-metric query carries), the tag
 // layout as the API's journal derives it plus the journal version it was
 // read at, the resolution window, and the tag filters with the same arm
-// semantics the ClickHouse builder writes.
-func buildStoreQueryBase(metric *format.MetricMetaValue, filterIn, filterNotIn data_model.TagFilters, lod data_model.LOD, utcOffset int64, timeoutMs int32) tlstatshouse.StoreQueryBase {
-	var metricVersion int64
-	if metric != nil {
-		metricVersion = metric.Version
-	}
+// semantics the ClickHouse builder writes. A query that addresses several
+// metrics with differing tag layouts is refused here rather than read through
+// a layout that reinterprets some of them.
+func buildStoreQueryBase(metric *format.MetricMetaValue, filterIn, filterNotIn data_model.TagFilters, lod data_model.LOD, utcOffset int64, timeoutMs int32) (tlstatshouse.StoreQueryBase, error) {
 	base := tlstatshouse.StoreQueryBase{
-		MetricVersion: metricVersion,
-		TagLayout:     tlstatshouse.StoreTagLayout{Kinds: duckstore.TagLayoutKinds(metric)},
 		Lod: tlstatshouse.StoreLod{
 			FromSec:   lod.FromSec,
 			ToSec:     lod.ToSec,
@@ -319,21 +366,35 @@ func buildStoreQueryBase(metric *format.MetricMetaValue, filterIn, filterNotIn d
 		FilterNotIn: storeTagFilters(filterNotIn),
 		TimeoutMs:   timeoutMs,
 	}
-	if metric != nil {
-		base.MetricId = metric.MetricID
-		return base
+	if single := singleAddressedMetric(metric, filterIn); single != nil {
+		base.MetricId = single.MetricID
+		base.MetricVersion = single.Version
+		base.TagLayout = tlstatshouse.StoreTagLayout{Kinds: duckstore.TagLayoutKinds(single)}
+		return base, nil
 	}
 	// no single metric: the filter's metric lists address the query, exactly
-	// as the ClickHouse builder's writeMetricFilter treats them — a one-entry
-	// filter-in list collapses to that metric's id
+	// as the ClickHouse builder's writeMetricFilter treats them
 	var metricIn []int32
 	for _, m := range filterIn.Metrics {
 		metricIn = append(metricIn, m.MetricID)
 	}
-	if len(metricIn) == 1 {
-		base.MetricId = metricIn[0]
-	} else if len(metricIn) > 0 {
+	if len(metricIn) > 1 {
 		base.SetMetricIn(metricIn)
+		// The shards validate every listed member against the one layout this
+		// request carries, so the members must agree on it; the first member
+		// is the natural representative.
+		kinds := duckstore.TagLayoutKinds(filterIn.Metrics[0])
+		for _, m := range filterIn.Metrics[1:] {
+			if !duckstore.TagLayoutsEqual(kinds, duckstore.TagLayoutKinds(m)) {
+				return tlstatshouse.StoreQueryBase{}, fmt.Errorf(
+					"metrics %d and %d have differing tag layouts: a multi-metric query cannot read both through one layout",
+					filterIn.Metrics[0].MetricID, m.MetricID)
+			}
+		}
+		base.TagLayout = tlstatshouse.StoreTagLayout{Kinds: kinds}
+		// MetricVersion stays 0: several members carry several versions, so
+		// there is no one version to wait for — the shards compare the layout
+		// against their own journal without waiting.
 	}
 	var metricNotIn []int32
 	for _, m := range filterNotIn.Metrics {
@@ -342,7 +403,7 @@ func buildStoreQueryBase(metric *format.MetricMetaValue, filterIn, filterNotIn d
 	if len(metricNotIn) > 0 {
 		base.SetMetricNotIn(metricNotIn)
 	}
-	return base
+	return base, nil
 }
 
 // lodLocationName renders the LOD's zone for the one step that needs it;

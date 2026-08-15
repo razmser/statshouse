@@ -66,12 +66,17 @@ build-agg:
 # toolchain links as usual and none of this applies.
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Linux)
-DUCKDB_EXTLDFLAGS := -static -Wl,--allow-multiple-definition -Wl,--whole-archive $(shell $(CC) -print-file-name=libpthread.a) -Wl,--no-whole-archive
+DUCKDB_LIBPTHREAD := $(shell $(CC) -print-file-name=libpthread.a)
+DUCKDB_EXTLDFLAGS := -static -Wl,--allow-multiple-definition -Wl,--whole-archive $(DUCKDB_LIBPTHREAD) -Wl,--no-whole-archive
 else
+DUCKDB_LIBPTHREAD :=
 DUCKDB_EXTLDFLAGS := -O2
 endif
 
 build-agg-duckdb:
+ifneq ($(DUCKDB_LIBPTHREAD),)
+	@test "$(DUCKDB_LIBPTHREAD)" != "libpthread.a" || { echo 'ERROR: $(CC) -print-file-name=libpthread.a echoed the argument back (no libpthread.a in the toolchain?) — the static duckdb build needs a complete toolchain' >&2; exit 1; }
+endif
 	go build -tags duckdb -ldflags "$(COMMON_BUILD_VARS) -extldflags '$(DUCKDB_EXTLDFLAGS)'" -buildvcs=false -o target/statshouse-agg-duckdb ./cmd/statshouse-agg
 
 build-sh-grafana:

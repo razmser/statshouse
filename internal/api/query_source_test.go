@@ -620,8 +620,8 @@ func TestNewQuerySourceSelection(t *testing.T) {
 	require.Equal(t, chQuerySource{}, newQuerySource(duckstore.BackendClickHouse, nil, "", nil))
 
 	duck := newQuerySource(duckstore.BackendDuck, nil, "", nil)
-	require.ErrorIs(t, duck.querySeries(context.Background(), nil, &seriesDataQuery{}, data_model.LOD{}, func(tsSelectRow) error { return nil }), errDuckQuerySourcePending)
-	require.ErrorIs(t, duck.queryTagValues(context.Background(), nil, &tagValuesDataQuery{}, data_model.LOD{}, func(selectRow) error { return nil }), errDuckQuerySourcePending)
+	require.ErrorIs(t, duck.querySeries(context.Background(), nil, &seriesDataQuery{}, data_model.LOD{}, func(tsSelectRow) error { return nil }), errDuckQuerySourceMisconfigured)
+	require.ErrorIs(t, duck.queryTagValues(context.Background(), nil, &tagValuesDataQuery{}, data_model.LOD{}, func(selectRow) error { return nil }), errDuckQuerySourceMisconfigured)
 
 	// duck with shard addresses builds the fan-out source, sorted by shard
 	// number, with the shard-set modulus derived from them

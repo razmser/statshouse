@@ -478,9 +478,20 @@ func TestFanoutSeriesPruning(t *testing.T) {
 	t.Run("fixed key pins one shard", func(t *testing.T) {
 		m := fanoutMetric(format.ShardFixed)
 		m.ShardFixedKey = 2 // 1-based: shard 2
+		m.UpdateTime = 1000 // untouched since before the range began
 		visited, err := run(t, fanoutTestSource(fanoutFakes(3)...), m)
 		require.NoError(t, err)
 		require.Equal(t, []int{2}, visited)
+	})
+	t.Run("fixed key edited inside range fans out", func(t *testing.T) {
+		// the key is admin-editable, so a touch inside the range may have
+		// moved the assignment mid-range
+		m := fanoutMetric(format.ShardFixed)
+		m.ShardFixedKey = 2
+		m.UpdateTime = 2500 // after FromSec 2000
+		visited, err := run(t, fanoutTestSource(fanoutFakes(3)...), m)
+		require.NoError(t, err)
+		require.ElementsMatch(t, []int{1, 2, 3}, visited)
 	})
 	t.Run("by metric id pins its shard", func(t *testing.T) {
 		// 1003 % 3 = 1 → 0-based shard 1 → shard 2
@@ -517,6 +528,7 @@ func TestFanoutSeriesPruning(t *testing.T) {
 	t.Run("pruned shard missing from config is an error", func(t *testing.T) {
 		m := fanoutMetric(format.ShardFixed)
 		m.ShardFixedKey = 3 // only shards 1..2 configured
+		m.UpdateTime = 1000
 		_, err := run(t, fanoutTestSource(fanoutFakes(2)...), m)
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "duck shard 3")
@@ -608,7 +620,7 @@ func TestBuildStoreSeriesArgs(t *testing.T) {
 	require.NoError(t, err)
 	lod := data_model.LOD{FromSec: 1000, ToSec: 2000, StepSec: 60, Location: moscow}
 
-	args := buildStoreSeriesArgs(&seriesDataQuery{
+	args, err := buildStoreSeriesArgs(&seriesDataQuery{
 		metric:      metric,
 		what:        fanoutWhats(data_model.DigestCount, data_model.DigestUnique),
 		by:          []int{1, format.ShardTagIndex, format.StringTopTagIndex},
@@ -618,6 +630,7 @@ func TestBuildStoreSeriesArgs(t *testing.T) {
 		minMaxHost:  [2]bool{true, true},
 		utcOffset:   10800,
 	}, lod, 123)
+	require.NoError(t, err)
 
 	require.Equal(t, []int32{int32(data_model.DigestCount), int32(data_model.DigestUnique)}, args.What)
 	require.Equal(t, []int32{1, format.ShardTagIndex, format.StringTopTagIndex}, args.By)
@@ -654,11 +667,13 @@ func TestBuildStoreSeriesArgs(t *testing.T) {
 	require.Equal(t, []int64{3}, args.Base.FilterNotIn[0].Mapped)
 
 	// a nil location names UTC
-	argsUTC := buildStoreSeriesArgs(&seriesDataQuery{metric: metric}, data_model.LOD{FromSec: 1, ToSec: 2, StepSec: 60}, 0)
+	argsUTC, err := buildStoreSeriesArgs(&seriesDataQuery{metric: metric}, data_model.LOD{FromSec: 1, ToSec: 2, StepSec: 60}, 0)
+	require.NoError(t, err)
 	require.Equal(t, "UTC", argsUTC.Base.Lod.Location)
 
 	// sort and host flags default off
-	argsPlain := buildStoreSeriesArgs(&seriesDataQuery{metric: metric}, data_model.LOD{}, 0)
+	argsPlain, err := buildStoreSeriesArgs(&seriesDataQuery{metric: metric}, data_model.LOD{}, 0)
+	require.NoError(t, err)
 	require.False(t, argsPlain.IsSetSortDesc())
 	require.False(t, argsPlain.IsSetSortAsc())
 	require.False(t, argsPlain.IsSetMinHost())
@@ -669,37 +684,98 @@ func TestBuildStoreSeriesArgs(t *testing.T) {
 // metric lists address the query — with the one-entry collapse the CH
 // builder applies.
 func TestBuildStoreQueryBaseMetricLists(t *testing.T) {
-	base := buildStoreQueryBase(nil, data_model.TagFilters{Metrics: []*format.MetricMetaValue{{MetricID: 1000}, {MetricID: 1001}}},
+	base, err := buildStoreQueryBase(nil, data_model.TagFilters{Metrics: []*format.MetricMetaValue{{MetricID: 1000}, {MetricID: 1001}}},
 		data_model.TagFilters{Metrics: []*format.MetricMetaValue{{MetricID: 1002}}}, data_model.LOD{}, 0, 0)
+	require.NoError(t, err)
 	require.Equal(t, int32(0), base.MetricId)
 	require.Equal(t, []int32{1000, 1001}, base.MetricIn)
 	require.Equal(t, []int32{1002}, base.MetricNotIn)
-	require.Nil(t, base.TagLayout.Kinds)
+	// the bare metrics carry no tags, so the shared layout is empty
+	require.Empty(t, base.TagLayout.Kinds)
 
 	// exactly one filter-in metric collapses to the single-id predicate
-	base = buildStoreQueryBase(nil, data_model.TagFilters{Metrics: []*format.MetricMetaValue{{MetricID: 1005}}}, data_model.TagFilters{}, data_model.LOD{}, 0, 0)
+	base, err = buildStoreQueryBase(nil, data_model.TagFilters{Metrics: []*format.MetricMetaValue{{MetricID: 1005}}}, data_model.TagFilters{}, data_model.LOD{}, 0, 0)
+	require.NoError(t, err)
 	require.Equal(t, int32(1005), base.MetricId)
 	require.Nil(t, base.MetricIn)
+}
+
+// TestBuildStoreQueryBasePlaceholderAndMixedLayouts pins the aggregate-query
+// rules: a PromQL aggregate's placeholder metric (the engine's nilMetric,
+// id 0) never addresses the query — the lone filter-in metric does, with its
+// own version and layout — and two filter-in metrics with differing tag
+// layouts are refused rather than read through one layout.
+func TestBuildStoreQueryBasePlaceholderAndMixedLayouts(t *testing.T) {
+	real := testMetricWithTags(t, "agg_target",
+		format.MetricMetaTag{Name: "t1"},
+		format.MetricMetaTag{Name: "t2", RawKind: "int64"}, // raw64
+	)
+	real.MetricID = 501
+	real.Version = 88
+
+	// the placeholder with one filter-in metric collapses onto that metric
+	base, err := buildStoreQueryBase(&format.MetricMetaValue{}, // nilMetric placeholder: id 0
+		data_model.TagFilters{Metrics: []*format.MetricMetaValue{real}}, data_model.TagFilters{}, data_model.LOD{}, 0, 0)
+	require.NoError(t, err)
+	require.Equal(t, int32(501), base.MetricId)
+	require.Equal(t, int64(88), base.MetricVersion)
+	require.Equal(t, []int32{0, 0, 2}, base.TagLayout.Kinds) // placeholder slot, t1 mapped, t2 raw64
+	require.Nil(t, base.MetricIn)
+
+	// the placeholder with no metric lists keeps id-0 semantics, like the CH
+	// builder's `metric = 0`
+	base, err = buildStoreQueryBase(&format.MetricMetaValue{}, data_model.TagFilters{}, data_model.TagFilters{}, data_model.LOD{}, 0, 0)
+	require.NoError(t, err)
+	require.Zero(t, base.MetricId)
+	require.Nil(t, base.MetricIn)
+	require.Nil(t, base.TagLayout.Kinds)
+
+	// two filter-in metrics with differing layouts are refused
+	other := testMetricWithTags(t, "agg_other",
+		format.MetricMetaTag{Name: "t1"},
+		format.MetricMetaTag{Name: "t2"}, // mapped where the target has raw64
+	)
+	other.MetricID = 502
+	_, err = buildStoreQueryBase(nil, data_model.TagFilters{Metrics: []*format.MetricMetaValue{real, other}}, data_model.TagFilters{}, data_model.LOD{}, 0, 0)
+	require.ErrorContains(t, err, "differing tag layouts")
+	require.ErrorContains(t, err, "501 and 502")
 }
 
 // TestBuildStoreTagValuesArgs: the tag-values verb carries the tag index and
 // the ids-only mode — and deliberately no user top N for the shards to apply.
 func TestBuildStoreTagValuesArgs(t *testing.T) {
-	args := buildStoreTagValuesArgs(&tagValuesDataQuery{
+	args, err := buildStoreTagValuesArgs(&tagValuesDataQuery{
 		metric:     fanoutMetric(format.ShardFixed),
 		tag:        format.MetricMetaTag{Index: 3},
 		idsOnly:    true,
 		numResults: 2,
 	}, data_model.LOD{FromSec: 1, ToSec: 2, StepSec: 60}, 7)
+	require.NoError(t, err)
 	require.Equal(t, int32(3), args.TagIndex)
 	require.True(t, args.IsSetIdsOnly())
 	require.Equal(t, int64(1), args.Base.Lod.FromSec)
 	require.Equal(t, int32(7), args.Base.TimeoutMs)
 	require.Equal(t, int32(1002), args.Base.MetricId)
 
-	plain := buildStoreTagValuesArgs(&tagValuesDataQuery{metric: fanoutMetric(format.ShardFixed), tag: format.MetricMetaTag{Index: 1}}, data_model.LOD{}, 0)
+	plain, err := buildStoreTagValuesArgs(&tagValuesDataQuery{metric: fanoutMetric(format.ShardFixed), tag: format.MetricMetaTag{Index: 1}}, data_model.LOD{}, 0)
+	require.NoError(t, err)
 	require.False(t, plain.IsSetIdsOnly())
 }
+
+// fanoutJournal is a test double of the metrics-journal surface the mismatch
+// retry needs: it records the versions it was asked to wait for and hands out
+// the metric copy the re-read should return.
+type fanoutJournal struct {
+	waited []int64
+	fresh  *format.MetricMetaValue
+}
+
+func (j *fanoutJournal) WaitVersion(ctx context.Context, version int64) error {
+	j.waited = append(j.waited, version)
+	return ctx.Err()
+}
+
+func (j *fanoutJournal) GetMetaMetric(metricID int32) *format.MetricMetaValue { return j.fresh }
 
 // TestFanoutRetryOnceOnMetadataMismatch: a metadata mismatch triggers one
 // bounded journal wait, a metric re-read and a rebuilt request; the retry's
@@ -719,15 +795,11 @@ func TestFanoutRetryOnceOnMetadataMismatch(t *testing.T) {
 			return fanoutSeriesResp(1, fanoutSeriesBatch(1, []int64{100}, [][]int64{{1}}, nil,
 				&tlstatshouse.StoreSeriesBatch{Count: []float64{3}})), nil
 		}
-		src := fanoutTestSource(fakes...)
-		var waited []int64
-		src.waitVersionOverride = func(_ context.Context, version int64) error {
-			waited = append(waited, version)
-			return nil
-		}
 		fresh := fanoutMetric(format.ShardFixed)
 		fresh.Version = 43
-		src.refreshMetricOverride = func(int32) *format.MetricMetaValue { return fresh }
+		journal := &fanoutJournal{fresh: fresh}
+		src := fanoutTestSource(fakes...)
+		src.journal = journal
 
 		rows, err := fanoutRunSeries(t, src, &seriesDataQuery{
 			metric: fanoutMetric(format.ShardFixed), // Version 0
@@ -735,7 +807,7 @@ func TestFanoutRetryOnceOnMetadataMismatch(t *testing.T) {
 			by:     []int{0},
 		})
 		require.NoError(t, err)
-		require.Equal(t, []int64{1}, waited) // waited for old version + 1
+		require.Equal(t, []int64{1}, journal.waited) // waited for old version + 1
 		require.Len(t, rows, 1)
 		require.Equal(t, float64(3), rows[0].count)
 		require.Equal(t, 2, calls)
@@ -746,11 +818,10 @@ func TestFanoutRetryOnceOnMetadataMismatch(t *testing.T) {
 		fakes[0].seriesFn = func(context.Context, tlstatshouse.StoreQuerySeries) (tlstatshouse.StoreSeriesResponse, error) {
 			return tlstatshouse.StoreSeriesResponse{}, mismatch
 		}
-		src := fanoutTestSource(fakes...)
-		src.waitVersionOverride = func(context.Context, int64) error { return nil }
 		fresh := fanoutMetric(format.ShardFixed)
 		fresh.Version = 43
-		src.refreshMetricOverride = func(int32) *format.MetricMetaValue { return fresh }
+		src := fanoutTestSource(fakes...)
+		src.journal = &fanoutJournal{fresh: fresh}
 
 		_, err := fanoutRunSeries(t, src, &seriesDataQuery{metric: fanoutMetric(format.ShardFixed), what: fanoutWhats(data_model.DigestCount)})
 		require.Error(t, err)
@@ -763,12 +834,77 @@ func TestFanoutRetryOnceOnMetadataMismatch(t *testing.T) {
 			return tlstatshouse.StoreSeriesResponse{}, mismatch
 		}
 		src := fanoutTestSource(fakes...)
-		src.waitVersionOverride = func(context.Context, int64) error { return nil }
-		src.refreshMetricOverride = func(int32) *format.MetricMetaValue { return nil }
+		src.journal = &fanoutJournal{fresh: nil}
 
 		_, err := fanoutRunSeries(t, src, &seriesDataQuery{metric: fanoutMetric(format.ShardFixed), what: fanoutWhats(data_model.DigestCount)})
 		require.ErrorContains(t, err, "left the journal")
 	})
+
+	// the tag-values verb validates the same base, so its mismatch path
+	// retries through the same machinery
+	t.Run("tag values retry with the fresh metric", func(t *testing.T) {
+		fakes := fanoutFakes(1)
+		calls := 0
+		fakes[0].tagValuesFn = func(_ context.Context, args tlstatshouse.StoreQueryTagValues) (tlstatshouse.StoreTagValuesResponse, error) {
+			calls++
+			if calls == 1 {
+				return tlstatshouse.StoreTagValuesResponse{}, mismatch
+			}
+			require.Equal(t, int64(43), args.Base.MetricVersion) // the rebuilt request carries the fresh version
+			return tlstatshouse.StoreTagValuesResponse{Tag: []int64{7}, Count: []float64{3}}, nil
+		}
+		fresh := fanoutMetric(format.ShardFixed)
+		fresh.Version = 43
+		src := fanoutTestSource(fakes...)
+		src.journal = &fanoutJournal{fresh: fresh}
+
+		var rows []selectRow
+		err := src.queryTagValues(context.Background(), nil, &tagValuesDataQuery{
+			metric: fanoutMetric(format.ShardFixed), // Version 0
+			tag:    format.MetricMetaTag{Index: 1},
+		}, data_model.LOD{FromSec: 2000, ToSec: 3000, StepSec: 60}, func(r selectRow) error {
+			rows = append(rows, r)
+			return nil
+		})
+		require.NoError(t, err)
+		require.Len(t, rows, 1)
+		require.Equal(t, int64(7), rows[0].valID)
+		require.Equal(t, float64(3), rows[0].cnt)
+		require.Equal(t, 2, calls)
+	})
+}
+
+// TestShardForRange pins the pruning rules: only a provably immutable
+// assignment (by-metric-id) or one untouched since before the queried range
+// prunes to a single shard; everything else fans out.
+func TestShardForRange(t *testing.T) {
+	src := &duckQuerySource{numShards: 3}
+	const from = int64(1000)
+	mk := func(strategy string, key uint32, shardNum uint32, upd uint32) *format.MetricMetaValue {
+		return &format.MetricMetaValue{
+			MetricID: 7, ShardStrategy: strategy, ShardFixedKey: key,
+			ShardNum: shardNum, UpdateTime: upd,
+		}
+	}
+
+	// by-metric-id: derived from the immutable id (7 % 3 = 1) — prunes
+	// regardless of edits
+	require.Equal(t, 1, src.shardForRange(mk(format.ShardByMetricID, 0, 0, 0), from))
+	require.Equal(t, 1, src.shardForRange(mk(format.ShardByMetricID, 0, 0, 2000), from))
+
+	// fixed shard: editable — prunes only when the last edit predates the range
+	require.Equal(t, 2, src.shardForRange(mk(format.ShardFixed, 0, 2, 500), from))
+	require.Equal(t, -1, src.shardForRange(mk(format.ShardFixed, 0, 2, 2000), from), "edited inside the range")
+	require.Equal(t, -1, src.shardForRange(mk(format.ShardFixed, 0, 2, 0), from), "unknown last-change time")
+
+	// fixed key: equally editable (an admin edit can move it mid-range), so
+	// the same guard applies — key 3 resolves to shard 2
+	require.Equal(t, 2, src.shardForRange(mk(format.ShardFixed, 3, 0, 500), from))
+	require.Equal(t, -1, src.shardForRange(mk(format.ShardFixed, 3, 0, 2000), from), "fixed key edited inside the range")
+	require.Equal(t, -1, src.shardForRange(mk(format.ShardFixed, 3, 0, 0), from), "fixed key with unknown last-change time")
+
+	// unsharded metrics fan out everywhere
+	require.Equal(t, -1, src.shardForRange(mk(format.ShardBuiltinDist, 0, 0, 500), from))
 }
 
 // TestStoreQueryTimeoutMs: the relative timeout rides the context deadline

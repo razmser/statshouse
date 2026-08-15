@@ -86,8 +86,8 @@ var tierSeconds = map[string]int64{
 	Tier1h: 3600,
 }
 
-// Tiers returns the tier names in canonical order.
-func Tiers() []string {
+// allTiers returns the tier names in canonical order.
+func allTiers() []string {
 	return append([]string(nil), tiers...)
 }
 
@@ -96,8 +96,8 @@ func TierTable(tier string) string {
 	return tierTables[tier]
 }
 
-// TierSeconds returns the length of a tier's bucket interval in seconds.
-func TierSeconds(tier string) int64 {
+// tierSecondsOf returns the length of a tier's bucket interval in seconds.
+func tierSecondsOf(tier string) int64 {
 	return tierSeconds[tier]
 }
 
@@ -108,7 +108,7 @@ func TierSeconds(tier string) int64 {
 // is BIGINT unix seconds, sketch states stay opaque ClickHouse bytes in BLOB,
 // and there is deliberately no primary key, unique constraint or index:
 // partial rows repeat the key and an index would cost Appender throughput.
-func TierTableDDL(table string) string {
+func tierTableDDL(table string) string {
 	var b strings.Builder
 	b.WriteString("CREATE TABLE IF NOT EXISTS " + table + " (\n")
 	b.WriteString("    metric INTEGER NOT NULL,\n")

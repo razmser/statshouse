@@ -572,9 +572,16 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, backend storageBackend, k
 			stackTag:     confStackDuck,
 			sharedMeta:   ds.metadata,
 		})
-		// The duck stack reuses the shared metadata container (already tracked);
-		// only its own three services are appended.
-		containers = append(containers, dsDuck.agg.name, dsDuck.api.name, dsDuck.agent.name)
+		// The duck stack reuses the shared metadata container (already tracked
+		// above), so only its own three services are appended — on a partial
+		// start too, exactly like the metadata stack's nil-safe failure path:
+		// the started containers must still be torn down, and dereferencing a
+		// half-built stack would crash the harness before it reports.
+		for _, s := range []*service{dsDuck.agg, dsDuck.api, dsDuck.agent} {
+			if s != nil {
+				containers = append(containers, s.name)
+			}
+		}
 		if err != nil {
 			return fail(rec, artifactsDir, rt, containers, fmt.Errorf("duck daemon stack: %w", err))
 		}
@@ -627,12 +634,13 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, backend storageBackend, k
 		prewarmRetries:   prewarmRetries,
 	}
 	var totalPass, totalFail int
+	cancelled := false
 	if conformance {
 		// The conformance phase replaces the client drivers: the harness itself
 		// seeds the identical stream to BOTH agents in-process (one hostname →
 		// identical _h/max_host across backends), gates on the CH reference
 		// matching the frozen model, then runs the differential request set.
-		totalPass, totalFail = runConformancePhase(ctx, rec, conformancePhaseOpts{
+		totalPass, totalFail, cancelled = runConformancePhase(ctx, rec, conformancePhaseOpts{
 			runID:     runID,
 			chAPI:     queryAddr,
 			duckAPI:   duckAPIAddr,
@@ -651,6 +659,18 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, backend storageBackend, k
 	if totalFail > 0 {
 		dumpServiceLogs(rec, rt, containers, artifactsDir)
 		writeRunArtifacts(artifactsDir, rec)
+		return 1
+	}
+	// A cancelled conformance run must not read as PASS: the differential was
+	// cut short (deadline or signal), so the unexecuted requests are neither
+	// passed nor failed — the run is reported as interrupted and fails.
+	if cancelled {
+		dumpServiceLogs(rec, rt, containers, artifactsDir)
+		writeRunArtifacts(artifactsDir, rec)
+		summary := fmt.Sprintf("INTERRUPTED: conformance differential cancelled before finishing — %d passed, results incomplete, runtime=%s, runid=%s",
+			totalPass, rt.Name(), runID)
+		rec.logf("%s", summary)
+		fmt.Println(summary)
 		return 1
 	}
 

@@ -44,10 +44,15 @@ Ground rules when touching either seam:
 - The API never links DuckDB — everything crosses the RPC. The aggregator
   gates duck on `duckstore.Available` (false in untagged builds); the API
   accepts `duck` in any build.
-- Cross-backend agreement is enforced by the differential conformance run
-  (`e2e/conformance_test.go`) and the e2e suite, whose assertions and input
-  matrix are frozen. Backend comparisons are always by decoded value — never
-  by generated SQL, state bytes, or file lists.
+- Cross-backend agreement is enforced by the differential conformance run —
+  `e2e/conformance.go`, a mode of the e2e binary (`go run ./e2e
+  --conformance`, or `bash e2e/lima.sh --conformance` in the Lima VM) that
+  boots ClickHouse plus both daemon stacks over one shared metadata, seeds
+  the identical deterministic stream to both and compares the two APIs'
+  decoded answers to every query shape, with CH as the reference. The e2e
+  suite's client assertions and input matrix are frozen. Backend comparisons
+  are always by decoded value — never by generated SQL, state bytes, or file
+  lists.
 - The operator-facing surface (flags, retention, disk formula, quarantine,
   backup policy) is documented in `docs/duck-store.md`, kept in sync with the
   code by `internal/duckstore/docs_test.go`.
