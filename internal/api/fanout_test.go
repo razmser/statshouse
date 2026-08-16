@@ -308,8 +308,9 @@ func TestFanoutTagValuesGlobalTopN(t *testing.T) {
 	src := fanoutTestSource(fakes...)
 	var rows []selectRow
 	err := src.queryTagValues(context.Background(), nil, &tagValuesDataQuery{
-		metric: fanoutMetric(format.ShardBuiltinDist),
-		tag:    format.MetricMetaTag{Index: 1},
+		metric:     fanoutMetric(format.ShardBuiltinDist),
+		tag:        format.MetricMetaTag{Index: 1},
+		numResults: 100,
 	}, data_model.LOD{FromSec: 2000, ToSec: 3000, StepSec: 60}, func(r selectRow) error {
 		rows = append(rows, r)
 		return nil
@@ -329,6 +330,24 @@ func TestFanoutTagValuesGlobalTopN(t *testing.T) {
 	// a caller taking the global top 2 keeps "common" — a per-shard top-1
 	// (what the shards must never apply) would have dropped it
 	require.Equal(t, "common", rows[:2][0].val)
+
+	// the same query asking for a top 2 emits only the top 3 rows (N+1, the
+	// row the ClickHouse source's per-LOD LIMIT keeps for the "more" flag),
+	// cut on the merged ranking
+	rows = nil
+	err = src.queryTagValues(context.Background(), nil, &tagValuesDataQuery{
+		metric:     fanoutMetric(format.ShardBuiltinDist),
+		tag:        format.MetricMetaTag{Index: 1},
+		numResults: 2,
+	}, data_model.LOD{FromSec: 2000, ToSec: 3000, StepSec: 60}, func(r selectRow) error {
+		rows = append(rows, r)
+		return nil
+	})
+	require.NoError(t, err)
+	require.Len(t, rows, 3)
+	require.Equal(t, "common", rows[0].val)
+	require.Equal(t, int64(11), rows[1].valID)
+	require.Equal(t, int64(12), rows[2].valID)
 }
 
 // TestFanoutTagValuesMergeKeyedByValue checks the merge key is the value, not
@@ -501,11 +520,52 @@ func TestFanoutSeriesPruning(t *testing.T) {
 		require.ElementsMatch(t, []int{1, 2, 3}, visited)
 	})
 	t.Run("by metric id pins its shard", func(t *testing.T) {
-		// 1003 % 3 = 1 → 0-based shard 1 → shard 2
+		// 1003 % 3 = 1 → 0-based shard 1 → shard 2; the strategy is
+		// admin-editable, so the last change must predate the range
 		m := fanoutMetric(format.ShardByMetricID)
 		m.MetricID = 1003
+		m.UpdateTime = 1000
 		visited, err := run(t, fanoutTestSource(fanoutFakes(3)...), m)
 		require.NoError(t, err)
+		require.Equal(t, []int{2}, visited)
+	})
+	t.Run("by metric id edited inside range fans out", func(t *testing.T) {
+		m := fanoutMetric(format.ShardByMetricID)
+		m.MetricID = 1003
+		m.UpdateTime = 2500 // after FromSec 2000: the strategy may have flipped mid-range
+		visited, err := run(t, fanoutTestSource(fanoutFakes(3)...), m)
+		require.NoError(t, err)
+		require.ElementsMatch(t, []int{1, 2, 3}, visited)
+	})
+	t.Run("promql aggregate placeholder fans out", func(t *testing.T) {
+		// the zero placeholder a promql aggregate carries is not an
+		// assignment — pruning by it would pin every aggregate to shard 1
+		m := fanoutMetric(format.ShardByMetricID)
+		m.MetricID = 0
+		m.UpdateTime = 1000
+		visited, err := run(t, fanoutTestSource(fanoutFakes(3)...), m)
+		require.NoError(t, err)
+		require.ElementsMatch(t, []int{1, 2, 3}, visited)
+	})
+	t.Run("aggregate over one metric prunes by that metric", func(t *testing.T) {
+		// the same placeholder with the real metric addressed through the
+		// filter: the lone member decides the shard set (1003 % 3 = 1 → 2)
+		m := fanoutMetric(format.ShardByMetricID)
+		m.MetricID = 1003
+		m.UpdateTime = 1000
+		src := fanoutTestSource(fanoutFakes(3)...)
+		_, err := fanoutRunSeries(t, src, &seriesDataQuery{
+			metric:   &format.MetricMetaValue{},
+			filterIn: data_model.TagFilters{Metrics: []*format.MetricMetaValue{m}},
+			what:     fanoutWhats(data_model.DigestCount),
+		})
+		require.NoError(t, err)
+		var visited []int
+		for _, c := range src.clients {
+			if f := c.(*fakeStoreShard); f.seriesCallCount() > 0 {
+				visited = append(visited, int(f.shard))
+			}
+		}
 		require.Equal(t, []int{2}, visited)
 	})
 	t.Run("fixed shard pruned when older than range", func(t *testing.T) {
@@ -881,9 +941,10 @@ func TestFanoutRetryOnceOnMetadataMismatch(t *testing.T) {
 	})
 }
 
-// TestShardForRange pins the pruning rules: only a provably immutable
-// assignment (by-metric-id) or one untouched since before the queried range
-// prunes to a single shard; everything else fans out.
+// TestShardForRange pins the pruning rules: compiled-in builtins (immune to
+// edits) and user metrics untouched since before the queried range prune to a
+// single shard; everything else — including the zero placeholder a promql
+// aggregate carries — fans out.
 func TestShardForRange(t *testing.T) {
 	src := &duckQuerySource{numShards: 3}
 	const from = int64(1000)
@@ -894,24 +955,43 @@ func TestShardForRange(t *testing.T) {
 		}
 	}
 
-	// by-metric-id: derived from the immutable id (7 % 3 = 1) — prunes
-	// regardless of edits
-	require.Equal(t, 1, src.shardForRange(mk(format.ShardByMetricID, 0, 0, 0), from))
-	require.Equal(t, 1, src.shardForRange(mk(format.ShardByMetricID, 0, 0, 2000), from))
+	// by-metric-id: the id is immutable, but the strategy is admin-editable —
+	// a metric flipped onto by-metric-id keeps its pre-flip rows on the old
+	// shard — so only a last change before the range proves the assignment
+	// covers it (7 % 3 = 1)
+	require.Equal(t, 1, src.shardForRange(mk(format.ShardByMetricID, 0, 0, 500), from))
+	require.Equal(t, -1, src.shardForRange(mk(format.ShardByMetricID, 0, 0, 2000), from), "edited inside the range")
+	require.Equal(t, -1, src.shardForRange(mk(format.ShardByMetricID, 0, 0, 0), from), "unknown last-change time")
 
-	// fixed shard: editable — prunes only when the last edit predates the range
+	// fixed shard: equally editable — prunes only when the last edit predates the range
 	require.Equal(t, 2, src.shardForRange(mk(format.ShardFixed, 0, 2, 500), from))
 	require.Equal(t, -1, src.shardForRange(mk(format.ShardFixed, 0, 2, 2000), from), "edited inside the range")
 	require.Equal(t, -1, src.shardForRange(mk(format.ShardFixed, 0, 2, 0), from), "unknown last-change time")
 
-	// fixed key: equally editable (an admin edit can move it mid-range), so
-	// the same guard applies — key 3 resolves to shard 2
+	// fixed key: the same guard applies — key 3 resolves to shard 2
 	require.Equal(t, 2, src.shardForRange(mk(format.ShardFixed, 3, 0, 500), from))
 	require.Equal(t, -1, src.shardForRange(mk(format.ShardFixed, 3, 0, 2000), from), "fixed key edited inside the range")
 	require.Equal(t, -1, src.shardForRange(mk(format.ShardFixed, 3, 0, 0), from), "fixed key with unknown last-change time")
 
-	// unsharded metrics fan out everywhere
+	// the promql-aggregate placeholder carries no assignment at all
+	placeholder := mk(format.ShardByMetricID, 0, 0, 500)
+	placeholder.MetricID = 0
+	require.Equal(t, -1, src.shardForRange(placeholder, from))
+
+	// compiled-in builtins cannot be edited, so the compiled table decides —
+	// whatever a journal copy claims about strategy or change time
+	builtin := *format.BuiltinMetricMetaAggKeepAlive // by-metric-id, no edit guard applies
+	require.Equal(t, int(uint32(builtin.MetricID)%3), src.shardForRange(&builtin, from))
+	staleCopy := builtin
+	staleCopy.ShardStrategy = format.ShardFixed
+	staleCopy.ShardNum = 2
+	staleCopy.UpdateTime = 2000
+	require.Equal(t, int(uint32(builtin.MetricID)%3), src.shardForRange(&staleCopy, from), "journal copy cannot override the compiled table")
+
+	// unsharded metrics fan out everywhere — including builtins whose data
+	// follows the metric it describes
 	require.Equal(t, -1, src.shardForRange(mk(format.ShardBuiltinDist, 0, 0, 500), from))
+	require.Equal(t, -1, src.shardForRange(format.BuiltinMetricMetaIngestionStatus, from))
 }
 
 // TestStoreQueryTimeoutMs: the relative timeout rides the context deadline

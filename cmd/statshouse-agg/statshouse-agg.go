@@ -229,6 +229,8 @@ main_loop:
 	agg.SaveJournals()
 	agg.SaveMappings()
 	shutdownInfo.SaveJournal = agent.ShutdownInfoDuration(&now).Nanoseconds()
+	log.Printf("7. Closing duck store...")
+	agg.CloseDuckStore()
 	shutdownInfo.FinishShutdownTime = now.UnixNano()
 	agent.ShutdownInfoSave(argv.cacheDir, shutdownInfo)
 	log.Printf("Bye")

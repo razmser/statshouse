@@ -403,6 +403,7 @@ func MakeAggregator(fj *os.File, fjCompact *os.File, mappingsCache *pcache.Mappi
 
 	// The duck store must exist before the insert threads start; from here to
 	// the end of MakeAggregator nothing fails anymore.
+	var queryLn net.Listener
 	if a.config.StorageBackend == duckstore.BackendDuck {
 		duck, err := openDuckStore(a.config, a.sh2)
 		if err != nil {
@@ -419,6 +420,14 @@ func MakeAggregator(fj *os.File, fjCompact *os.File, mappingsCache *pcache.Mappi
 				CryptoKeys:  []string{aesPwd},
 				Logf:        log.Printf,
 			}, duck.QueryExecutor(a.metricStorage, a.shardKey))
+			// Bind here, synchronously: under duck this listener is the
+			// shard's entire read path, so an address that cannot bind is a
+			// startup failure — a silently write-only shard is exactly the
+			// misconfiguration the duck validation exists to make loud.
+			queryLn, err = rpc.Listen("tcp4", a.config.DuckQueryAddr, false)
+			if err != nil {
+				return nil, fmt.Errorf("failed to bind duck query listener on %q: %v", a.config.DuckQueryAddr, err)
+			}
 		}
 	}
 
@@ -442,7 +451,9 @@ func MakeAggregator(fj *os.File, fjCompact *os.File, mappingsCache *pcache.Mappi
 
 	if a.queryServer != nil {
 		go func() {
-			_ = a.queryServer.ListenAndServe()
+			if err := a.queryServer.Serve(queryLn); err != nil {
+				log.Printf("[error] duck query listener stopped: %v", err)
+			}
 		}()
 	}
 
@@ -485,6 +496,19 @@ func (a *Aggregator) SaveJournals() {
 func (a *Aggregator) SaveMappings() {
 	if _, err := a.mappingsStorage.Save(); err != nil {
 		log.Printf("Mappings storage save failed: %v", err)
+	}
+}
+
+// CloseDuckStore stops the duck store's maintenance loops and releases its
+// DuckDB handles — the last shutdown step under the duck backend, after every
+// producer of store writes (insert threads, RPC servers) has stopped. Under
+// ClickHouse it is a no-op.
+func (a *Aggregator) CloseDuckStore() {
+	if a.duckStore == nil {
+		return
+	}
+	if err := a.duckStore.Close(); err != nil {
+		log.Printf("duck store close failed: %v", err)
 	}
 }
 

@@ -42,3 +42,16 @@ func TestRowAtPointStringTagRepro(t *testing.T) {
 	row := c.rowAtPoint(0)
 	require.Equal(t, "alpha", row.stag[3])
 }
+
+// TestRowAtPointShardNumRepro: grouping a point query by __shard__ selects
+// the _shard_num column (writeSelectTagsV3 registers it for both modes), and
+// rowAt fills the row identity from it — but rowAtPoint never did, so every
+// shard decoded onto shard 0 and the per-shard rows overwrote each other
+// instead of forming one series per shard. The duck source's decoder has
+// always filled it, so the two backends answered the same query differently.
+func TestRowAtPointShardNumRepro(t *testing.T) {
+	var c seriesQuery
+	c.shardNum = proto.ColUInt32{2}
+	row := c.rowAtPoint(0)
+	require.Equal(t, uint32(2), row.shardNum)
+}

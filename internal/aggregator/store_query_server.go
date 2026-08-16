@@ -137,7 +137,9 @@ func addressedMetricIDs(base tlstatshouse.StoreQueryBase) []int32 {
 
 // storeQueryServerConfig configures the query listener.
 type storeQueryServerConfig struct {
-	// Address the listener serves store queries on ("host:port").
+	// Address the listener serves store queries on ("host:port"). The caller
+	// binds it itself — a bad address must fail startup, not pass silently —
+	// so this is documentation and diagnostics, not something Serve reads.
 	Address string
 
 	// Concurrency is how many queries execute at once; one more than that
@@ -235,13 +237,9 @@ func (s *storeQueryServer) handleQueryClient(ctx context.Context, hctx *rpc.Hand
 	return s.h.Handle(ctx, hctx)
 }
 
-// ListenAndServe starts serving on the configured address; it returns when the
+// Serve serves on an already-open listener, which the caller binds so a bad
+// address fails startup instead of passing silently; it returns when the
 // server is shut down.
-func (s *storeQueryServer) ListenAndServe() error {
-	return s.server.ListenAndServe("tcp4", s.cfg.Address)
-}
-
-// Serve serves on an already-open listener; tests use it to pick a free port.
 func (s *storeQueryServer) Serve(ln net.Listener) error {
 	return s.server.Serve(ln)
 }

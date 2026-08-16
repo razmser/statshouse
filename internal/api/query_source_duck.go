@@ -97,26 +97,43 @@ func newDuckQuerySource(cfg duckQuerySourceConfig) *duckQuerySource {
 // whole range starting at fromSec, or -1 when the query must fan out. Fan-out
 // is the always-correct answer — data lands wherever agent-to-aggregator
 // routing put it — so pruning happens only when the assignment provably
-// covers the range. The by-metric-id assignment is derived from the immutable
-// metric id, so it never moves and prunes unconditionally. The fixed-key and
-// fixed-shard assignments are admin-editable (an edit can move either
-// mid-range), so they hold only from the metric's last change onward: a
-// metric with an unknown last-change time, or one touched inside the queried
-// range, fans out for correctness.
+// covers the range. Compiled-in builtins qualify outright: they cannot be
+// edited, so their assignment never moves, and write-side routing resolves
+// them from the same immutable table — the passed copy is replaced by it.
+// Every user-metric assignment — by-metric-id included, because the strategy
+// fields themselves are admin-editable and a metric flipped from a fixed key
+// or shard onto by-metric-id keeps its pre-flip rows on the old shard while
+// id % numShards points elsewhere — holds only from the metric's last change
+// onward: a metric with an unknown last-change time, or one touched inside
+// the queried range, fans out for correctness.
 func (s *duckQuerySource) shardForRange(m *format.MetricMetaValue, fromSec int64) int {
+	// A promql aggregate carries a zero placeholder as its metric and
+	// addresses the real metric (or several) through the filter — there is no
+	// one assignment to prune by.
+	if m.MetricID == 0 {
+		return -1
+	}
+	if builtin, ok := format.BuiltinMetrics[m.MetricID]; ok {
+		m = builtin
+	} else if m.UpdateTime == 0 || int64(m.UpdateTime) > fromSec {
+		return -1
+	}
 	if !m.Sharded() {
 		return -1
 	}
 	// The effective assignment, resolved the way Shard() resolves it: the
 	// fixed key wins over the strategy, so a metric carrying both prunes by
 	// the editable key, not by its id.
-	byMetricID := m.ShardFixedKey == 0 && m.ShardStrategy == format.ShardByMetricID
-	if !byMetricID {
-		if m.UpdateTime == 0 || int64(m.UpdateTime) > fromSec {
-			return -1
-		}
-	}
 	return m.Shard(s.numShards)
+}
+
+// clientsForMetric returns the shard set a query about m starting at fromSec
+// must visit: the single shard shardForRange pins it to, or the whole set.
+func (s *duckQuerySource) clientsForMetric(m *format.MetricMetaValue, fromSec int64) ([]storeShardClient, error) {
+	if shard := s.shardForRange(m, fromSec); shard >= 0 {
+		return s.clientsForShard(shard, m.MetricID)
+	}
+	return s.clients, nil
 }
 
 // clientsForShard returns the single client serving shard (0-based), or an
@@ -152,14 +169,14 @@ func (s *duckQuerySource) querySeries(ctx context.Context, h *requestHandler, q 
 	if err := h.blockedPolicyError(q.metric, q.user); err != nil {
 		return err
 	}
+	// The addressed metric decides the shard set — for a promql aggregate
+	// that is the filter's lone member, not the placeholder the query carries.
 	clients := s.clients
-	if q.metric != nil {
-		if shard := s.shardForRange(q.metric, lod.FromSec); shard >= 0 {
-			var err error
-			clients, err = s.clientsForShard(shard, q.metric.MetricID)
-			if err != nil {
-				return err
-			}
+	if addressed := singleAddressedMetric(q.metric, q.filterIn); addressed != nil {
+		var err error
+		clients, err = s.clientsForMetric(addressed, lod.FromSec)
+		if err != nil {
+			return err
 		}
 	}
 	args, err := buildStoreSeriesArgs(q, lod, storeQueryTimeoutMs(ctx))
@@ -167,7 +184,7 @@ func (s *duckQuerySource) querySeries(ctx context.Context, h *requestHandler, q 
 		return err
 	}
 	start := time.Now()
-	resps, err := retryOnMismatch(s, ctx, clients, singleAddressedMetric(q.metric, q.filterIn),
+	resps, err := retryOnMismatch(s, ctx, clients, lod.FromSec, singleAddressedMetric(q.metric, q.filterIn),
 		func(ctx context.Context, c storeShardClient) (tlstatshouse.StoreSeriesResponse, error) {
 			return c.querySeries(ctx, args)
 		},
@@ -214,12 +231,10 @@ func (s *duckQuerySource) queryTagValues(ctx context.Context, h *requestHandler,
 	}
 	clients := s.clients
 	if q.metric != nil {
-		if shard := s.shardForRange(q.metric, lod.FromSec); shard >= 0 {
-			var err error
-			clients, err = s.clientsForShard(shard, q.metric.MetricID)
-			if err != nil {
-				return err
-			}
+		var err error
+		clients, err = s.clientsForMetric(q.metric, lod.FromSec)
+		if err != nil {
+			return err
 		}
 	}
 	args, err := buildStoreTagValuesArgs(q, lod, storeQueryTimeoutMs(ctx))
@@ -227,7 +242,7 @@ func (s *duckQuerySource) queryTagValues(ctx context.Context, h *requestHandler,
 		return err
 	}
 	start := time.Now()
-	resps, err := retryOnMismatch(s, ctx, clients, singleAddressedMetric(q.metric, q.filterIn),
+	resps, err := retryOnMismatch(s, ctx, clients, lod.FromSec, singleAddressedMetric(q.metric, q.filterIn),
 		func(ctx context.Context, c storeShardClient) (tlstatshouse.StoreTagValuesResponse, error) {
 			return c.queryTagValues(ctx, args)
 		},
@@ -260,6 +275,15 @@ func (s *duckQuerySource) queryTagValues(ctx context.Context, h *requestHandler,
 	if err != nil {
 		return err
 	}
+	// The ClickHouse source truncates every LOD's query to the user's top
+	// numResults+1 (its SQL LIMIT), and the handler sums those per-LOD
+	// partials — so the same cut is applied here, once per LOD, after the
+	// cross-shard merge has produced the LOD's global ranking. Without it a
+	// value below one LOD's cut would still contribute its full count here
+	// and the two backends' answers would drift apart over multi-LOD ranges.
+	if q.numResults >= 0 && len(merged) > q.numResults+1 {
+		merged = merged[:q.numResults+1]
+	}
 	for i := range merged {
 		if err := onRow(merged[i]); err != nil {
 			return err
@@ -277,9 +301,11 @@ func (s *duckQuerySource) queryTagValues(ctx context.Context, h *requestHandler,
 // layout either side is unsure of. metric is the single metric the request
 // addresses (nil when it addresses several or none, in which case there is no
 // one metric to refresh and the mismatch is final); rebuild re-derives the
-// call from a fresh journal copy of that metric. Both verbs go through it:
+// call from a fresh journal copy of that metric, and the shard set is
+// re-selected from that same fresh copy — an edit that moved the assignment
+// mid-query must move the retry's destinations too. Both verbs go through it:
 // the shards validate a tag-values request's base exactly like a series one.
-func retryOnMismatch[R any](s *duckQuerySource, ctx context.Context, clients []storeShardClient, metric *format.MetricMetaValue,
+func retryOnMismatch[R any](s *duckQuerySource, ctx context.Context, clients []storeShardClient, fromSec int64, metric *format.MetricMetaValue,
 	call func(ctx context.Context, c storeShardClient) (R, error),
 	rebuild func(fresh *format.MetricMetaValue) (func(ctx context.Context, c storeShardClient) (R, error), error)) ([]R, error) {
 	resps, err := fanoutCall(ctx, clients, call)
@@ -299,7 +325,11 @@ func retryOnMismatch[R any](s *duckQuerySource, ctx context.Context, clients []s
 	if rerr != nil {
 		return nil, rerr
 	}
-	return fanoutCall(ctx, clients, retry)
+	retryClients, cerr := s.clientsForMetric(fresh, fromSec)
+	if cerr != nil {
+		return nil, cerr
+	}
+	return fanoutCall(ctx, retryClients, retry)
 }
 
 // waitVersion waits — at most fanoutJournalWait — for the API's metrics
@@ -355,7 +385,9 @@ func buildStoreSeriesArgs(q *seriesDataQuery, lod data_model.LOD, timeoutMs int3
 // buildStoreTagValuesArgs lowers a semantic tag-values request onto the RPC's
 // tag-values verb. The user's top N is deliberately not carried: the shards
 // must not apply it (a value ranked below N everywhere can still be globally
-// top-N), the API sums counts across shards and the handler takes the top N.
+// top-N), the API sums counts across shards and applies N itself — per LOD,
+// after the cross-shard merge, the way the ClickHouse source's SQL LIMIT
+// does.
 func buildStoreTagValuesArgs(q *tagValuesDataQuery, lod data_model.LOD, timeoutMs int32) (tlstatshouse.StoreQueryTagValues, error) {
 	base, err := buildStoreQueryBase(q.metric, q.filterIn, q.filterNotIn, lod, q.utcOffset, timeoutMs)
 	if err != nil {

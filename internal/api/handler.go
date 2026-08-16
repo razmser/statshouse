@@ -2998,6 +2998,12 @@ func (c *seriesQuery) rowAtPoint(i int) pSelectRow {
 	if len(c.maxHostV2) != 0 {
 		row.maxHost = c.maxHostV2[i]
 	}
+	// The shard column decodes into the row identity the same way rowAt
+	// fills it: without it every shard of a group-by-__shard__ point query
+	// collapses onto shard 0 and the per-shard rows overwrite each other.
+	if c.shardNum != nil {
+		row.shardNum = c.shardNum[i]
+	}
 	return row
 }
 
