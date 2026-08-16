@@ -174,7 +174,7 @@ func NewWriter(s *Store, cfg WriterConfig) (*Writer, error) {
 	if s.writer != nil {
 		s.mu.Unlock()
 		_ = conn.Close()
-		w.closeAppenders()
+		w.dropAppenders()
 		return nil, fmt.Errorf("duck-store: store already has a writer")
 	}
 	s.writer = w
@@ -186,9 +186,12 @@ func NewWriter(s *Store, cfg WriterConfig) (*Writer, error) {
 // WriteRound submits rows to the writer goroutine and returns when the whole
 // round is flushed into the delta — acknowledged means durable (see Writer).
 // The rows (and their byte slices) must stay untouched until WriteRound
-// returns. A cancelled context fails the round; the writer may still finish
-// flushing it afterwards, exactly like a ClickHouse insert that outruns its
-// caller's timeout.
+// returns: once the writer goroutine has taken them it keeps reading them for
+// the whole round, so WriteRound waits for its reply rather than hand the
+// rows back early. A cancelled context still fails the round — or completes
+// it, when the flush had already finished — exactly like a ClickHouse insert
+// that outruns its caller's timeout, so the conveyor's at-least-once resend
+// of a reported failure stays safe.
 func (w *Writer) WriteRound(ctx context.Context, rows []Row) error {
 	req := writeRequest{ctx: ctx, rows: rows, resp: make(chan error, 1)}
 	select {
@@ -198,14 +201,12 @@ func (w *Writer) WriteRound(ctx context.Context, rows []Row) error {
 	case <-w.done:
 		return errWriterClosed
 	}
-	select {
-	case err := <-req.resp:
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-w.done:
-		return errWriterClosed
-	}
+	// The writer goroutine took the request, so its reply is guaranteed to
+	// arrive (resp is buffered; even Close lets an in-flight round finish
+	// first). Returning on anything but the reply would hand the rows back to
+	// a caller contractually allowed to reuse them while the round is still
+	// reading them.
+	return <-req.resp
 }
 
 // SwitchDelta moves the writer onto db, the pool of a freshly rolled delta
@@ -250,7 +251,7 @@ func (w *Writer) run() {
 				req.resp <- w.writeRound(req.ctx, req.rows)
 			}
 		case <-w.done:
-			w.closeAppenders()
+			w.dropAppenders()
 			_ = w.conn.Close()
 			return
 		}
@@ -270,7 +271,7 @@ func (w *Writer) switchDelta(db *sql.DB) error {
 		_ = conn.Close()
 		return err
 	}
-	w.closeAppenders() // the old generation's; its last round flushed before this
+	w.dropAppenders() // the old generation's; its last round flushed before this
 	old := w.conn
 	w.conn = conn
 	w.appenders = appenders
@@ -444,8 +445,8 @@ func createTierAppenders(conn *sql.Conn) (map[string]*duckdb.Appender, error) {
 // the failed round's transaction is still open: an appender's Close flushes
 // its leftovers, so anything still buffered lands INSIDE that transaction —
 // where the rollback waiting right after it discards it, keeping the failed
-// round out of every tier. The other caller, a generation switch or shutdown,
-// runs between rounds when nothing is buffered.
+// round out of every tier. The other callers, a generation switch or shutdown,
+// run between rounds when nothing is buffered.
 func (w *Writer) dropAppenders() {
 	for tier, a := range w.appenders {
 		if a != nil {
@@ -455,8 +456,4 @@ func (w *Writer) dropAppenders() {
 		}
 		delete(w.appenders, tier)
 	}
-}
-
-func (w *Writer) closeAppenders() {
-	w.dropAppenders()
 }

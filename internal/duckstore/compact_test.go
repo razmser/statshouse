@@ -649,3 +649,31 @@ func TestNewCompactorDefaults(t *testing.T) {
 	require.Equal(t, DefaultCompactorInterval, c.cfg.Interval)
 	require.NotNil(t, c.cfg.Logf)
 }
+
+// TestBlobListCoversDriverVariants feeds blobList every LIST(BLOB) shape
+// duckdb-go can hand a Scan: nil, one []byte, a [][]byte, an []any of blobs,
+// and the two shapes that must error. These arms exist precisely because the
+// driver's scan type varies across versions; an upgrade would otherwise run
+// code no test ever executed, failing every compaction and seal.
+func TestBlobListCoversDriverVariants(t *testing.T) {
+	out, err := blobList(nil)
+	require.NoError(t, err)
+	require.Nil(t, out)
+
+	got, err := blobList([][]byte{[]byte("a"), []byte("b")})
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{[]byte("a"), []byte("b")}, got)
+
+	got, err = blobList([]byte("single"))
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{[]byte("single")}, got)
+
+	got, err = blobList([]any{[]byte("a"), []byte("b")})
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{[]byte("a"), []byte("b")}, got)
+
+	_, err = blobList([]any{[]byte("a"), "not a blob"})
+	require.Error(t, err)
+	_, err = blobList(42)
+	require.Error(t, err)
+}

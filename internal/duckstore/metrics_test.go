@@ -194,7 +194,12 @@ func TestRetainerReportsWindowEvents(t *testing.T) {
 		s := agedWindowsFixture(t, 5, 26*3600, 50*3600)
 
 		m := &recordingMetrics{}
-		cfg := defaultRetentionConfig()
+		cfg := RetentionConfig{
+			Retention1s:        DefaultRetention1s,
+			Retention1m:        DefaultRetention1m,
+			Retention1h:        DefaultRetention1h,
+			FreeSpaceWatermark: DefaultFreeSpaceWatermark,
+		}
 		cfg.NowFunc = farFutureClock()
 		cfg.Metrics = m
 		retainer := NewRetainer(s, cfg)
@@ -251,7 +256,12 @@ func TestRetainerReportsWindowEvents(t *testing.T) {
 		require.NotNil(t, l)
 
 		m := &recordingMetrics{}
-		cfg := defaultRetentionConfig()
+		cfg := RetentionConfig{
+			Retention1s:        DefaultRetention1s,
+			Retention1m:        DefaultRetention1m,
+			Retention1h:        DefaultRetention1h,
+			FreeSpaceWatermark: DefaultFreeSpaceWatermark,
+		}
 		cfg.NowFunc = farFutureClock()
 		cfg.Metrics = m
 		retainer := NewRetainer(s, cfg)

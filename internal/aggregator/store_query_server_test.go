@@ -371,3 +371,16 @@ func TestStoreQueryServerSettings(t *testing.T) {
 	require.Equal(t, 5, cap(srv.sema))
 	require.Equal(t, 13, srv.workerLimit, "the worker pool tracks the admission slots")
 }
+
+// TestStoreQueryServerMalformedRequestIsBadRequest drives the parse-failure
+// arm of both verbs directly — the TL client never produces undecodable
+// bytes, so the mapping from a garbage request to the structured bad_request
+// code is only reachable with a hand-built handler context, and a regression
+// here would otherwise leak an unstructured rpc error to the API's fan-out.
+func TestStoreQueryServerMalformedRequestIsBadRequest(t *testing.T) {
+	s := newStoreQueryServer(storeQueryServerConfig{Concurrency: 1}, newGatedQueryExecutor())
+	err := s.handleQuerySeries(context.Background(), &rpc.HandlerContext{Request: []byte{0xff, 0xff, 0xff}})
+	requireErrorCode(t, err, duckstore.ErrCodeBadRequest, "garbage series request")
+	err = s.handleQueryTagValues(context.Background(), &rpc.HandlerContext{Request: []byte{0x01, 0x02, 0x03}})
+	requireErrorCode(t, err, duckstore.ErrCodeBadRequest, "garbage tag-values request")
+}

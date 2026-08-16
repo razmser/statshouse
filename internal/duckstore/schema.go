@@ -87,19 +87,9 @@ var tierSeconds = map[string]int64{
 	Tier1h: 3600,
 }
 
-// allTiers returns the tier names in canonical order.
-func allTiers() []string {
-	return append([]string(nil), tiers...)
-}
-
 // TierTable returns the table name a tier is stored in.
 func TierTable(tier string) string {
 	return tierTables[tier]
-}
-
-// tierSecondsOf returns the length of a tier's bucket interval in seconds.
-func tierSecondsOf(tier string) int64 {
-	return tierSeconds[tier]
 }
 
 // TierTableDDL returns the CREATE TABLE statement for one tier table: the

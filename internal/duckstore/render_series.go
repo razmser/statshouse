@@ -38,12 +38,6 @@ import (
 // SQL text: DuckDB rejects ClickHouse's backslash escaping outright, so there
 // is no transliteration of the existing escaping to fall back on.
 
-// seriesBatchTargetBytes is the target size of one storeSeriesBatch. It
-// matches the API transport's chunk size, because a batch is the unit a
-// future streaming RPC would emit one at a time. It is a variable only so
-// tests can shrink it; production leaves it alone.
-var seriesBatchTargetBytes = 10_000_000
-
 // monthLodStep is the one step with a genuine timezone dependency: calendar
 // months. Every other step truncates by integer arithmetic against
 // utc_offset. The value is data_model's _1M: 31 days of seconds.
@@ -275,9 +269,15 @@ func buildSeriesSQL(p *seriesPlan, sources []string) (*seriesQuerySQL, error) {
 	var sel []string
 	if p.monthLod {
 		// to the local wall clock in the requested zone, truncated to the
-		// month, and read back as the UTC unix seconds of that boundary
-		sel = append(sel, "(epoch(date_trunc('month', timezone("+param(lod.Location)+
-			", timezone('UTC', make_timestamp(time * 1000000))))))::BIGINT AS _time")
+		// month, then re-attached to the zone before epoch — so _time is the
+		// true instant of the local month start, exactly the unix seconds
+		// ClickHouse's toStartOfInterval(time, INTERVAL 1 MONTH, '<loc>')
+		// reports. Skipping the re-attachment would read the naive local
+		// boundary as UTC, shifting every month bucket by the zone offset.
+		loc := param(lod.Location)
+		sel = append(sel, "(epoch(timezone("+loc+
+			", date_trunc('month', timezone("+loc+
+			", timezone('UTC', make_timestamp(time * 1000000)))))))::BIGINT AS _time")
 	} else {
 		utc := param(lod.UtcOffset)
 		step := param(lod.StepSec)
@@ -739,15 +739,14 @@ func scanSeriesRows(rows *sql.Rows, p *seriesPlan, shardNum int32) (tlstatshouse
 	return b.response(shardNum), nil
 }
 
-// seriesBatcher accumulates rows into size-bounded batches, one column vector
-// per grouped tag (the shard entry's vector filled from the literal) and one
-// column per requested aggregate.
+// seriesBatcher accumulates the scan's rows into the response's single batch,
+// one column vector per grouped tag (the shard entry's vector filled from the
+// literal) and one column per requested aggregate.
 type seriesBatcher struct {
 	cols    seriesCols
 	by      []byCol
 	batches []tlstatshouse.StoreSeriesBatch
 	cur     tlstatshouse.StoreSeriesBatch
-	est     int
 }
 
 func newSeriesBatcher(p *seriesPlan) *seriesBatcher {
@@ -763,7 +762,7 @@ func (b *seriesBatcher) reset() {
 	}
 }
 
-// add appends one row and flushes the batch when it passes the target size.
+// add appends one row to the batch.
 func (b *seriesBatcher) add(r *seriesScanRow, pct, uniq string) {
 	b.cur.Time = append(b.cur.Time, r.time)
 	for i := range b.by {
@@ -806,37 +805,6 @@ func (b *seriesBatcher) add(r *seriesScanRow, pct, uniq string) {
 		b.cur.MaxHostTag = append(b.cur.MaxHostTag, r.maxHostTag)
 		b.cur.MaxHostStag = append(b.cur.MaxHostStag, r.maxHostStag)
 	}
-
-	b.est += b.rowBytes(r, pct, uniq)
-	if b.est >= seriesBatchTargetBytes && len(b.cur.Time) > 0 {
-		b.flush()
-	}
-}
-
-// rowBytes estimates one row's serialized size, the number the batch target
-// is judged against: 8 per number, a length prefix per string.
-func (b *seriesBatcher) rowBytes(r *seriesScanRow, pct, uniq string) int {
-	n := 8 + 8*len(b.by)
-	for i := range b.by {
-		if b.by[i].stag {
-			n += 4 + len(r.stags[i])
-		}
-	}
-	for _, present := range []struct {
-		on  bool
-		add int
-	}{
-		{b.cols.count, 8}, {b.cols.min, 8}, {b.cols.max, 8},
-		{b.cols.sum, 8}, {b.cols.sumsquare, 8}, {b.cols.cardinality, 8},
-		{b.cols.percentiles, 4 + len(pct)}, {b.cols.uniq, 4 + len(uniq)},
-		{b.cols.minHost, 16 + 4 + len(r.minHostStag)},
-		{b.cols.maxHost, 16 + 4 + len(r.maxHostStag)},
-	} {
-		if present.on {
-			n += present.add
-		}
-	}
-	return n
 }
 
 // flush seals the current batch, unless it is empty.
@@ -877,7 +845,6 @@ func (b *seriesBatcher) flush() {
 	}
 	b.batches = append(b.batches, b.cur)
 	b.reset()
-	b.est = 0
 }
 
 func (b *seriesBatcher) response(shardNum int32) tlstatshouse.StoreSeriesResponse {

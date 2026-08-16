@@ -152,6 +152,13 @@ func TestConformanceSpecialRequestShapes(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, "max_count_host", q(host.path).Get("qw"))
 
+	// the month-LOD series overrides the default 1s step with w=1M
+	month, ok := byLabel["series-month/c_tagged/count"]
+	require.True(t, ok)
+	require.Equal(t, "/api/query", strings.SplitN(month.path, "?", 2)[0])
+	require.Equal(t, "1M", q(month.path).Get("w"))
+	require.Equal(t, "count", q(month.path).Get("qw"))
+
 	// table swaps only the endpoint path
 	tvs, ok := byLabel["table/v_mix/sum"]
 	require.True(t, ok)

@@ -597,18 +597,18 @@ func TestRenderSeriesMonthBuckets(t *testing.T) {
 		1682899200, 1700000000, monthLodStep)
 	q.Base.Lod.Location = "Europe/Moscow"
 	r := renderSeriesSorted(t, s, 1, q)
-	require.Equal(t, []int64{1682899200, 1698796800}, r.time, "local month starts as unix seconds")
+	// the true instants of the local month starts: 2023-05-01 00:00 MSK is
+	// 2023-04-30 21:00 UTC, 2023-11-01 00:00 MSK is 2023-10-31 21:00 UTC —
+	// exactly what ClickHouse's toStartOfInterval(time, INTERVAL 1 MONTH,
+	// 'Europe/Moscow') reports, not the boundary's wall clock read as UTC
+	require.Equal(t, []int64{1682888400, 1698786000}, r.time, "local month starts as unix seconds")
 	require.Equal(t, []float64{1, 2}, r.count)
 }
 
-// TestRenderSeriesBatchSplitting shrinks the batch target so a handful of rows
-// spans several batches, and checks the split keeps every batch row-complete
-// and the concatenation ordered.
-func TestRenderSeriesBatchSplitting(t *testing.T) {
-	old := seriesBatchTargetBytes
-	seriesBatchTargetBytes = 50 // one time+count row estimates 16 bytes
-	t.Cleanup(func() { seriesBatchTargetBytes = old })
-
+// TestRenderSeriesSingleBatch checks the response's batch shape: the whole
+// answer is one batch whose column vectors all carry the same row count, and
+// a sorted request comes back ordered.
+func TestRenderSeriesSingleBatch(t *testing.T) {
 	s, w := newTestWriter(t)
 	b1 := (writerNowUnix - 7200) / 60 * 60
 	var rows []Row
@@ -621,15 +621,12 @@ func TestRenderSeriesBatchSplitting(t *testing.T) {
 	q.SetSortAsc(true)
 	resp, err := s.RenderSeries(context.Background(), 1, q)
 	require.NoError(t, err)
-	require.Greater(t, len(resp.Batches), 1, "the shrunken target must split the rows")
-	var times []int64
-	for _, b := range resp.Batches {
-		require.NotZero(t, b.Rows)
-		require.Equal(t, int(b.Rows), len(b.Time))
-		require.Equal(t, int(b.Rows), len(b.Count))
-		times = append(times, b.Time...)
-	}
-	require.Equal(t, []int64{b1, b1 + 60, b1 + 120, b1 + 180, b1 + 240, b1 + 300}, times)
+	require.Len(t, resp.Batches, 1)
+	b := resp.Batches[0]
+	require.EqualValues(t, 6, b.Rows)
+	require.Equal(t, int(b.Rows), len(b.Time))
+	require.Equal(t, int(b.Rows), len(b.Count))
+	require.Equal(t, []int64{b1, b1 + 60, b1 + 120, b1 + 180, b1 + 240, b1 + 300}, b.Time)
 }
 
 // TestRenderSeriesMetricFilter covers the three metric predicates: an exact

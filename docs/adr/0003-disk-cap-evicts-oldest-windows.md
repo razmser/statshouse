@@ -1,8 +1,10 @@
 # Disk is sized by the sampling budget, not by a configured cap
 
 The primary control on duck-store's disk usage is the one operators already use: the aggregator's
-insert budget, which the sampler enforces as bytes per insert round
-(`max(MinInsertBudget, InsertBudget × contributors)`, `aggregator_insert.go:478`). Because that bounds
+insert budget, which the sampler enforces as bytes per insert round —
+`max(MinInsertBudget, InsertBudgetFixed + InsertBudget × contributors)` in the sampler that budgets
+each insert round in `aggregator_insert.go` (`InsertBudgetFixed` = 300 000 bytes, defined beside the
+other insert constants in `internal/data_model/constants.go`). Because that bounds
 the serialized bytes/sec entering the store, and **retention** bounds how long they stay, disk is a
 formula rather than an estimate:
 

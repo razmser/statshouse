@@ -52,7 +52,9 @@ Ground rules when touching either seam:
   decoded answers to every query shape, with CH as the reference. The e2e
   suite's client assertions and input matrix are frozen. Backend comparisons
   are always by decoded value — never by generated SQL, state bytes, or file
-  lists.
+  lists. The same suite also runs the duck stack alone (`go run ./e2e
+  --storage-backend=duck`, or `bash e2e/lima.sh --storage-backend=duck`):
+  no ClickHouse container, the same client assertions.
 - The operator-facing surface (flags, retention, disk formula, quarantine,
   backup policy) is documented in `docs/duck-store.md`, kept in sync with the
   code by `internal/duckstore/docs_test.go`.

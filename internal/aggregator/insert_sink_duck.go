@@ -91,13 +91,22 @@ func openDuckStore(config ConfigAggregator, sh2 *agent.Agent) (duckStoreHandle, 
 	}, nil
 }
 
+// duckMetricsSink is the slice of agent.Agent's surface the store's events
+// flow through, named here — where it is consumed — so the forwarding itself
+// is testable against a capturing fake: a live agent needs the full shard
+// machinery. *agent.Agent satisfies it as-is.
+type duckMetricsSink interface {
+	AddValueCounter(t uint32, metricInfo *format.MetricMetaValue, tags []int32, value float64, counter float64)
+	AddCounter(t uint32, metricInfo *format.MetricMetaValue, tags []int32, count float64)
+}
+
 // duckMetrics forwards the store's observability events to the __duck_store_*
 // builtin metrics through the aggregator's own agent, the same way
 // reportInsertMetric forwards the insert-path metrics: one tags slice per
 // event in final tag positions (environment at 0, filled by the agent), the
 // metric metas carrying the value comments that name the numbers.
 type duckMetrics struct {
-	sh *agent.Agent
+	sh duckMetricsSink
 }
 
 var _ duckstore.MetricsRecorder = (*duckMetrics)(nil)

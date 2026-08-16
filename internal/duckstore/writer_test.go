@@ -10,6 +10,7 @@ package duckstore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -179,7 +180,7 @@ func TestWriterDropsRowsOutsideIngestGuard(t *testing.T) {
 	require.NoError(t, w.WriteRound(context.Background(), rows))
 
 	// the two survivors are in every tier; the three dropped rows in none
-	for _, tier := range allTiers() {
+	for _, tier := range tiers {
 		require.Equal(t, 1, tierCount(t, s, tier, testMetricID), "%s: boundary-old row", tier)
 		require.Equal(t, 0, tierCount(t, s, tier, testMetricID+1), "%s: one-second-too-old row", tier)
 		require.Equal(t, 0, tierCount(t, s, tier, testMetricID+2), "%s: far-past row", tier)
@@ -213,7 +214,7 @@ func TestWriterFailedRoundSurfacesError(t *testing.T) {
 	// the failed round left nothing behind, and the writer still takes rounds
 	require.Equal(t, 0, tierCount(t, s, Tier1s, testMetricID2), "the failed round must not land")
 	require.NoError(t, w.WriteRound(context.Background(), []Row{testRow(testMetricID2, now)}))
-	for _, tier := range allTiers() {
+	for _, tier := range tiers {
 		require.Equal(t, 1, tierCount(t, s, tier, testMetricID2), "%s must hold the recovered round", tier)
 	}
 }
@@ -270,13 +271,13 @@ func TestWriterFailedMidRoundCommitsNothing(t *testing.T) {
 
 	// the failed round must be absent from ALL three tiers: 1s flushed fine,
 	// but the round rolled back with it
-	for _, tier := range allTiers() {
+	for _, tier := range tiers {
 		require.Zero(t, tierCount(t, s, tier, testMetricID), "%s must not hold any of the failed round", tier)
 	}
 
 	// the writer recovers and the resent round lands exactly once
 	require.NoError(t, w.WriteRound(context.Background(), []Row{testRow(testMetricID, now)}))
-	for _, tier := range allTiers() {
+	for _, tier := range tiers {
 		require.Equal(t, 1, tierCount(t, s, tier, testMetricID), "%s must hold the recovered round once", tier)
 	}
 }
@@ -323,14 +324,64 @@ func TestWriterDataSurvivesReopen(t *testing.T) {
 }
 
 // TestWriterCancelledContextFailsRound proves a caller that gives up gets an
-// error rather than a silent partial acknowledgement.
+// error rather than a silent partial acknowledgement. The select in
+// WriteRound may still hand the round to the writer goroutine before noticing
+// the cancellation, and duckdb-go starts an already-cancelled flush anyway —
+// one that may beat its own interrupt and commit — so the two honest outcomes
+// are a cancellation error (the round rolled back) or a true acknowledgement
+// (the row really landed). Anything else, including an error with the row
+// committed, is a false report.
 func TestWriterCancelledContextFailsRound(t *testing.T) {
-	_, w := newTestWriter(t)
+	s, w := newTestWriter(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	err := w.WriteRound(ctx, []Row{testRow(testMetricID, uint32(writerNow.Unix()))})
-	require.Error(t, err)
-	require.ErrorIs(t, err, context.Canceled)
+	now := uint32(writerNow.Unix())
+	err := w.WriteRound(ctx, []Row{testRow(testMetricID, now)})
+	if err == nil {
+		tierRow(t, s, Tier1s, testMetricID, int64(now)) // the ack must be true
+	} else {
+		require.ErrorIs(t, err, context.Canceled)
+		require.Zero(t, tierCount(t, s, Tier1s, testMetricID), "a failed round must not land")
+	}
+}
+
+// TestWriterCancelledContextKeepsRowOwnership pins the ownership half of the
+// cancellation contract: the caller may reuse its row slice the moment
+// WriteRound returns, so WriteRound must NOT return while the writer
+// goroutine is still reading the round's rows — the regression this guards
+// against returned ctx.Err() on cancellation and let the next round's AppendRow
+// overwrite rows the writer was concurrently appending into the delta.
+func TestWriterCancelledContextKeepsRowOwnership(t *testing.T) {
+	inRound := make(chan struct{})
+	release := make(chan struct{})
+	_, w := newTestWriterCfg(t, WriterConfig{
+		FlushTierFault: func(round int64, tier string) error {
+			select {
+			case <-inRound:
+			default:
+				close(inRound)
+			}
+			<-release
+			return nil
+		},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- w.WriteRound(ctx, []Row{testRow(testMetricID, uint32(writerNow.Unix()))})
+	}()
+	<-inRound // the writer goroutine is mid-round, holding the rows
+	cancel()  // the caller gives up
+	select {
+	case err := <-done:
+		t.Fatalf("WriteRound returned %v while the round was still in flight", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release) // let the round finish
+	// now it returns, with the round's true outcome (nil or the cancellation)
+	err := <-done
+	require.True(t, err == nil || errors.Is(err, context.Canceled), "unexpected round outcome: %v", err)
 }
 
 // TestWriterSerializesConcurrentRounds drives several round submitters at the
@@ -385,7 +436,7 @@ func TestWithinIngestGuard(t *testing.T) {
 func TestWriterEmptyRoundIsNoop(t *testing.T) {
 	s, w := newTestWriter(t)
 	require.NoError(t, w.WriteRound(context.Background(), nil))
-	for _, tier := range allTiers() {
+	for _, tier := range tiers {
 		require.Equal(t, 0, tierCount(t, s, tier, testMetricID))
 	}
 }

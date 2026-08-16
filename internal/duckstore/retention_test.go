@@ -53,7 +53,12 @@ func farFutureClock() func() time.Time {
 // with an event recorder attached, the configuration a plain
 // --storage-backend=duck aggregator runs with.
 func specDefaultRetainer(s *Store, now func() time.Time) (*Retainer, *recordingMetrics) {
-	cfg := defaultRetentionConfig()
+	cfg := RetentionConfig{
+		Retention1s:        DefaultRetention1s,
+		Retention1m:        DefaultRetention1m,
+		Retention1h:        DefaultRetention1h,
+		FreeSpaceWatermark: DefaultFreeSpaceWatermark,
+	}
 	cfg.NowFunc = now
 	m := &recordingMetrics{}
 	cfg.Metrics = m
@@ -233,7 +238,12 @@ func TestRetainerRunsAlongsideIngestion(t *testing.T) {
 	defer cancel()
 	// the spec defaults under a clock four hours past the writer clock: past
 	// the old 1s window's boundary, nowhere near the fresh windows'
-	cfg := defaultRetentionConfig()
+	cfg := RetentionConfig{
+		Retention1s:        DefaultRetention1s,
+		Retention1m:        DefaultRetention1m,
+		Retention1h:        DefaultRetention1h,
+		FreeSpaceWatermark: DefaultFreeSpaceWatermark,
+	}
 	cfg.Interval = 10 * time.Millisecond
 	cfg.NowFunc = func() time.Time { return time.Unix(int64(now)+4*3600, 0) }
 	events := &recordingMetrics{}
@@ -340,4 +350,101 @@ func TestNewRetainerDefaults(t *testing.T) {
 	require.NotNil(t, r.cfg.NowFunc)
 	require.NotNil(t, r.cfg.Logf)
 	require.NotNil(t, r.cfg.FreeSpace)
+}
+
+// TestRetainerFreeSpaceProbeFailures covers the eviction loop's two probe
+// failure arms: a first measurement that errors skips eviction entirely, and
+// a re-measurement that errors after one eviction stops the loop instead of
+// spinning — the store keeps serving whatever survived either way.
+func TestRetainerFreeSpaceProbeFailures(t *testing.T) {
+	const watermark = uint64(1 << 20)
+
+	t.Run("first_probe_fails", func(t *testing.T) {
+		s := agedWindowsFixture(t, 5, 26*3600, 50*3600)
+		before := len(s.Windows())
+		retainer := NewRetainer(s, RetentionConfig{
+			FreeSpaceWatermark: watermark,
+			FreeSpace:          func(string) (uint64, error) { return 0, fmt.Errorf("statfs: permission denied") },
+			NowFunc:            func() time.Time { return writerNow },
+		})
+		require.NoError(t, retainer.RetainOnce(context.Background()))
+		require.Len(t, s.Windows(), before, "a failed probe must not evict anything")
+	})
+
+	t.Run("remeasure_fails_after_one_eviction", func(t *testing.T) {
+		s := agedWindowsFixture(t, 5, 26*3600, 50*3600)
+		before := len(s.Windows())
+		calls := 0
+		retainer := NewRetainer(s, RetentionConfig{
+			FreeSpaceWatermark: watermark,
+			FreeSpace: func(string) (uint64, error) {
+				calls++
+				if calls == 1 {
+					return watermark - 1, nil // below the watermark: evict
+				}
+				return 0, fmt.Errorf("statfs: i/o error") // the re-measure after the first eviction
+			},
+			NowFunc: func() time.Time { return writerNow },
+		})
+		require.NoError(t, retainer.RetainOnce(context.Background()))
+		require.Equal(t, 2, calls)
+		require.Len(t, s.Windows(), before-1, "exactly the one eviction before the failed re-measure")
+	})
+}
+
+// TestRetainerLowWatermarkNothingLeftToEvict pins the loop's exit when the
+// volume stays below the watermark with nothing evictable left: the pass
+// completes (ingestion is never stopped for want of disk) and reports nothing
+// evicted.
+func TestRetainerLowWatermarkNothingLeftToEvict(t *testing.T) {
+	s, _ := openTestStore(t, t.TempDir()) // a fresh store serves no archive windows
+	m := &recordingMetrics{}
+	retainer := NewRetainer(s, RetentionConfig{
+		FreeSpaceWatermark: 1 << 20,
+		FreeSpace:          func(string) (uint64, error) { return 1, nil }, // forever below the watermark
+		NowFunc:            func() time.Time { return writerNow },
+		Metrics:            m,
+	})
+	require.NoError(t, retainer.RetainOnce(context.Background()))
+	require.Empty(t, s.Windows())
+	require.Zero(t, countWindowEvents(m, WindowEarlyEvicted))
+}
+
+// TestDropWindowUnlinkFailureRestoresService drives the restore arm of the
+// unlink: a window whose file cannot be removed (here: the path is a
+// non-empty directory) stays served — the next pass retries — and once the
+// obstacle is gone the window leaves normally.
+func TestDropWindowUnlinkFailureRestoresService(t *testing.T) {
+	s := agedWindowsFixture(t, 5, 26*3600, 50*3600)
+	wf := findWindow(t, s, Tier1s, testWindowStart(Tier1s, writerNowUnix-26*3600))
+
+	require.NoError(t, os.Remove(wf.Path))
+	require.NoError(t, os.Mkdir(wf.Path, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(wf.Path, "leftover"), []byte("x"), 0o644))
+
+	require.Error(t, s.DropWindow(Tier1s, wf.WindowStart), "unlinking a non-empty directory must fail")
+	stillServed := false
+	for _, w := range s.Windows() {
+		if w.Tier == Tier1s && w.WindowStart == wf.WindowStart {
+			stillServed = true
+		}
+	}
+	require.True(t, stillServed, "the window keeps serving when its unlink failed")
+
+	require.NoError(t, os.Remove(filepath.Join(wf.Path, "leftover")))
+	require.NoError(t, os.Remove(wf.Path))
+	require.NoError(t, s.DropWindow(Tier1s, wf.WindowStart))
+	require.NoFileExists(t, wf.Path)
+}
+
+// TestStatfsFreeSpace smoke-tests the production default free-space probe on
+// a real volume: it succeeds on an existing directory and reports the
+// non-zero availability df shows, and fails on a missing one.
+func TestStatfsFreeSpace(t *testing.T) {
+	free, err := statfsFreeSpace(t.TempDir())
+	require.NoError(t, err)
+	require.NotZero(t, free)
+
+	_, err = statfsFreeSpace(filepath.Join(t.TempDir(), "no", "such", "dir"))
+	require.Error(t, err)
 }

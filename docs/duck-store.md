@@ -21,12 +21,18 @@ duck-store install starts empty.
 `--storage-backend=clickhouse|duck` on both `statshouse-agg` and
 `statshouse-api` (default `clickhouse`).
 
-Two build requirements:
+Three build requirements:
 
 - the **aggregator** binary must be compiled with the `duckdb` build tag —
   `make build-agg-duckdb` produces it with the verified static link flags. A
   regular (pure Go) aggregator refuses `--storage-backend=duck` at startup
   with an error naming the flag and the build tag.
+- that tagged build is a cgo build linking DuckDB's C++ runtime, so the build
+  host needs a working C/C++ toolchain; for the static Linux link the
+  toolchain must be complete enough to provide `libpthread.a` (the make
+  target checks for it and refuses to link otherwise). A naive static link of
+  DuckDB produces a binary that segfaults on first use, which is why the
+  flags live in the make target and not in ad-hoc `go build` invocations.
 - the **API** never embeds DuckDB; any `statshouse-api` binary accepts `duck`.
 
 A minimal single-shard setup (all other standard flags — `--agg-addr`,
@@ -50,6 +56,11 @@ several shards, list every shard's query address in
 `--duck-shard-query-addrs` as comma-separated `shard=host:port` pairs with
 1-based shard numbers.
 
+On the API, `--clickhouse-v2-addrs` is a ClickHouse-backend flag: under duck
+it is not required (the API substitutes an internal placeholder address for
+the pool it never queries), and passing it anyway has no effect — every read
+fans out to the shard addresses from `--duck-shard-query-addrs` instead.
+
 When the API and the aggregators run on different machines, the store-query
 RPC handshakes are encrypted and both sides must present the same key: pass
 the key file to the API with `--rpc-crypto-path` and to the aggregators with
@@ -70,10 +81,13 @@ Two caveats for sharded installs:
 
 Nonsensical combinations fail at startup with a message naming the offending
 flags: `--kh` with duck, duck without `--duck-store-dir` or
-`--duck-query-addr`, any `--duck-*` flag without duck, `--duck-shard-query-addrs`
-on the API without duck (and duck on the API without it), and the ClickHouse
-v3-to-v6 `--migration` under duck (the migration and the table generator are
-ClickHouse-only tooling and hard-error against duck).
+`--duck-query-addr`, either of those two addressing flags without duck on the
+aggregator, `--duck-shard-query-addrs` on the API without duck (and duck on the
+API without it), and the ClickHouse v3-to-v6 `--migration` under duck (the
+migration and the table generator are ClickHouse-only tooling and hard-error
+against duck). The remaining `--duck-*` flags — retention, free-space
+watermark, query concurrency, memory limit — are accepted under either backend
+and simply have no effect while the aggregator runs ClickHouse.
 
 ## The store directory
 
@@ -121,10 +135,12 @@ so it is visible and alertable rather than discovered.
 
 duck-store ships no required disk-cap flag. Disk is bounded upstream by the
 same lever as under ClickHouse — the aggregator's insert (sampling) budget,
-which the sampler enforces as `max(MinInsertBudget, InsertBudget ×
-contributors)` bytes per insert round. Because that bounds the serialized
-bytes per second entering the store, and retention bounds how long they stay,
-disk per tier is a formula rather than an estimate:
+which the sampler enforces as `max(MinInsertBudget, InsertBudgetFixed +
+InsertBudget × contributors)` bytes per insert round (`InsertBudgetFixed` is
+300 000 bytes; the terms live beside `MinInsertBudget` in the aggregator
+config). Because that bounds the serialized bytes per second entering the
+store, and retention bounds how long they stay, disk per tier is a formula
+rather than an estimate:
 
 ```
 disk_per_tier ≈ insert_budget_bytes_per_sec × retention_sec × duck_bytes_per_rowbinary_byte

@@ -979,6 +979,15 @@ func TestRPCStoreShardClientCryptoKey(t *testing.T) {
 				hctx.Response, _ = args.WriteResultTL1(hctx.Response, resp)
 				return nil
 			},
+			RawStoreQueryTagValues: func(_ context.Context, hctx *rpc.HandlerContext) error {
+				var args tlstatshouse.StoreQueryTagValues
+				if _, err := args.ReadTL1(hctx.Request); err != nil {
+					return err
+				}
+				var resp tlstatshouse.StoreTagValuesResponse
+				hctx.Response, _ = args.WriteResultTL1(hctx.Response, resp)
+				return nil
+			},
 		}
 		srv := rpc.NewServer(rpc.ServerWithCryptoKeys([]string{serverKey}),
 			// production peers sit in different containers, so their nonce
@@ -1009,4 +1018,13 @@ func TestRPCStoreShardClientCryptoKey(t *testing.T) {
 	// a wrong key fails each handshake attempt; the client retries with
 	// backoff, so a short deadline still proves it can never succeed
 	require.Error(t, queryOne("a-completely-different-key-000000", 2*time.Second), "a client with the wrong key must fail the handshake")
+
+	// the tag-values verb speaks the same encrypted handshake — a wrong verb
+	// or response-type wiring here would otherwise only surface in the full
+	// docker conformance run
+	clients := newRPCStoreShardClients(map[uint32]string{1: addr}, serverKey)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err := clients[0].queryTagValues(ctx, tlstatshouse.StoreQueryTagValues{})
+	require.NoError(t, err, "the tag-values call must complete the same verified handshake")
 }

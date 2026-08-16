@@ -90,19 +90,6 @@ type RetentionConfig struct {
 	Logf func(format string, args ...any)
 }
 
-// defaultRetentionConfig returns the spec's retention defaults — 52 h (1s),
-// 33 d (1m), unbounded (1h), the free-space watermark off — for callers that
-// configure some knobs and want the documented values for the rest. Fields
-// left zero in a bare RetentionConfig mean unbounded, not default.
-func defaultRetentionConfig() RetentionConfig {
-	return RetentionConfig{
-		Retention1s:        DefaultRetention1s,
-		Retention1m:        DefaultRetention1m,
-		Retention1h:        DefaultRetention1h,
-		FreeSpaceWatermark: DefaultFreeSpaceWatermark,
-	}
-}
-
 // Retainer drives a store's retention passes. It is one goroutine whose every
 // touch on a window file goes through the archive maintenance lock — which
 // ingestion never takes — so retention runs at lowest priority and can never

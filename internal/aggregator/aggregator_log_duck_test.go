@@ -13,6 +13,7 @@ import (
 
 	"github.com/VKCOM/statshouse/internal/duckstore"
 	"github.com/VKCOM/statshouse/internal/vkgo/kittenhouseclient/rowbinary"
+	"github.com/VKCOM/statshouse/internal/vkgo/srvfunc"
 )
 
 // TestDecodeInternalLogRows round-trips the RowBinary internal-log buffer the
@@ -46,6 +47,27 @@ func TestDecodeInternalLogRows(t *testing.T) {
 	require.Equal(t, rows, got)
 
 	require.NoError(t, decodeInternalLogRows(nil, func(internalLogRow) { t.Fatal("no rows to emit") }), "an empty buffer decodes to no rows")
+
+	// The same round-trip through the production encoder itself, so the test
+	// reads back the real field order (time, host, type, six keys, message)
+	// rather than its own re-implementation of it: any drift in
+	// appendInternalLogLocked breaks the duck path's decode, and this is the
+	// only place that would notice.
+	a := &Aggregator{}
+	a.appendInternalLog("insert_error", "", "0", "0", "statshouse_value_incoming_arg_min_max", "", "", "connection refused")
+	a.appendInternalLog("start", "", "", "", "", "", "", "Started")
+	var prod []internalLogRow
+	require.NoError(t, decodeInternalLogRows(a.internalLog, func(r internalLogRow) { prod = append(prod, r) }))
+	require.Len(t, prod, 2)
+	require.Equal(t, "insert_error", prod[0].Type)
+	require.Equal(t, [6]string{"", "0", "0", "statshouse_value_incoming_arg_min_max", "", ""}, prod[0].Keys)
+	require.Equal(t, "connection refused", prod[0].Message)
+	require.Equal(t, "start", prod[1].Type)
+	require.Equal(t, "Started", prod[1].Message)
+	for _, r := range prod {
+		require.NotZero(t, r.Time)
+		require.Equal(t, srvfunc.Hostname(), r.Host)
+	}
 
 	// The insert-error path under duck is one appendInternalLog call per
 	// failure, so a realistic buffer mixes rows of both shapes — already

@@ -17,7 +17,7 @@ import (
 )
 
 func TestTierTableDDLMatchesResolvedSchema(t *testing.T) {
-	for _, tier := range allTiers() {
+	for _, tier := range tiers {
 		t.Run(tier, func(t *testing.T) {
 			// whitespace-normalized, so the DDL's column alignment is free to
 			// change without breaking the schema contract
@@ -65,7 +65,7 @@ func TestTierTableDDLMatchesResolvedSchema(t *testing.T) {
 
 func TestTierTableDDLDistinctPerTier(t *testing.T) {
 	seen := map[string]string{}
-	for _, tier := range allTiers() {
+	for _, tier := range tiers {
 		table := TierTable(tier)
 		require.NotEmpty(t, table)
 		require.Equal(t, 1, strings.Count(tierTableDDL(table), "CREATE TABLE"))
@@ -75,9 +75,9 @@ func TestTierTableDDLDistinctPerTier(t *testing.T) {
 }
 
 func TestTierSeconds(t *testing.T) {
-	require.EqualValues(t, 1, tierSecondsOf(Tier1s))
-	require.EqualValues(t, 60, tierSecondsOf(Tier1m))
-	require.EqualValues(t, 3600, tierSecondsOf(Tier1h))
+	require.EqualValues(t, 1, tierSeconds[Tier1s])
+	require.EqualValues(t, 60, tierSeconds[Tier1m])
+	require.EqualValues(t, 3600, tierSeconds[Tier1h])
 }
 
 func TestDeltaFileNames(t *testing.T) {
@@ -104,7 +104,7 @@ func TestDeltaFileNames(t *testing.T) {
 }
 
 func TestArchiveFileNames(t *testing.T) {
-	for _, tier := range allTiers() {
+	for _, tier := range tiers {
 		name := archiveFileName(tier, 1700000000)
 		gotTier, gotStart, ok := parseArchiveFileName(name)
 		require.True(t, ok, name)

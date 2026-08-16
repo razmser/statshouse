@@ -104,6 +104,19 @@ func TestSealRewritesRunsIntoOnePreservingDecodedContents(t *testing.T) {
 		require.NoError(t, db.Close())
 	}
 
+	// a retried pass after a crash between the commit and the in-memory
+	// bookkeeping completes quietly: sealing an already-sealed window is the
+	// documented no-op, and the rewrite must not run a second time
+	require.NoError(t, sealer.SealOnce(context.Background()))
+	for _, wf := range s.Windows() {
+		require.True(t, wf.Sealed, "%s window %d must stay sealed on the retried pass", wf.Tier, wf.WindowStart)
+		db, err := openStoreFile(wf.Path, true, ResourcesConfig{})
+		require.NoError(t, err)
+		rows := scanTableRows(t, db, tierTables[wf.Tier])
+		require.Len(t, rows, len(want[wf.Tier]), "%s: the retried pass must not rewrite again", wf.Tier)
+		require.NoError(t, db.Close())
+	}
+
 	// the marker is the file's own: a restart serves the window sealed
 	dir := s.cfg.Dir
 	require.NoError(t, s.Close())

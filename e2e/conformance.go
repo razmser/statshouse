@@ -110,6 +110,8 @@ type confRequest struct {
 //     divergence is diagnosable in-run as data-level vs estimator-level;
 //   - host-column variants: qw=count with mh=1 (max_hosts alongside counts) and
 //     qw=max_count_host (DigestMax+maxhost);
+//   - a month-LOD series (w=1M): the one step whose bucket timestamps depend
+//     on a named timezone, so the time axis itself is compared exactly;
 //   - table view: v_mix qw=sum and c_matrix qw=count n=10000 (below the API's
 //     maxTableRowsPage clamp, so both sides return every row);
 //   - point view: c_tagged count, vp_mix p90, u_exact unique over the last
@@ -185,6 +187,24 @@ func buildConformanceRequests(stream metricStream) []confRequest {
 			qw:    "max_count_host",
 			path: confQueryPath(m.Name, m.QBKeys, base, func(q url.Values) {
 				q.Set("qw", "max_count_host")
+			}),
+		})
+	}
+
+	// Month-LOD series: the one step whose bucket timestamps depend on a named
+	// timezone (local calendar month boundaries), so the time axis itself —
+	// compared exactly by compareConfSeries — is part of the parity contract.
+	// A duck-side zone bug shifts every month bucket by the zone offset
+	// without touching any value, which is why the shape gets its own entry
+	// instead of riding on the 1s series above.
+	if m, ok := confMetric(stream, "c_tagged"); ok {
+		reqs = append(reqs, confRequest{
+			kind:  confSeries,
+			label: "series-month/c_tagged/count",
+			qw:    "count",
+			path: confQueryPath(m.Name, m.QBKeys, base, func(q url.Values) {
+				q.Set("qw", "count")
+				q.Set("w", "1M")
 			}),
 		})
 	}

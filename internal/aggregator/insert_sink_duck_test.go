@@ -21,6 +21,7 @@ import (
 	"github.com/VKCOM/statshouse/internal/data_model"
 	"github.com/VKCOM/statshouse/internal/duckstore"
 	"github.com/VKCOM/statshouse/internal/format"
+	"github.com/VKCOM/statshouse/internal/metajournal"
 )
 
 // sinkNowUnix is the frozen clock the duck sink tests run under — the writer's
@@ -304,3 +305,112 @@ func TestDuckMetricsTagMappings(t *testing.T) {
 	require.Equal(t, int32(format.TagValueIDDuckSizeArchive), duckSizeLocationTag(duckstore.SizeArchive))
 	require.Zero(t, duckSizeLocationTag(duckstore.SizeLocation("other")))
 }
+
+// duckValueCounterCall and duckCounterCall record one forwarded event: the
+// builtin metric it landed in, the full ordered tag slice and the numbers.
+type duckValueCounterCall struct {
+	meta  *format.MetricMetaValue
+	tags  []int32
+	value float64
+	count float64
+}
+
+type duckCounterCall struct {
+	meta *format.MetricMetaValue
+	tags []int32
+	n    float64
+}
+
+type capturingDuckSink struct {
+	valueCounters []duckValueCounterCall
+	counters      []duckCounterCall
+}
+
+func (c *capturingDuckSink) AddValueCounter(_ uint32, meta *format.MetricMetaValue, tags []int32, value, count float64) {
+	c.valueCounters = append(c.valueCounters, duckValueCounterCall{meta, tags, value, count})
+}
+
+func (c *capturingDuckSink) AddCounter(_ uint32, meta *format.MetricMetaValue, tags []int32, n float64) {
+	c.counters = append(c.counters, duckCounterCall{meta, tags, n})
+}
+
+// TestDuckMetricsForwardsEvents proves the forwarding itself — which builtin
+// metric every store event lands in, with which ordered tag literals and
+// which value/count — not just the duck*Tag mappings: a transposed tag or a
+// swapped value/count here misattributes the operator surface documented in
+// docs/duck-store.md, silently, because nothing else exercises these calls.
+func TestDuckMetricsForwardsEvents(t *testing.T) {
+	sink := &capturingDuckSink{}
+	m := &duckMetrics{sh: sink}
+
+	m.MaintenancePass(duckstore.MaintenanceCompaction, nil, 2500*time.Millisecond)
+	m.MaintenancePass(duckstore.MaintenanceSealing, errors.New("boom"), 500*time.Millisecond)
+	require.Equal(t, []duckValueCounterCall{
+		{format.BuiltinMetricMetaDuckMaintenanceTime,
+			[]int32{0, format.TagValueIDDuckMaintenanceCompaction, format.TagValueIDStatusOK}, 2.5, 1},
+		{format.BuiltinMetricMetaDuckMaintenanceTime,
+			[]int32{0, format.TagValueIDDuckMaintenanceSealing, format.TagValueIDStatusError}, 0.5, 1},
+	}, sink.valueCounters)
+
+	m.MaintenanceWindow(duckstore.WindowSealed, duckstore.Tier1m)
+	require.Equal(t, []duckCounterCall{
+		{format.BuiltinMetricMetaDuckWindows,
+			[]int32{0, format.TagValueIDDuckWindowSealed, format.TagValueIDDuckTier1m}, 1},
+	}, sink.counters)
+
+	m.QuarantinedFiles(duckstore.QuarantineStorage, 3)
+	require.Equal(t, []duckCounterCall{
+		{format.BuiltinMetricMetaDuckWindows,
+			[]int32{0, format.TagValueIDDuckWindowSealed, format.TagValueIDDuckTier1m}, 1},
+		{format.BuiltinMetricMetaDuckQuarantinedFiles,
+			[]int32{0, format.TagValueIDDuckQuarantineStorage}, 3},
+	}, sink.counters)
+
+	sink.valueCounters = nil
+	m.StoreQuery(duckstore.QueryTagValues, errors.New("boom"), 500*time.Millisecond)
+	require.Equal(t, []duckValueCounterCall{
+		{format.BuiltinMetricMetaDuckQueryTime,
+			[]int32{0, format.TagValueIDDuckQueryTagValues, format.TagValueIDStatusError}, 0.5, 1},
+	}, sink.valueCounters)
+
+	sink.valueCounters = nil
+	m.StoreSize(duckstore.SizeArchive, 100, 40)
+	require.Equal(t, []duckValueCounterCall{
+		{format.BuiltinMetricMetaDuckStoreSize,
+			[]int32{0, format.TagValueIDDuckSizeArchive, format.TagValueIDDuckSizeUsed}, 100, 1},
+		{format.BuiltinMetricMetaDuckStoreSize,
+			[]int32{0, format.TagValueIDDuckSizeArchive, format.TagValueIDDuckSizeFree}, 40, 1},
+	}, sink.valueCounters)
+}
+
+// TestNewInsertSinkRoutesByBackend pins the write seam's routing: an
+// aggregator holding a duck-store handle produces the store's sinks, and one
+// without it produces the ClickHouse inserter.
+func TestNewInsertSinkRoutesByBackend(t *testing.T) {
+	sinkFromHandle := &stubDuckSink{}
+	a := &Aggregator{duckStore: stubDuckHandle{sink: sinkFromHandle}}
+	got := a.newInsertSink(nil)
+	require.Same(t, sinkFromHandle, got, "a non-nil duck store must produce its sinks")
+
+	a = &Aggregator{}
+	require.IsType(t, &clickhouseSink{}, a.newInsertSink(nil), "without duck-store the sink is the ClickHouse inserter")
+}
+
+type stubDuckSink struct{}
+
+func (stubDuckSink) AppendRow(*insertRow) int { return 0 }
+func (stubDuckSink) Send(context.Context) (int, int, time.Duration, error) {
+	return 0, 0, 0, nil
+}
+func (stubDuckSink) RoundSize() int { return 0 }
+func (stubDuckSink) Reset()         {}
+
+type stubDuckHandle struct {
+	sink InsertSink
+}
+
+func (h stubDuckHandle) NewSink() InsertSink { return h.sink }
+func (stubDuckHandle) QueryExecutor(*metajournal.MetricsStorage, int32) storeQueryExecutor {
+	return nil
+}
+func (stubDuckHandle) Close() error { return nil }
