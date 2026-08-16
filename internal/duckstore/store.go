@@ -490,11 +490,15 @@ func (s *Store) quarantineFile(path, reason string, axis QuarantineAxis) {
 	// DuckDB may leave a write-ahead log next to the file; move it along so
 	// the quarantined file is not split from it.
 	if err := os.Rename(path, dst); err != nil {
+		// The file stays where it is, still excluded from serving; the next
+		// open re-detects and retries the move. It is not recorded: a count
+		// of files the quarantine directory does not hold would mislead the
+		// reclamation workflow.
 		s.cfg.Logf("[error] duck-store: failed to quarantine %s (%s): %v", path, reason, err)
-	} else {
-		_ = os.Rename(path+".wal", dst+".wal")
-		s.cfg.Logf("[error] duck-store: quarantined %s: %s", path, reason)
+		return
 	}
+	_ = os.Rename(path+".wal", dst+".wal")
+	s.cfg.Logf("[error] duck-store: quarantined %s: %s", path, reason)
 	s.quarantined = append(s.quarantined, QuarantineInfo{Path: path, Reason: reason, Axis: axis})
 }
 
@@ -638,14 +642,17 @@ func tierOrder(tier string) int {
 }
 
 // uniquePath returns path itself, or path with a numeric suffix if it already
-// exists, so moving a file aside never overwrites an earlier quarantine.
+// exists, so moving a file aside never overwrites an earlier quarantine. A
+// stat error other than existence also counts as free: a directory that
+// cannot be stat'ed never yields the NotExist verdict the wait is for, while
+// a wrong guess makes the caller's rename fail loudly instead.
 func uniquePath(path string) string {
-	if _, err := os.Stat(path); os.IsNotExist(err) {
+	if _, err := os.Stat(path); err != nil {
 		return path
 	}
 	for n := 1; ; n++ {
 		candidate := fmt.Sprintf("%s.%d", path, n)
-		if _, err := os.Stat(candidate); os.IsNotExist(err) {
+		if _, err := os.Stat(candidate); err != nil {
 			return candidate
 		}
 	}

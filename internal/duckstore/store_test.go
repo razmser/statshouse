@@ -447,3 +447,32 @@ func TestQuarantineDoesNotOverwriteEarlierQuarantine(t *testing.T) {
 	require.FileExists(t, filepath.Join(dir, quarantineSubdir, archiveFileName(Tier1s, 3600)))
 	require.FileExists(t, filepath.Join(dir, quarantineSubdir, archiveFileName(Tier1s, 3600)+".1"))
 }
+
+// TestQuarantineFileSurvivesAnUnusableQuarantineDirectory pins two failure
+// modes of a broken quarantine directory at once. A regular file squatting on
+// the quarantine directory's path makes every stat and rename under it answer
+// ENOTDIR — root or not — which is not a NotExist verdict, so uniquePath must
+// treat any stat error other than existence as a free name instead of waiting
+// forever for one (previously a tight loop), and the failed move must leave
+// the record alone: the file is still in place, still excluded, and the next
+// open re-detects and retries it.
+func TestQuarantineFileSurvivesAnUnusableQuarantineDirectory(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, quarantineSubdir), nil, 0o644))
+	var logs []string
+	s := &Store{cfg: StoreConfig{
+		Dir: dir,
+		Logf: func(format string, args ...any) {
+			logs = append(logs, fmt.Sprintf(format, args...))
+		},
+	}}
+	src := filepath.Join(dir, deltaFileName(5))
+	require.NoError(t, os.WriteFile(src, nil, 0o644))
+
+	s.quarantineFile(src, "test reason", QuarantineUnreadable)
+
+	require.Empty(t, s.Quarantined(), "a file the move failed on is not quarantined")
+	require.FileExists(t, src, "the failed move leaves the file where it was")
+	require.Len(t, logs, 1, "the failed move is logged once")
+	require.Contains(t, logs[0], "failed to quarantine", "the log names the failure, not a quarantine that did not happen")
+}
