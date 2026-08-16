@@ -308,18 +308,23 @@ func (s *duckQuerySource) queryTagValues(ctx context.Context, h *requestHandler,
 func retryOnMismatch[R any](s *duckQuerySource, ctx context.Context, clients []storeShardClient, fromSec int64, metric *format.MetricMetaValue,
 	call func(ctx context.Context, c storeShardClient) (R, error),
 	rebuild func(fresh *format.MetricMetaValue) (func(ctx context.Context, c storeShardClient) (R, error), error)) ([]R, error) {
-	resps, err := fanoutCall(ctx, clients, call)
-	if !duckstore.IsCode(err, duckstore.ErrCodeMetadataMismatch) || metric == nil || metric.MetricID == 0 {
+	resps, shardErrs, err := fanoutCall(ctx, clients, call)
+	// The mismatch routinely comes from a higher-numbered shard — the one
+	// whose journal already advanced — while lower-numbered shards are still
+	// executing and merely fail because the mismatch cancelled them, so the
+	// gate keys on any shard's own refusal, never on the headline error.
+	mismatch := shardCode(shardErrs, duckstore.ErrCodeMetadataMismatch)
+	if mismatch == nil || metric == nil || metric.MetricID == 0 {
 		return resps, err
 	}
 	if s.waitVersion(ctx, metric.Version+1) != nil {
 		return nil, fmt.Errorf("duck shard refused the query at journal version %d and the metrics journal never reached %d: %w",
-			metric.Version, metric.Version+1, err)
+			metric.Version, metric.Version+1, mismatch)
 	}
 	fresh := s.refreshMetric(metric.MetricID)
 	if fresh == nil {
 		return nil, fmt.Errorf("duck shard refused the query at journal version %d and metric %d left the journal: %w",
-			metric.Version, metric.MetricID, err)
+			metric.Version, metric.MetricID, mismatch)
 	}
 	retry, rerr := rebuild(fresh)
 	if rerr != nil {
@@ -329,7 +334,22 @@ func retryOnMismatch[R any](s *duckQuerySource, ctx context.Context, clients []s
 	if cerr != nil {
 		return nil, cerr
 	}
-	return fanoutCall(ctx, retryClients, retry)
+	retryResps, _, retryErr := fanoutCall(ctx, retryClients, retry)
+	return retryResps, retryErr
+}
+
+// shardCode finds the first per-shard failure carrying the given structured
+// store error code. The headline fan-out error cannot be trusted for this:
+// the failure that cancelled the fan-out often lives at a higher shard index
+// than the siblings it cancelled, and those artifacts come first in shard
+// order.
+func shardCode(errs []error, code int32) error {
+	for _, err := range errs {
+		if duckstore.IsCode(err, code) {
+			return err
+		}
+	}
+	return nil
 }
 
 // waitVersion waits — at most fanoutJournalWait — for the API's metrics

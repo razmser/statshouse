@@ -98,9 +98,13 @@ func (c *rpcStoreShardClient) queryTagValues(ctx context.Context, args tlstatsho
 
 // fanoutCall runs fn against every client in parallel and collects each
 // result. The first failure cancels the others' context — a query with one
-// dead shard is already dead — and the collected error is the first failure
-// by shard order, wrapped with the shard's number and address.
-func fanoutCall[T any](ctx context.Context, clients []storeShardClient, fn func(ctx context.Context, c storeShardClient) (T, error)) ([]T, error) {
+// dead shard is already dead — and the headline error is the first failure by
+// shard order, wrapped with the shard's number and address. The full
+// per-shard error list is returned alongside it: a failure routinely cancels
+// lower-numbered siblings mid-query, so their context-cancellation errors
+// shadow its code in the headline, and a caller that must act on a specific
+// shard's code — the metadata-mismatch retry — scans the list instead.
+func fanoutCall[T any](ctx context.Context, clients []storeShardClient, fn func(ctx context.Context, c storeShardClient) (T, error)) ([]T, []error, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	results := make([]T, len(clients))
@@ -119,12 +123,17 @@ func fanoutCall[T any](ctx context.Context, clients []storeShardClient, fn func(
 		}()
 	}
 	wg.Wait()
+	var headline error
 	for i, err := range errs {
 		if err != nil {
-			return nil, fmt.Errorf("duck shard %d (%s): %w", clients[i].shardNum(), clients[i].addr(), err)
+			headline = fmt.Errorf("duck shard %d (%s): %w", clients[i].shardNum(), clients[i].addr(), err)
+			break
 		}
 	}
-	return results, nil
+	if headline != nil {
+		return nil, errs, headline
+	}
+	return results, errs, nil
 }
 
 // decodeSeriesResponse lowers one shard's columnar batches into decoded rows,

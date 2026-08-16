@@ -880,6 +880,52 @@ func TestFanoutRetryOnceOnMetadataMismatch(t *testing.T) {
 		require.Equal(t, 2, calls)
 	})
 
+	// The mismatch arrives from a higher-numbered shard — the one whose
+	// journal already advanced — while the lower-numbered shard is still
+	// executing and only fails because the mismatch cancelled it. Its
+	// context-cancellation error comes first in shard order, so the retry
+	// must key on any shard's refusal, not on the headline error.
+	t.Run("mismatch on a higher shard still retries", func(t *testing.T) {
+		fakes := fanoutFakes(2)
+		slowCalls := 0
+		fakes[0].seriesFn = func(ctx context.Context, _ tlstatshouse.StoreQuerySeries) (tlstatshouse.StoreSeriesResponse, error) {
+			slowCalls++
+			if slowCalls == 1 {
+				<-ctx.Done() // still executing when the sibling refuses the query
+				return tlstatshouse.StoreSeriesResponse{}, ctx.Err()
+			}
+			return fanoutSeriesResp(1, fanoutSeriesBatch(1, []int64{100}, [][]int64{{1}}, nil,
+				&tlstatshouse.StoreSeriesBatch{Count: []float64{1}})), nil
+		}
+		refusedCalls := 0
+		fakes[1].seriesFn = func(_ context.Context, args tlstatshouse.StoreQuerySeries) (tlstatshouse.StoreSeriesResponse, error) {
+			refusedCalls++
+			if refusedCalls == 1 {
+				return tlstatshouse.StoreSeriesResponse{}, mismatch
+			}
+			require.Equal(t, int64(43), args.Base.MetricVersion) // the rebuilt request carries the fresh version
+			return fanoutSeriesResp(2, fanoutSeriesBatch(1, []int64{100}, [][]int64{{1}}, nil,
+				&tlstatshouse.StoreSeriesBatch{Count: []float64{3}})), nil
+		}
+		fresh := fanoutMetric(format.ShardFixed)
+		fresh.Version = 43
+		journal := &fanoutJournal{fresh: fresh}
+		src := fanoutTestSource(fakes...)
+		src.journal = journal
+
+		rows, err := fanoutRunSeries(t, src, &seriesDataQuery{
+			metric: fanoutMetric(format.ShardFixed), // Version 0
+			what:   fanoutWhats(data_model.DigestCount),
+			by:     []int{0},
+		})
+		require.NoError(t, err)
+		require.Equal(t, []int64{1}, journal.waited) // waited for old version + 1
+		require.Len(t, rows, 1)
+		require.Equal(t, float64(4), rows[0].count) // both shards' rows folded
+		require.Equal(t, 2, slowCalls)
+		require.Equal(t, 2, refusedCalls)
+	})
+
 	t.Run("second mismatch fails", func(t *testing.T) {
 		fakes := fanoutFakes(1)
 		fakes[0].seriesFn = func(context.Context, tlstatshouse.StoreQuerySeries) (tlstatshouse.StoreSeriesResponse, error) {
