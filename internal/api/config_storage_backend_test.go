@@ -36,9 +36,53 @@ func TestConfigStorageBackend(t *testing.T) {
 	require.Contains(t, err.Error(), "--duck-shard-query-addrs")
 	require.Contains(t, err.Error(), "--storage-backend=duck")
 
-	require.NoError(t, f.Parse([]string{"--duck-shard-query-addrs=1=10.0.0.1:9900,2=10.0.0.2:9900"}))
+	require.NoError(t, f.Parse([]string{"--duck-shard-query-addrs=1=10.0.0.1:9900,2=10.0.0.2:9900", "--shard-by-metric-shards=2"}))
 	require.NoError(t, cfg.ValidateConfig())
 	require.Equal(t, map[uint32]string{1: "10.0.0.1:9900", 2: "10.0.0.2:9900"}, cfg.DuckShardQueryAddrs)
+
+	// the by-metric-id routing shards by --shard-by-metric-shards (the copy
+	// of the aggregator cluster's modulus), so a partial address list — a
+	// contiguous prefix of a bigger count, say shards 1-2 of 16 — must fail
+	// at startup: the query side would prune by-metric-id queries by
+	// metric_id % 2 while the data lives by metric_id % 16, silently
+	// misrouting most of them
+	require.NoError(t, f.Parse([]string{"--shard-by-metric-shards=16"}))
+	err = cfg.ValidateConfig()
+	require.Error(t, err, "shards 1-2 of 16 silently misroute by-metric-id queries")
+	require.Contains(t, err.Error(), "--shard-by-metric-shards")
+	require.Contains(t, err.Error(), "16")
+	require.Contains(t, err.Error(), "2 shards")
+
+	// the count must be covered, not matched: a cluster can hold more shards
+	// than the modulus pins by-metric-id data to, and fixed-shard metrics and
+	// fan-outs still read the extras
+	require.NoError(t, f.Parse([]string{"--duck-shard-query-addrs=1=10.0.0.1:9900,2=10.0.0.2:9900,3=10.0.0.3:9900", "--shard-by-metric-shards=2"}))
+	require.NoError(t, cfg.ValidateConfig(), "three addresses cover a count of two")
+	require.Equal(t, 2, cfg.ShardByMetricShards, "the flag must round-trip")
+
+	// zero keeps the ClickHouse-pool meaning of deriving the modulus from
+	// what is configured — the highest address
+	require.NoError(t, f.Parse([]string{"--shard-by-metric-shards=0"}))
+	require.NoError(t, cfg.ValidateConfig())
+
+	// a negative count can only be a typo
+	require.NoError(t, f.Parse([]string{"--shard-by-metric-shards=-1"}))
+	err = cfg.ValidateConfig()
+	require.Error(t, err, "a negative routing modulus routes nothing")
+	require.Contains(t, err.Error(), "--shard-by-metric-shards")
+	require.NoError(t, f.Parse([]string{"--shard-by-metric-shards=2"}))
+
+	// the by-metric-id routing numbers the shards 1..N contiguously, so a
+	// gap would route some metric ids to a shard with no address —
+	// validation must refuse the gap
+	require.NoError(t, f.Parse([]string{"--duck-shard-query-addrs=1=10.0.0.1:9900,3=10.0.0.3:9900"}))
+	err = cfg.ValidateConfig()
+	require.Error(t, err, "a gap in the shard numbering routes some metrics nowhere")
+	require.Contains(t, err.Error(), "--duck-shard-query-addrs")
+	require.Contains(t, err.Error(), "shard 3 breaks the numbering")
+
+	require.NoError(t, f.Parse([]string{"--duck-shard-query-addrs=3=10.0.0.3:9900,1=10.0.0.1:9900,2=10.0.0.2:9900"}))
+	require.NoError(t, cfg.ValidateConfig(), "unsorted-but-contiguous is fine")
 
 	// the addresses without the duck backend are as nonsensical as the
 	// backend without them

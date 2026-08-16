@@ -22,9 +22,9 @@ import (
 
 // Compaction moves delta rows into the archive windows their own timestamps
 // belong to, collapsing partial rows by the full key on the way. Everything
-// except the two sketch columns collapses in SQL; percentiles and uniq_state
-// come out of the collapse query as lists of blobs and are folded in Go (see
-// fold.go) before the group is written.
+// except the two aggregate-state columns collapses in SQL; percentiles and
+// uniq_state come out of the collapse query as lists of blobs and are folded
+// in Go (see fold.go) before the group is written.
 //
 // The move itself rides the consume protocol from generation.go: the collapse
 // is consumeWindow's AppendWindow, so each window's folded rows and its
@@ -76,24 +76,7 @@ func NewCompactor(s *Store, cfg CompactorConfig) *Compactor {
 // A failed pass is logged and retried by the next; the consume protocol makes
 // that safe. It returns nil when ctx is done.
 func (c *Compactor) Run(ctx context.Context) error {
-	if err := c.CompactOnce(ctx); err != nil && ctx.Err() == nil {
-		c.cfg.Logf("[error] duck-store: compaction pass: %v", err)
-	}
-	t := time.NewTicker(c.cfg.Interval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-t.C:
-			if err := c.CompactOnce(ctx); err != nil {
-				if ctx.Err() != nil {
-					return nil
-				}
-				c.cfg.Logf("[error] duck-store: compaction pass: %v", err)
-			}
-		}
-	}
+	return runMaintenanceLoop(ctx, MaintenanceCompaction, c.cfg.Interval, c.cfg.Logf, c.CompactOnce)
 }
 
 // CompactOnce lands one pass: it consumes every generation a previous crash
@@ -199,7 +182,7 @@ func collapseWindowRows(tx *sql.Tx, tier string, windowStart, windowEnd int64) e
 
 // queryCollapsedGroups runs the collapse over the table qualifier src — the
 // delta generation attached as deltaSrcAlias for compaction, main for sealing
-// — and returns its groups with both sketch columns folded.
+// — and returns its groups with both aggregate-state columns folded.
 func queryCollapsedGroups(tx *sql.Tx, src, table string, windowStart, windowEnd int64) ([]collapsedGroup, error) {
 	rows, err := tx.Query(collapseQuery(src, table), windowStart, windowEnd)
 	if err != nil {
@@ -263,7 +246,8 @@ func insertCollapsedGroups(tx *sql.Tx, table string, groups []collapsedGroup) er
 }
 
 // tierColumnCount is the number of columns in a tier table: metric and time,
-// 48 tag pairs, six numerics, three host triples and the two sketch columns.
+// 48 tag pairs, six numerics, three host triples and the two aggregate-state
+// columns.
 const tierColumnCount = 2 + 2*format.MaxTags + 6 + 9 + 2
 
 // collapsedGroupScan builds the scan target for one collapse query row, in the
@@ -308,7 +292,7 @@ func hostStruct(idCol, sCol, valCol string) string {
 }
 
 // collapseQuery builds the collapse statement for one tier table, reading it
-// through the src qualifier: the transliteration of the DDL sketch in
+// through the src qualifier: the transliteration of the DDL draft in
 // .scratch/duck-store/03-schema-ddl.sql. Host columns collapse ordered by
 // their skewed state values — not the true min/max/max_count — so a collapsed
 // window merges with later partial rows exactly as the uncollapsed states

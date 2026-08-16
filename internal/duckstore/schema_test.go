@@ -55,7 +55,7 @@ func TestTierTableDDLMatchesResolvedSchema(t *testing.T) {
 			}
 
 			// column count: key anchors + 2*MaxTags tags + 6 aggregates +
-			// 3 host triples + 2 sketch blobs
+			// 3 host triples + 2 aggregate-state blobs
 			wantColumns := 2 + 2*format.MaxTags + 6 + 9 + 2
 			gotColumns := strings.Count(ddl, "not null")
 			require.Equal(t, wantColumns, gotColumns, "every column must be NOT NULL")
@@ -89,7 +89,7 @@ func TestDeltaFileNames(t *testing.T) {
 	}
 
 	for _, name := range []string{
-		"delta.duckdb",         // generationless, the pre-generation sketch name
+		"delta.duckdb",         // generationless, the legacy pre-generation name
 		"delta-.duckdb",        // empty generation
 		"delta--1.duckdb",      // negative generation
 		"delta-1.duckdb.wal",   // the write-ahead log

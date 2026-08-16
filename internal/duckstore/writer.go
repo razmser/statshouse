@@ -25,7 +25,7 @@ import (
 
 // Ingestion-time age guard. The future bound is the ClickHouse matview
 // predicate's (`time < now() + 3600`); the old bound is deliberately tighter
-// than the matview's three days: a duck-store window freezes at its end plus
+// than the matview's three days: a duck-store window seals at its end plus
 // the historic window, so a row older than that could only land in a window
 // that is already sealed and can never take it. Conforming agents are capped
 // at the same bound (the agent config refuses a wider historic window), so
@@ -57,8 +57,8 @@ type HostPair struct {
 
 // Row is one resolved aggregator row to write into the delta: the duck-store
 // counterpart of the aggregator's insertRow. Time is the row's own unix
-// seconds; the writer truncates it per tier. The sketch columns carry
-// ClickHouse aggregate state bytes verbatim, and Count feeds both the count
+// seconds; the writer truncates it per tier. The percentiles and unique
+// columns carry ClickHouse aggregate state bytes verbatim, and Count feeds both the count
 // and max_count columns. The caller owns the byte slices until WriteRound
 // returns; rows must not be reused while a round is in flight.
 type Row struct {

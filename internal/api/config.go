@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"maps"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -64,6 +65,14 @@ type Config struct {
 	// and copies the key here, so the same key serves every RPC the process
 	// makes. Empty keeps the transport unencrypted (same-machine peers only).
 	DuckQueryRPCCryptoKey string
+
+	// ShardByMetricShards is the number of shards the by-metric-id strategy
+	// routes over — the copy of the aggregator cluster's
+	// --shard-by-metric-shards (see the command's flag help), the modulus
+	// agents shard metric data by at write time. The ClickHouse pool routes
+	// by it, and the duck backend both routes by it and requires
+	// --duck-shard-query-addrs to cover every shard it can route to.
+	ShardByMetricShards int
 
 	chutil.RateLimitConfig
 }
@@ -128,6 +137,40 @@ func (argv *Config) ValidateConfig() error {
 		if len(argv.DuckShardQueryAddrs) == 0 {
 			return fmt.Errorf("--duck-shard-query-addrs must be set when --storage-backend=duck: every query fans out to the aggregator shards' store-query listeners")
 		}
+		// The by-metric-id assignment shards by --shard-by-metric-shards —
+		// the copy of the aggregator cluster's routing modulus — so the
+		// addresses must cover shards 1..N of that count: a partial list
+		// would silently misroute every by-metric-id query the source prunes
+		// to one shard, and silently drop the shards fan-outs never visit.
+		// The numbering must also be contiguous from 1: a gap can only be a
+		// typo. Addresses beyond the count may exist — a cluster can hold
+		// more shards than the modulus pins by-metric-id data to (the
+		// aggregator allows the count under the cluster size), and
+		// fixed-shard metrics and fan-outs still read them.
+		shards := make([]uint32, 0, len(argv.DuckShardQueryAddrs))
+		for shard := range argv.DuckShardQueryAddrs {
+			shards = append(shards, shard)
+		}
+		slices.Sort(shards)
+		for i, shard := range shards {
+			if shard != uint32(i+1) {
+				return fmt.Errorf("--duck-shard-query-addrs must number the shards 1..%d contiguously: shard %d breaks the numbering",
+					shards[len(shards)-1], shard)
+			}
+		}
+		switch {
+		case argv.ShardByMetricShards < 0:
+			return fmt.Errorf("--shard-by-metric-shards (%d) must not be negative", argv.ShardByMetricShards)
+		case argv.ShardByMetricShards == 0:
+			// 0 keeps the ClickHouse-pool meaning of "derive from what is
+			// configured": for duck, the highest configured shard — which
+			// the contiguous numbering above makes the address count.
+		default:
+			if argv.ShardByMetricShards > len(shards) {
+				return fmt.Errorf("--shard-by-metric-shards is %d but --duck-shard-query-addrs lists only %d shards: by-metric-id data lands on shards 1..%d and every one needs a query address",
+					argv.ShardByMetricShards, len(shards), argv.ShardByMetricShards)
+			}
+		}
 	} else if argv.DuckShardQueryAddrsStr != "" {
 		return fmt.Errorf("--duck-shard-query-addrs (%s) is set but --storage-backend is not duck", argv.DuckShardQueryAddrsStr)
 	}
@@ -180,6 +223,8 @@ func (argv *Config) Bind(f *flag.FlagSet, defaultI config.Config) {
 	f.Var(&argv.StorageBackend, "storage-backend", "storage backend to query: \"clickhouse\" (default) or \"duck\" (aggregator shards over the structured query RPC)")
 	f.StringVar(&argv.DuckShardQueryAddrsStr, "duck-shard-query-addrs", default_.DuckShardQueryAddrsStr,
 		"per-shard store-query addresses of the aggregator shards under the duck backend, as comma-separated shard=host:port pairs with 1-based shard numbers")
+	f.IntVar(&argv.ShardByMetricShards, "shard-by-metric-shards", default_.ShardByMetricShards,
+		"number of shards for by-metric shard strategy. A copy from aggregator's config; under --storage-backend=duck, --duck-shard-query-addrs must cover shards 1..N")
 
 	f.BoolVar(&argv.RateLimitDisable, "rate-limit-disable", default_.RateLimitDisable, "disable rate limiting")
 	f.DurationVar(&argv.WindowDuration, "rate-limit-window-duration", default_.WindowDuration, "time window for analyzing ClickHouse requests")
@@ -205,6 +250,7 @@ func DefaultConfig() *Config {
 		CacheChunkSize:       5,
 		AvailableShardsStr:   "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16",
 		CHMaxShardConnsRatio: 20,
+		ShardByMetricShards:  16,
 		RateLimitConfig: chutil.RateLimitConfig{
 			WindowDuration:     2 * time.Minute,
 			MaxErrorRate:       20,

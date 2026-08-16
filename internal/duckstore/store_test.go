@@ -9,12 +9,14 @@
 package duckstore
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -145,7 +147,7 @@ func TestOpenStoreSchemaIsTransliteratedDDL(t *testing.T) {
 		require.Equal(t, [2]string{"DOUBLE", "NO"}, got["max_host_value"])
 		require.Equal(t, [2]string{"DOUBLE", "NO"}, got["max_count_host_value"])
 		require.Equal(t, [2]string{"INTEGER", "NO"}, got["max_count_host"])
-		// sketch states stay opaque ClickHouse bytes
+		// aggregate states stay opaque ClickHouse bytes
 		require.Equal(t, [2]string{"BLOB", "NO"}, got["percentiles"])
 		require.Equal(t, [2]string{"BLOB", "NO"}, got["uniq_state"])
 	}
@@ -183,6 +185,66 @@ func TestOpenStoreResumesNewestValidGeneration(t *testing.T) {
 	require.NoError(t, s2.Delta().QueryRow(`SELECT sum(count) FROM s1 WHERE metric = $1`, int32(6)).Scan(&count))
 	require.EqualValues(t, 10, count, "the newest generation's rows must be reachable")
 	requireDeltaServes(t, s2) // writes land in the newest generation
+}
+
+// TestOpenStoreQuarantinedNewestNeverReactivatesConsumedDelta pins recovery's
+// hardest case: the physically newest generation cannot be vouched for while
+// an older, already-consumed one is still on disk (its consumption committed
+// every window record but crashed before the unlink). The survivor must not
+// resume as the active delta — writes into a rolled-off, half-consumed file
+// would re-serve rows its archive windows already hold — it must finish
+// unlinking, and a fresh generation must take over as active.
+func TestOpenStoreQuarantinedNewestNeverReactivatesConsumedDelta(t *testing.T) {
+	dir := t.TempDir()
+
+	// generation 0 holds one row, generation 1 (active) was never written
+	s, _ := openTestStore(t, dir)
+	w, err := NewWriter(s, WriterConfig{NowFunc: func() time.Time { return writerNow }})
+	require.NoError(t, err)
+	row := testRow(testMetricID, uint32(writerNow.Unix()))
+	row.Count, row.Sum = 2, 20
+	require.NoError(t, w.WriteRound(context.Background(), []Row{row}))
+	require.NoError(t, w.Close())
+	require.NoError(t, s.RollGeneration())
+	require.NoError(t, s.Close())
+
+	// the consumption of generation 0 commits every window record, then
+	// dies exactly before the unlink: delta-0.duckdb stays, consumed
+	s, _ = openTestStore(t, dir)
+	err = s.ConsumeGeneration(context.Background(), 0, ConsumeOptions{Fault: crashAt(CrashAfterCommitBeforeUnlink, 1)})
+	require.Error(t, err)
+	require.NoError(t, s.Close())
+	require.FileExists(t, filepath.Join(dir, deltaFileName(0)))
+	require.FileExists(t, filepath.Join(dir, deltaFileName(1)))
+
+	// the active generation's file goes bad underneath the store — a torn
+	// write, say — so the next open quarantines the physically newest
+	require.NoError(t, os.WriteFile(filepath.Join(dir, deltaFileName(1)), []byte("junk, not a database"), 0o644))
+
+	s2, logs := openTestStore(t, dir)
+
+	// the junk newest is quarantined, named and counted
+	quarantined := s2.Quarantined()
+	require.Len(t, quarantined, 1)
+	require.Equal(t, filepath.Join(dir, deltaFileName(1)), quarantined[0].Path)
+	require.Contains(t, quarantined[0].Reason, "cannot open")
+	require.Contains(t, strings.Join(*logs, "\n"), "quarantined "+filepath.Join(dir, deltaFileName(1)))
+
+	// the consumed survivor finishes unlinking instead of resuming active,
+	// and a fresh generation — never the quarantined number — takes over
+	require.NoFileExists(t, filepath.Join(dir, deltaFileName(0)), "the consumed generation must finish unlinking")
+	require.Equal(t, []int64{2}, s2.DeltaGenerations())
+	require.EqualValues(t, 2, s2.ActiveDeltaGeneration())
+
+	// the consumed generation's rows are served exactly once, from their
+	// window — nothing re-enters through a delta
+	want := consumeTotals{count: 2, sum: 20, min: 1.5, max: 9.75, sumsquare: 101.25}
+	got := readerTotals(t, s2)
+	for _, tier := range tiers {
+		require.Equal(t, want, got[fmt.Sprintf("%s/%d", tierTables[tier], testMetricID)], "%s", tier)
+	}
+
+	requireDeltaServes(t, s2)
 }
 
 func TestOpenStoreQuarantinesDeltaOnAnyStampAxisMismatch(t *testing.T) {
@@ -292,6 +354,77 @@ func TestOpenStoreQuarantinesBadArchivesAndKeepsServing(t *testing.T) {
 	require.EqualValues(t, 4, count)
 	require.NoError(t, db.Close())
 	requireDeltaServes(t, s2)
+}
+
+// TestOpenStoreSweepsLeftoverArchiveTmpFiles pins the other half of a crashed
+// window creation: consumeWindow builds an archive window under a temporary
+// name and renames it into place, so a crash mid-build leaves the temporary
+// file next to the window it never became. Reopen sweeps it — the next
+// consumption of the same window rebuilds from scratch — instead of letting
+// it linger or quarantining it as an unreadable window. Files the store could
+// not have created — an operator's or a tool's .tmp dropped into the archive
+// directory, which the scan otherwise tolerates as unknown — must survive the
+// sweep.
+func TestOpenStoreSweepsLeftoverArchiveTmpFiles(t *testing.T) {
+	dir := t.TempDir()
+	s, _ := openTestStore(t, dir) // a good delta, no windows
+	require.NoError(t, s.Close())
+
+	archiveDir := filepath.Join(dir, archiveSubdir)
+	target := filepath.Join(archiveDir, archiveFileName(Tier1s, 3600))
+	require.NoError(t, os.WriteFile(target+windowTmpSuffix, []byte("half-built window"), 0o644))
+	require.NoError(t, os.WriteFile(target+windowTmpSuffix+".wal", []byte("half-built window"), 0o644))
+	foreign := []string{
+		filepath.Join(archiveDir, "operator-notes.txt.tmp"),
+		filepath.Join(archiveDir, "backup.duckdb.tmp"),
+		filepath.Join(archiveDir, "not-a-tier-1.duckdb.tmp.wal"),
+	}
+	for _, f := range foreign {
+		require.NoError(t, os.WriteFile(f, []byte("not ours"), 0o644))
+	}
+
+	s2, logs := openTestStore(t, dir)
+	require.NoFileExists(t, target+windowTmpSuffix)
+	require.NoFileExists(t, target+windowTmpSuffix+".wal")
+	for _, f := range foreign {
+		require.FileExists(t, f, "a foreign .tmp file is not the store's to delete")
+	}
+	require.Empty(t, s2.Quarantined(), "a leftover temporary is swept, not quarantined")
+	require.Empty(t, s2.Windows())
+	require.NotContains(t, strings.Join(*logs, "\n"), "failed to remove",
+		"the sweep of removable temporaries reports no failure")
+	require.NoError(t, s2.Close())
+}
+
+// TestCreateFileLandsSchemaWithoutItsWal pins the durability contract the
+// archive-window rename depends on: when createFile returns, the schema and
+// stamp are in the main file, not pending in a write-ahead log. Window
+// creation renames the file and discards the temporary's log, so a schema
+// that lived only there would be published tableless — and the consume
+// path's existence check never rebuilds an existing path. createFile
+// disables DuckDB's silent shutdown checkpoint and flushes through the
+// explicit checkpoint alone, so a log still carrying the schema here means
+// that checkpoint is gone; deleting the log before reopening is exactly
+// the discard window creation performs, and the file must answer for its
+// schema alone.
+func TestCreateFileLandsSchemaWithoutItsWal(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, archiveSubdir, archiveFileName(Tier1s, 3600))
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	require.NoError(t, createFile(path, []string{TierTable(Tier1s)}, currentTestStamp(t), ResourcesConfig{}))
+	if fi, err := os.Stat(path + ".wal"); err == nil {
+		require.Zero(t, fi.Size(), "the schema and stamp must live in the main file, not pending in the write-ahead log")
+		require.NoError(t, os.Remove(path+".wal"), "the discard the window rename performs must succeed")
+	}
+
+	db, err := openStoreFile(path, true, ResourcesConfig{})
+	require.NoError(t, err)
+	defer db.Close()
+	var stamped, rows int
+	require.NoError(t, db.QueryRow("SELECT count(*) FROM "+VersionTable).Scan(&stamped))
+	require.Equal(t, 1, stamped, "the stamp must live in the main file")
+	require.NoError(t, db.QueryRow("SELECT count(*) FROM "+tierTables[Tier1s]).Scan(&rows))
+	require.Zero(t, rows)
 }
 
 func TestQuarantineDoesNotOverwriteEarlierQuarantine(t *testing.T) {

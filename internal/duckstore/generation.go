@@ -23,6 +23,38 @@ import (
 // pulling them through Go.
 const deltaSrcAlias = "delta_src"
 
+// windowTmpSuffix marks an archive window file mid-creation. A window is
+// created under the temporary name and renamed into place, because the
+// consume path creates one only when the final path is absent: a crash
+// between creating the file and committing its tables would otherwise leave
+// a tableless leftover at the final path that no later pass repairs — the
+// conditional create skips it and every read of it fails — wedging
+// consumption of that window forever.
+const windowTmpSuffix = ".tmp"
+
+// createArchiveWindow creates an empty archive window file at path
+// atomically: the database is built under a temporary name — removing any
+// stale temporary a crashed earlier attempt left — and renamed into place,
+// so the final path only ever exists complete. Delta generations do not need
+// this: their creation is unconditional and idempotent, so a leftover
+// mid-creation file is simply completed by the next attempt.
+func createArchiveWindow(path, tier string, st stamp, res ResourcesConfig) error {
+	tmp := path + windowTmpSuffix
+	_ = os.Remove(tmp)
+	_ = os.Remove(tmp + ".wal")
+	if err := createFile(tmp, []string{tierTables[tier]}, st, res); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	// createFile checkpoints and closes the database before returning, so the
+	// renamed file holds its schema on its own; a write-ahead log next to the
+	// temporary name can only be a stale leftover.
+	_ = os.Remove(tmp + ".wal")
+	return nil
+}
+
 // tierWindowSecs is each tier's archive window length: the file boundary
 // consumption routes rows by, retention unlinks whole files at, and sealing
 // rewrites one of. The 1s tier's hour is the tickets' provisional starting
@@ -198,7 +230,7 @@ func (s *Store) consumeWindow(ctx context.Context, gen int64, deltaPath string, 
 	}
 	path := filepath.Join(s.cfg.Dir, archiveSubdir, archiveFileName(k.tier, k.start))
 	if _, err := os.Stat(path); os.IsNotExist(err) {
-		if err := createFile(path, []string{tierTables[k.tier]}, s.currentStamp(), s.cfg.Resources); err != nil {
+		if err := createArchiveWindow(path, k.tier, s.currentStamp(), s.cfg.Resources); err != nil {
 			return fmt.Errorf("duck-store: consume generation %d: %w", gen, err)
 		}
 	}
@@ -218,7 +250,7 @@ func (s *Store) consumeWindow(ctx context.Context, gen int64, deltaPath string, 
 		return nil
 	}
 
-	// A sealed window is frozen: its rows were rewritten into one run past the
+	// A sealed window is immutable: its rows were rewritten into one run past the
 	// historic window, so only a sender violating that window could land here
 	// — the writer's ingest guard drops such rows, and this is the backstop.
 	// The rows can never be appended, and failing here would wedge this

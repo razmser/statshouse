@@ -28,7 +28,7 @@ import (
 // the one CPU burst in the design, so it runs once per window lifetime, at
 // window end plus the historic window — 48 hours past the point any late row
 // can still arrive for that window, which is what makes the sealed collapse
-// safe to freeze. From the seal on, the window's contents never change again:
+// final. From the seal on, the window's contents never change again:
 // the sealed marker in the window file's own metadata refuses every later
 // append, and the store opens the file read-only from then on.
 //
@@ -92,24 +92,7 @@ func NewSealer(s *Store, cfg SealerConfig) *Sealer {
 // per Interval. A failed pass is logged and retried by the next; the seal
 // transaction makes that safe. It returns nil when ctx is done.
 func (sl *Sealer) Run(ctx context.Context) error {
-	if err := sl.SealOnce(ctx); err != nil && ctx.Err() == nil {
-		sl.cfg.Logf("[error] duck-store: sealing pass: %v", err)
-	}
-	t := time.NewTicker(sl.cfg.Interval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-t.C:
-			if err := sl.SealOnce(ctx); err != nil {
-				if ctx.Err() != nil {
-					return nil
-				}
-				sl.cfg.Logf("[error] duck-store: sealing pass: %v", err)
-			}
-		}
-	}
+	return runMaintenanceLoop(ctx, MaintenanceSealing, sl.cfg.Interval, sl.cfg.Logf, sl.SealOnce)
 }
 
 // SealOnce seals every served window that has crossed its seal time. Windows
@@ -152,7 +135,7 @@ func windowSealDue(tier string, windowStart, nowUnix int64) bool {
 }
 
 // SealWindow rewrites one archive window's runs into a single collapsed run
-// and freezes the file: the rewrite, the sealed marker and nothing else land
+// and seals the file: the rewrite, the sealed marker and nothing else land
 // in one transaction, and the file is reopened read-only — the access mode
 // every open from the seal on uses. Sealing an already-sealed window is a
 // no-op, so a retried pass after a crash between the commit and the in-memory

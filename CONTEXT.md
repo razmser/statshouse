@@ -21,7 +21,7 @@ The read protocol between statshouse-api and a duck-store-backed agg. The API se
 _Avoid_: query API, SQL RPC
 
 **Aggregate state**:
-A serialized partial-aggregation value stored per row instead of raw samples — TDigest centroids for percentiles, HLL/uniq state for unique counts, argMin/argMax host values. ClickHouse uses its own byte formats, which `internal/chutil` already encodes and decodes in Go. The duck-store format is an open question, constrained by **shard fan-out**: percentile and unique states must stay mergeable across shards and LODs, so a finalized number is not sufficient.
+A serialized partial-aggregation value stored per row instead of raw samples — TDigest centroids for percentiles, HLL/uniq state for unique counts, argMin/argMax host values. ClickHouse uses its own byte formats, which `internal/chutil` already encodes and decodes in Go. duck-store keeps those byte formats verbatim — opaque BLOB columns, merged in Go with the same codecs — precisely because **shard fan-out** needs percentile and unique states mergeable across shards and LODs, which a finalized number would not be.
 _Avoid_: sketch, digest state
 
 **LOD (level of detail)**:

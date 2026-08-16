@@ -4,6 +4,7 @@
 
 /target/
 /statshouse
+/statshouse-agg
 /statshouse-api
 /statshouse-example
 /statshouse-metadata

@@ -1,4 +1,4 @@
-// Copyright 2025 V Kontate LLC
+// Copyright 2025 V Kontakte LLC
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -44,35 +44,53 @@ type duckQuerySource struct {
 	// clients holds one entry per configured shard, sorted by shard number —
 	// the whole shard set a query fans out over.
 	clients []storeShardClient
-	// numShards is the highest configured shard number: the modulus of the
-	// by-metric-id assignment, which numbers shards 1..N contiguously.
+	// numShards is the modulus of the by-metric-id assignment — the copy of
+	// the aggregator cluster's --shard-by-metric-shards, the count agents
+	// shard metric data by at write time. It comes from the API's own flag,
+	// not from the number of configured addresses: a partial address list is
+	// a startup-validation error, not a routing modulus.
 	numShards int
 	// journal re-reads metrics when a shard refuses a query as a metadata
 	// mismatch. Nil (tests without one) makes the retry fail fast.
 	journal metricsStorageRef
 }
 
+// duckQuerySourceConfig is everything the duck source is built from: the
+// per-shard query addresses, the by-metric-id routing modulus (the API's
+// --shard-by-metric-shards), the RPC crypto key the shards' store-query
+// listeners require, and the metrics journal for its mismatch retry.
+type duckQuerySourceConfig struct {
+	addrs     map[uint32]string
+	numShards int
+	cryptoKey string
+	journal   metricsStorageRef
+}
+
 // newDuckQuerySource builds the source over the configured per-shard query
-// addresses. cryptoKey is the RPC crypto key presented to every shard's
-// store-query listener (cross-machine handshakes require encryption). An
-// empty address set returns nil: the duck backend is then selected but not
-// servable, which newQuerySource reports per query.
-func newDuckQuerySource(addrs map[uint32]string, cryptoKey string, journal metricsStorageRef) *duckQuerySource {
-	if len(addrs) == 0 {
+// addresses. numShards zero or below falls back to the highest configured
+// shard number, the way startup validation resolves an unset count — a path
+// only tests building a bare source take. An empty address set returns nil:
+// the duck backend is then selected but not servable, which newQuerySource
+// reports per query.
+func newDuckQuerySource(cfg duckQuerySourceConfig) *duckQuerySource {
+	if len(cfg.addrs) == 0 {
 		return nil
 	}
-	rpcClients := newRPCStoreShardClients(addrs, cryptoKey)
+	rpcClients := newRPCStoreShardClients(cfg.addrs, cfg.cryptoKey)
 	clients := make([]storeShardClient, len(rpcClients))
 	for i, c := range rpcClients {
 		clients[i] = c
 	}
-	numShards := 0
-	for shard := range addrs {
-		if int(shard) > numShards {
-			numShards = int(shard)
+	numShards := cfg.numShards
+	if numShards <= 0 {
+		numShards = 0
+		for shard := range cfg.addrs {
+			if int(shard) > numShards {
+				numShards = int(shard)
+			}
 		}
 	}
-	return &duckQuerySource{clients: clients, numShards: numShards, journal: journal}
+	return &duckQuerySource{clients: clients, numShards: numShards, journal: cfg.journal}
 }
 
 // shardForRange returns the 0-based shard the metric's rows live on for the
@@ -112,7 +130,28 @@ func (s *duckQuerySource) clientsForShard(shard int, metricID int32) ([]storeSha
 	return nil, fmt.Errorf("duck shard %d, where metric %d lives, has no query address configured (--duck-shard-query-addrs)", shard+1, metricID)
 }
 
+// blockedPolicyError is the duck path's share of the blocked-metric-prefix
+// and blocked-user policy the ClickHouse path applies in doSelect: the same
+// check over the same pair the ClickHouse query metadata carried — the
+// addressed metric's name and the requesting user. A nil handler (tests)
+// skips it, the way it skips the duration reporting; a nil metric (a
+// multi-metric query) reads as the empty name, the way the ClickHouse
+// builder's placeholder does.
+func (h *requestHandler) blockedPolicyError(metric *format.MetricMetaValue, user string) error {
+	if h == nil {
+		return nil
+	}
+	name := ""
+	if metric != nil {
+		name = metric.Name
+	}
+	return h.blockedQueryError(name, user)
+}
+
 func (s *duckQuerySource) querySeries(ctx context.Context, h *requestHandler, q *seriesDataQuery, lod data_model.LOD, onRow func(tsSelectRow) error) error {
+	if err := h.blockedPolicyError(q.metric, q.user); err != nil {
+		return err
+	}
 	clients := s.clients
 	if q.metric != nil {
 		if shard := s.shardForRange(q.metric, lod.FromSec); shard >= 0 {
@@ -170,6 +209,9 @@ func (s *duckQuerySource) querySeries(ctx context.Context, h *requestHandler, q 
 }
 
 func (s *duckQuerySource) queryTagValues(ctx context.Context, h *requestHandler, q *tagValuesDataQuery, lod data_model.LOD, onRow func(selectRow) error) error {
+	if err := h.blockedPolicyError(q.metric, q.user); err != nil {
+		return err
+	}
 	clients := s.clients
 	if q.metric != nil {
 		if shard := s.shardForRange(q.metric, lod.FromSec); shard >= 0 {

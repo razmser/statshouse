@@ -32,8 +32,9 @@ type hostPair struct {
 // insertRow is one fully resolved row of an insert round, the form every storage
 // backend must see. Row resolution — sampling factors, per-metric skips and
 // unknown-tag bookkeeping — happens once, in shared code, so backends cannot
-// disagree about what a row is. Sketch columns carry ClickHouse aggregate state
-// bytes verbatim, which is also what duck-store keeps in its BLOB columns.
+// disagree about what a row is. The percentiles and unique columns carry
+// ClickHouse aggregate state bytes verbatim, which is also what duck-store
+// keeps in its BLOB columns.
 type insertRow struct {
 	key         data_model.Key      // metric, time and tag0..tag15; the string top slot stays empty
 	top         data_model.TagUnion // value written into the string top slot (usually empty)
@@ -56,7 +57,7 @@ type insertRow struct {
 type InsertSink interface {
 	// AppendRow adds one resolved row to the pending round and returns the row's
 	// RowBinary size in bytes, which feeds the insertSize accounting. The row's
-	// sketch slices are valid only until the next AppendRow call.
+	// aggregate-state slices are valid only until the next AppendRow call.
 	AppendRow(row *insertRow) int
 	// Send delivers the pending round, returning the status, exception code,
 	// elapsed time and error of the insert — the quadruple the conveyor reacts to.
@@ -255,9 +256,9 @@ func resolveHosts(rng *rand.Rand, row *insertRow, count float64, v *data_model.I
 
 // resolveMultiValueRow resolves one conveyor row — the tail or one string top of
 // an item — applying the sampling factor and the per-metric skips. scratch is
-// the reusable buffer the sketch state bytes are encoded into; the returned
-// buffer is the same storage rewound for the next row, so the row's sketch
-// slices stay valid only until the next resolve.
+// the reusable buffer the aggregate-state bytes are encoded into; the returned
+// buffer is the same storage rewound for the next row, so the row's
+// aggregate-state slices stay valid only until the next resolve.
 func resolveMultiValueRow(rng *rand.Rand, key *data_model.Key, top data_model.TagUnion, value *data_model.MultiValue, sf float64, appendCtx appendContext, scratch []byte) (insertRow, []byte) {
 	row := insertRow{key: *key, top: top}
 	resolveKeyTags(&row, appendCtx)
@@ -270,7 +271,7 @@ func resolveMultiValueRow(rng *rand.Rand, key *data_model.Key, top data_model.Ta
 		row.sumSquare = zeroIfTrue(value.Value.ValueSumSquare*sf, skipSumSquare)
 	}
 	row.percentiles = rowbinary.AppendCentroids(scratch[:0], value.ValueTDigest, sf)
-	row.unique = value.HLL.MarshallAppend(row.percentiles[len(row.percentiles):][:0]) // both sketches share one buffer, laid out back to back
+	row.unique = value.HLL.MarshallAppend(row.percentiles[len(row.percentiles):][:0]) // both aggregate states share one buffer, laid out back to back
 	resolveHosts(rng, &row, row.count, &value.Value, skipMaxHost, skipMinHost, appendCtx)
 	return row, row.percentiles[:0]
 }

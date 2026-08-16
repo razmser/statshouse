@@ -53,7 +53,7 @@ const ConsumedTableDDL = "CREATE TABLE IF NOT EXISTS " + ConsumedTable + " (" +
 
 // SealedTable is the metadata table archive window files carry: it holds a row
 // once the window is sealed — its runs rewritten into one and its contents
-// frozen. The marker is written in the same DuckDB transaction as the rewrite,
+// immutable from then on. The marker is written in the same DuckDB transaction as the rewrite,
 // so the two can never disagree. The store reads it to refuse every later
 // write to the file and to serve it read-only; retention and operators may
 // still unlink or copy the file, which is the only thing that can happen to it.
@@ -96,7 +96,7 @@ func TierTable(tier string) string {
 // transliteration of .scratch/duck-store/03-schema-ddl.sql. Every column is
 // NOT NULL with a zero-value default (the API compares empty string tags
 // directly and NULLs would make three-valued logic silently drop rows), time
-// is BIGINT unix seconds, sketch states stay opaque ClickHouse bytes in BLOB,
+// is BIGINT unix seconds, aggregate states stay opaque ClickHouse bytes in BLOB,
 // and there is deliberately no primary key, unique constraint or index:
 // partial rows repeat the key and an index would cost Appender throughput.
 func tierTableDDL(table string) string {

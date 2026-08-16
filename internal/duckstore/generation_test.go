@@ -12,6 +12,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -331,6 +332,31 @@ func TestConsumeCrashPointsKeepValuesExactlyOnce(t *testing.T) {
 	}
 }
 
+// TestCreateArchiveWindowReplacesStaleTmp pins the crash-retry of a window
+// creation: the temporary file a crashed build left behind must not wedge the
+// retry — the rebuild removes it (and its wal) first, builds under the same
+// temporary name, and renames, so the window lands atomically however many
+// attempts died before it.
+func TestCreateArchiveWindowReplacesStaleTmp(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, archiveFileName(Tier1s, 3600))
+	tmp := path + windowTmpSuffix
+	require.NoError(t, os.WriteFile(tmp, []byte("stale half-built window"), 0o644))
+	require.NoError(t, os.WriteFile(tmp+".wal", []byte("stale half-built window"), 0o644))
+
+	require.NoError(t, createArchiveWindow(path, Tier1s, stamp{}, ResourcesConfig{}))
+
+	require.FileExists(t, path, "the window landed")
+	require.NoFileExists(t, tmp)
+	require.NoFileExists(t, tmp+".wal")
+	db, err := openStoreFile(path, true, ResourcesConfig{})
+	require.NoError(t, err)
+	var rows int
+	require.NoError(t, db.QueryRow(`SELECT count(*) FROM `+tierTables[Tier1s]).Scan(&rows))
+	require.Zero(t, rows)
+	require.NoError(t, db.Close())
+}
+
 // TestConsumeGenerationEmptyGenerationUnlinksAlone checks the degenerate
 // consume: a rolled generation that never received a row is consumed by the
 // unlink alone, creating no windows.
@@ -368,7 +394,7 @@ func TestConsumeGenerationSealedWindowDropsAndCompletes(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = w.Close() })
 
-	// land one row in the previous 1s-tier window, then freeze that window;
+	// land one row in the previous 1s-tier window, then seal that window;
 	// the 1m and 1h windows sharing the timestamp stay open
 	lateTS := uint32(writerNow.Unix() - 3700)
 	first := testRow(testMetricID, lateTS)

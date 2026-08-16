@@ -19,8 +19,8 @@ import (
 	"github.com/VKCOM/statshouse/internal/vkgo/kittenhouseclient/rowbinary"
 )
 
-// The Go fold of the two sketch columns — the half of compaction SQL cannot
-// do. DuckDB can neither merge ClickHouse's aggregate states nor re-import
+// The Go fold of the two aggregate-state columns — the half of compaction SQL
+// cannot do. DuckDB can neither merge ClickHouse's aggregate states nor re-import
 // them, so wherever rows are folded (compaction here, query replies later) the
 // blob lists the SQL GROUP BY produces are merged in Go with the same codecs
 // the write path and the API already use. The fold happens before the group is

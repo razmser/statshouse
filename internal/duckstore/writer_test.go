@@ -50,7 +50,8 @@ func newTestWriterCfg(t *testing.T, cfg WriterConfig) (*Store, *Writer) {
 	return s, w
 }
 
-// testRow builds one fully populated row: every aggregate, both sketches, all
+// testRow builds one fully populated row: every aggregate, both aggregate
+// states, all
 // three host kinds and tags in both encodings, so a landed row exercises the
 // whole column mapping.
 func testRow(metric int32, ts uint32) Row {
@@ -107,7 +108,7 @@ func tierCount(t *testing.T, s *Store, tier string, metric int32) int {
 // TestWriterRoundLandsInAllTiersTruncated writes one round and proves the row
 // reached all three tiers with time truncated to each tier, that it is
 // committed (visible to a connection other than the writer's) as soon as
-// WriteRound returns, and that the tag, host and sketch columns survived the
+// WriteRound returns, and that the tag, host and aggregate-state columns survived the
 // mapping.
 func TestWriterRoundLandsInAllTiersTruncated(t *testing.T) {
 	s, w := newTestWriter(t)
@@ -143,7 +144,7 @@ func TestWriterRoundLandsInAllTiersTruncated(t *testing.T) {
 	require.Zero(t, tag47)
 	require.Equal(t, "string top", stag47)
 
-	// hosts and sketches are stored verbatim, skew values included
+	// hosts and aggregate states are stored verbatim, skew values included
 	var minHost, maxHost int32
 	var minShost, maxShost string
 	var minHostValue, maxHostValue float64
@@ -434,7 +435,7 @@ func TestWithinIngestGuard(t *testing.T) {
 }
 
 // TestIngestGuardHorizon pins the guard's old bound to the historic window:
-// windows freeze at their end plus data_model.MaxHistoricWindow, so a row
+// windows seal at their end plus data_model.MaxHistoricWindow, so a row
 // older than that could only target an already-sealed window. Widening this
 // bound past the historic window re-opens the wedge consumeWindow guards
 // against; change the two together or not at all.

@@ -70,7 +70,6 @@ var argv struct {
 	chV2MaxLightSlowConns    int
 	chV2MaxHardwareFastConns int
 	chV2MaxHardwareSlowConns int
-	ShardByMetricShards      int
 
 	chV2Password             string
 	chV2PasswordFile         string
@@ -527,7 +526,9 @@ func parseCommandLine() (err error) {
 	flag.IntVar(&argv.chV2MaxHeavySlowConns, "clickhouse-v2-max-heavy-slow-conns", 1, "maximum number of ClickHouse-v2 connections (heavy slow)")
 	flag.IntVar(&argv.chV2MaxHardwareFastConns, "clickhouse-v2-max-hardware-fast-conns", 2, "maximum number of ClickHouse-v2 connections (hardware fast)")
 	flag.IntVar(&argv.chV2MaxHardwareSlowConns, "clickhouse-v2-max-hardware-slow-conns", 1, "maximum number of ClickHouse-v2 connections (hardware slow)")
-	flag.IntVar(&argv.ShardByMetricShards, "shard-by-metric-shards", 16, "number of shards for by-metric shard strategy. A copy from aggregator's config")
+	// --shard-by-metric-shards moved into api.Config.Bind: the config listener
+	// reparses the API's own flag surface line by line, and the duck backend
+	// cross-validates the count against --duck-shard-query-addrs.
 
 	flag.StringVar(&argv.chV2Password, "clickhouse-v2-password", "", "ClickHouse-v2 password")
 	flag.StringVar(&argv.chV2PasswordFile, "clickhouse-v2-password-file", "", "file with ClickHouse-v2 password")

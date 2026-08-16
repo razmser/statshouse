@@ -10,6 +10,7 @@ package duckstore
 
 import (
 	"context"
+	"fmt"
 	// the month-LOD validator needs IANA zones even on a tzdata-less runner
 	"testing"
 	_ "time/tzdata"
@@ -431,7 +432,7 @@ func TestRenderSeriesHostsByIdentifyingValue(t *testing.T) {
 	require.Equal(t, "", r.maxHostStag[0])
 }
 
-// TestRenderSeriesFoldedStates checks the two sketch columns come back as one
+// TestRenderSeriesFoldedStates checks the two aggregate-state columns come back as one
 // folded state per row, matching a direct Go merge of the same inputs by
 // decoded value.
 func TestRenderSeriesFoldedStates(t *testing.T) {
@@ -710,6 +711,52 @@ func TestRenderSeriesMetricFilter(t *testing.T) {
 	require.Equal(t, []float64{1}, r.count, "the NOT IN list keeps the first")
 }
 
+// TestRenderSeriesByBeyondLayout covers by references inside the stored tag
+// columns but beyond the layout's kinds — the shape a group-over-everything
+// PromQL selector produces (by 0..47 against a metric with fewer tags) and a
+// metric-excluding query with no layout at all. The ClickHouse builder
+// renders every grouped reference's tag and string columns unconditionally,
+// so the renderer answers them the same way instead of refusing: the slot
+// reads its plain columns, zero and the empty string when the metric never
+// set them, and
+// groups by a constant.
+func TestRenderSeriesByBeyondLayout(t *testing.T) {
+	s, w := newTestWriter(t)
+	b1 := (writerNowUnix - 7200) / 60 * 60
+	require.NoError(t, w.WriteRound(context.Background(), []Row{
+		{Metric: testMetricID, Time: uint32(b1), Tags: tag0(11), Count: 3},
+	}))
+
+	what := []int32{int32(data_model.DigestCount)}
+	r := renderSeriesSorted(t, s, 1, seriesReq(testMetricID, twoMappedKinds, what, []int32{0, 3}, b1, b1+60, 60))
+	require.Equal(t, []float64{3}, r.count)
+	require.Equal(t, []int64{11}, r.tags[0])
+	require.Equal(t, []int64{0}, r.tags[1], "a slot beyond the layout reads its plain column, zero when unused")
+	require.Equal(t, []string{""}, r.stags[1], "its string half is selected too, exactly as the ClickHouse builder renders it")
+
+	// a metric-excluding query addresses no metric in particular, carries no
+	// layout, and must still group: the by reference reads the same plain
+	// columns through the empty layout
+	q := seriesReq(0, nil, what, []int32{1}, b1, b1+60, 60)
+	q.Base.SetMetricNotIn([]int32{testMetricID2})
+	r = renderSeriesSorted(t, s, 1, q)
+	require.Equal(t, []float64{3}, r.count, "the NOT IN list keeps the first metric, grouped through an empty layout")
+	require.Equal(t, []int64{0}, r.tags[0])
+	require.Equal(t, []string{""}, r.stags[0])
+
+	// grouping over every slot at once — the bare-selector shape — plans and
+	// answers; the empty slots fold into one constant series
+	all := make([]int32, format.MaxTags)
+	for i := range all {
+		all[i] = int32(i)
+	}
+	r = renderSeriesSorted(t, s, 1, seriesReq(testMetricID, twoMappedKinds, what, all, b1, b1+60, 60))
+	require.Equal(t, []float64{3}, r.count)
+	require.Len(t, r.tags, format.MaxTags)
+	require.Equal(t, []int64{11}, r.tags[0])
+	require.Equal(t, []int64{0}, r.tags[47], "the last slot is inside the stored columns")
+}
+
 // TestRenderSeriesValidation walks the malformed-request table: each entry
 // must fail as bad_request naming what was wrong, before any storage is
 // touched.
@@ -735,15 +782,15 @@ func TestRenderSeriesValidation(t *testing.T) {
 			q.SetSortDesc(true)
 			q.SetSortAsc(true)
 		}, "sort_desc and sort_asc are both set"},
-		{"by outside layout", func(q *tlstatshouse.StoreQuerySeries) { q.By = []int32{16} },
-			"by tag 16 is outside the tag layout of 2 kinds"},
+		{"by beyond the stored columns", func(q *tlstatshouse.StoreQuerySeries) { q.By = []int32{format.MaxTags} },
+			fmt.Sprintf("by tag %d is outside the %d stored tag columns", format.MaxTags, format.MaxTags)},
 		{"by negative", func(q *tlstatshouse.StoreQuerySeries) { q.By = []int32{-2} },
-			"by tag -2 is outside the tag layout"},
-		{"filter outside layout", func(q *tlstatshouse.StoreQuerySeries) {
-			f := tlstatshouse.StoreTagFilter{TagIndex: 9}
+			fmt.Sprintf("by tag -2 is outside the %d stored tag columns", format.MaxTags)},
+		{"filter beyond the stored columns", func(q *tlstatshouse.StoreQuerySeries) {
+			f := tlstatshouse.StoreTagFilter{TagIndex: format.MaxTags + 5}
 			f.SetMapped([]int64{1})
 			q.Base.FilterIn = []tlstatshouse.StoreTagFilter{f}
-		}, "filter on tag 9 is outside the tag layout"},
+		}, fmt.Sprintf("filter on tag %d is outside the %d stored tag columns", format.MaxTags+5, format.MaxTags)},
 		{"unknown layout kind", func(q *tlstatshouse.StoreQuerySeries) {
 			q.Base.TagLayout.Kinds = []int32{5, 0}
 		}, "tag layout kind 5 at index 0 is not mapped, raw32 or raw64"},

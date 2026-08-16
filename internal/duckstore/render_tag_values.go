@@ -68,7 +68,7 @@ func planTagValuesQuery(args tlstatshouse.StoreQueryTagValues) (*tagValuesPlan, 
 		return nil, err
 	}
 	p := &tagValuesPlan{storeQueryPlan: bp, args: args, tag: x}
-	switch bp.base.TagLayout.Kinds[x] {
+	switch bp.kindAt(x) {
 	case tagKindRaw64:
 		// the value is the whole 64 bits rebuilt from the two stored halves
 		if int(x)+1 >= format.MaxTags || int(x)+1 >= len(bp.base.TagLayout.Kinds) {

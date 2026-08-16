@@ -50,8 +50,8 @@ func newTestDuckSink(t *testing.T, cfg duckstore.WriterConfig) (*duckstore.Store
 }
 
 // sinkTestInsertRow builds one fully populated insertRow, the conveyor-side
-// counterpart of duckstore's testRow: every aggregate, both sketches, both
-// host encodings and tags in both encodings.
+// counterpart of duckstore's testRow: every aggregate, both aggregate states,
+// both host encodings and tags in both encodings.
 func sinkTestInsertRow(metric int32, ts uint32) insertRow {
 	row := insertRow{
 		key:         data_model.Key{Timestamp: ts, Metric: metric},
@@ -84,8 +84,8 @@ func sinkTierCount(t *testing.T, s *duckstore.Store, tier string, metric int32) 
 }
 
 // TestDuckSinkRoundLandsInStore drives one append/send cycle end to end and
-// checks the conversion: the resolved row's tags, string top, hosts, sketches
-// and aggregates must land decoded in the store, in all three tiers with time
+// checks the conversion: the resolved row's tags, string top, hosts, aggregate
+// states and aggregates must land decoded in the store, in all three tiers with time
 // truncated, and the per-row size accounting must match the ClickHouse
 // encoder's.
 func TestDuckSinkRoundLandsInStore(t *testing.T) {
@@ -138,7 +138,7 @@ func TestDuckSinkRoundLandsInStore(t *testing.T) {
 	require.EqualValues(t, 21, sum)
 	require.EqualValues(t, 101.25, sumsquare)
 
-	// hosts and sketches are stored verbatim, the skewed state values included
+	// hosts and aggregate states are stored verbatim, the skewed state values included
 	var minHost, maxHost int32
 	var minShost, maxShost string
 	var minHostValue, maxHostValue float64
@@ -217,10 +217,10 @@ func TestDuckSinkRoundSizeAndReset(t *testing.T) {
 	require.Equal(t, http.StatusOK, status)
 }
 
-// TestDuckSinkCopiesSketchBytes guards the duck sink's side of the scratch
-// contract: AppendRow must copy the sketch bytes, because the conveyor reuses
+// TestDuckSinkCopiesAggregateStateBytes guards the duck sink's side of the
+// scratch contract: AppendRow must copy the aggregate-state bytes, because the conveyor reuses
 // the scratch they were encoded into before Send ever runs.
-func TestDuckSinkCopiesSketchBytes(t *testing.T) {
+func TestDuckSinkCopiesAggregateStateBytes(t *testing.T) {
 	s, sink := newTestDuckSink(t, duckstore.WriterConfig{})
 	row := sinkTestInsertRow(sinkTestMetricID, uint32(sinkNowUnix))
 	sink.AppendRow(&row)

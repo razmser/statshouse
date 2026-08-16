@@ -1,4 +1,4 @@
-// Copyright 2025 V Kontate LLC
+// Copyright 2025 V Kontakte LLC
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -75,6 +75,12 @@ func (f *fakeStoreShard) seriesCallCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.seriesArgs)
+}
+
+func (f *fakeStoreShard) tagValuesCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.tagValuesArgs)
 }
 
 // fanoutTestSource builds a source over the fakes, sorted by shard number
@@ -201,7 +207,7 @@ func TestFanoutSeriesMergeAcrossShards(t *testing.T) {
 	require.Equal(t, float64(7), rows[3].count)
 }
 
-// TestFanoutSeriesStateMergesByValue checks the sketch and host merges by
+// TestFanoutSeriesStateMergesByValue checks the aggregate-state and host merges by
 // value: percentiles fold into one digest, uniques into one set with the
 // shared ids counted once, and the host arg-min/arg-max pick the right shard's
 // row by value.
@@ -574,7 +580,7 @@ func TestFanoutSeriesDecode(t *testing.T) {
 	_, err = decodeSeriesResponse(q, fanoutSeriesResp(1, fanoutSeriesBatch(1, []int64{100}, [][]int64{{7}}, nil, nil)))
 	require.ErrorContains(t, err, "tag columns")
 
-	// corrupt sketch states fail with the shard named
+	// corrupt aggregate states fail with the shard named
 	badTd := &seriesDataQuery{metric: fanoutMetric(format.ShardBuiltinDist), what: fanoutWhats(data_model.DigestPercentile), by: []int{0}}
 	_, err = decodeSeriesResponse(badTd, fanoutSeriesResp(4, fanoutSeriesBatch(1, []int64{100}, [][]int64{{7}}, nil,
 		&tlstatshouse.StoreSeriesBatch{Percentiles: []string{"not-a-digest"}})))
@@ -1088,4 +1094,37 @@ func TestRPCStoreShardClientCryptoKey(t *testing.T) {
 	defer cancel()
 	_, err := clients[0].queryTagValues(ctx, tlstatshouse.StoreQueryTagValues{})
 	require.NoError(t, err, "the tag-values call must complete the same verified handshake")
+}
+
+// TestDuckQueryBlockedPolicy pins the duck path's share of the
+// blocked-metric-prefix and blocked-user policy: the same refusal doSelect
+// applies on the ClickHouse path, over the same metric name and user the
+// ClickHouse query metadata carried, before any shard is contacted.
+func TestDuckQueryBlockedPolicy(t *testing.T) {
+	fake := &fakeStoreShard{shard: 1}
+	src := fanoutTestSource(fake)
+	lod := data_model.LOD{FromSec: 0, ToSec: 60, StepSec: 60}
+	metric := &format.MetricMetaValue{Name: "secret_metric", MetricID: 5}
+
+	blockedMetric := &requestHandler{Handler: &Handler{blockedMetricPrefixes: []string{"secret_"}}}
+	q := &seriesDataQuery{metric: metric, what: fanoutWhats(data_model.DigestCount)}
+	err := src.querySeries(context.Background(), blockedMetric, q, lod, func(tsSelectRow) error { return nil })
+	require.Error(t, err)
+	require.Contains(t, err.Error(), `metric "secret_metric" is blocked`)
+	require.Equal(t, 0, fake.seriesCallCount(), "the refusal must happen before any shard is contacted")
+
+	blockedUser := &requestHandler{Handler: &Handler{blockedUsers: []string{"eve"}}}
+	err = src.queryTagValues(context.Background(), blockedUser,
+		&tagValuesDataQuery{user: "eve", metric: metric}, lod, func(selectRow) error { return nil })
+	require.Error(t, err)
+	require.Contains(t, err.Error(), `user "eve" is blocked`)
+	require.Equal(t, 0, fake.tagValuesCallCount(), "the tag-values refusal is equally early")
+
+	// the same queries through an unblocked pair still reach the shard
+	unblocked := &requestHandler{Handler: &Handler{}}
+	require.NoError(t, src.querySeries(context.Background(), unblocked, q, lod, func(tsSelectRow) error { return nil }))
+	require.Equal(t, 1, fake.seriesCallCount())
+	require.NoError(t, src.queryTagValues(context.Background(), unblocked,
+		&tagValuesDataQuery{metric: metric, tag: format.MetricMetaTag{Index: 1}}, lod, func(selectRow) error { return nil }))
+	require.Equal(t, 1, fake.tagValuesCallCount())
 }

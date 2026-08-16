@@ -124,24 +124,7 @@ func NewRetainer(s *Store, cfg RetentionConfig) *Retainer {
 // Interval. A failed pass is logged and retried by the next. It returns nil
 // when ctx is done.
 func (r *Retainer) Run(ctx context.Context) error {
-	if err := r.RetainOnce(ctx); err != nil && ctx.Err() == nil {
-		r.cfg.Logf("[error] duck-store: retention pass: %v", err)
-	}
-	t := time.NewTicker(r.cfg.Interval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-t.C:
-			if err := r.RetainOnce(ctx); err != nil {
-				if ctx.Err() != nil {
-					return nil
-				}
-				r.cfg.Logf("[error] duck-store: retention pass: %v", err)
-			}
-		}
-	}
+	return runMaintenanceLoop(ctx, MaintenanceRetention, r.cfg.Interval, r.cfg.Logf, r.RetainOnce)
 }
 
 // RetainOnce lands one pass: every served window past its tier's retention is

@@ -115,10 +115,18 @@ func TestDuckQueryExecutorValidatesThenRenders(t *testing.T) {
 	_, err = e.QueryTagValues(context.Background(), tagValuesArgs(999, []int32{0, 0}, 1, b1))
 	requireErrorCode(t, err, duckstore.ErrCodeUnknownMetric, "absent metric")
 
-	// a malformed request (tag outside the claimed layout) survives validation
+	// a tag beyond the claimed layout but inside the stored columns answers
+	// like the ClickHouse builder: its plain column reads zero (the metric
+	// never set it) and every row folds into that one value
+	resp, err = e.QueryTagValues(context.Background(), tagValuesArgs(validateMetricMapped, []int32{0, 0}, 16, b1))
+	require.NoError(t, err)
+	require.Equal(t, []int64{0}, resp.Tag)
+	require.Equal(t, []float64{16}, resp.Count)
+
+	// a malformed request (tag outside the stored columns) survives validation
 	// and fails in the renderer as bad_request
-	_, err = e.QueryTagValues(context.Background(), tagValuesArgs(validateMetricMapped, []int32{0, 0}, 16, b1))
-	requireErrorCode(t, err, duckstore.ErrCodeBadRequest, "tag outside the layout")
+	_, err = e.QueryTagValues(context.Background(), tagValuesArgs(validateMetricMapped, []int32{0, 0}, format.MaxTags, b1))
+	requireErrorCode(t, err, duckstore.ErrCodeBadRequest, "outside the 48 stored tag columns")
 
 	// the series verb validates the same way and answers with this shard's number
 	series := tlstatshouse.StoreQuerySeries{

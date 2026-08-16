@@ -230,7 +230,7 @@ type goldenRowCase struct {
 
 // goldenRowCases covers every row flavour of the conveyor: value-stat rows
 // (badges, contributors log, sampling factors), conveyor rows with and without
-// sampling factors, skip flags, empty sketches and every tag encoding branch.
+// sampling factors, skip flags, empty aggregate states and every tag encoding branch.
 func goldenRowCases() []goldenRowCase {
 	valueKey := func(metric int32) *data_model.Key {
 		return &data_model.Key{Timestamp: goldenNow, Metric: metric}
@@ -321,7 +321,7 @@ func goldenRowCases() []goldenRowCase {
 }
 
 // TestInsertRowsGoldenEncoding freezes the RowBinary encoding of individual rows
-// — every aggregate, sketch and host branch of the conveyor — as produced before
+// — every aggregate, aggregate-state and host branch of the conveyor — as produced before
 // the seam. Row resolution and encoding must keep matching these bytes.
 func TestInsertRowsGoldenEncoding(t *testing.T) {
 	storage := goldenMetricStorage(t)
@@ -359,7 +359,7 @@ func TestRowBinarySizeMatchesEncoding(t *testing.T) {
 
 	// rows resolved through the conveyor's own resolution cover every branch
 	// of the encoders: values, counters, skips, sampling factors, string tops
-	// in both encodings, raw string tags, both host encodings and both sketches
+	// in both encodings, raw string tags, both host encodings and both aggregate states
 	valueKey := func(metric int32) *data_model.Key {
 		return &data_model.Key{Timestamp: goldenNow, Metric: metric}
 	}
@@ -384,12 +384,12 @@ func TestRowBinarySizeMatchesEncoding(t *testing.T) {
 		rows = append(rows, row)
 		row, _ = resolveMultiValueRow(rnd, valueKey(goldenMetricSkips), data_model.TagUnion{S: "string top"}, richTail(), 1, appendCtx, nil)
 		rows = append(rows, row)
-		// value-stat rows (badges, contributors log) have no sketches of their own
+		// value-stat rows (badges, contributors log) have no aggregate states of their own
 		row, _, _ = resolveValueStatRow(rnd, valueKey(format.BuiltinMetricIDBadges), data_model.SimpleItemValue(3.5, 2, data_model.TagUnion{I: goldenHostID}), appendCtx, nil)
 		rows = append(rows, row)
 	}
 	// and randomized rows exercising arbitrary tag strings, ids, hosts and
-	// sketch lengths (including empty sketches and empty hosts)
+	// aggregate-state lengths (including empty states and empty hosts)
 	randStr := func(maxLen int) string {
 		b := make([]byte, rnd.Intn(maxLen))
 		_, _ = rnd.Read(b)
@@ -540,8 +540,8 @@ func TestClickhouseSinkSend(t *testing.T) {
 	})
 }
 
-// TestInsertRowScratchIsolation guards the sink contract that a row's sketch
-// slices are valid only until the next append: the clickhouse sink copies them
+// TestInsertRowScratchIsolation guards the sink contract that a row's
+// aggregate-state slices are valid only until the next append: the clickhouse sink copies them
 // into the round body, so reusing one scratch buffer must not corrupt earlier
 // rows.
 func TestInsertRowScratchIsolation(t *testing.T) {
@@ -554,7 +554,7 @@ func TestInsertRowScratchIsolation(t *testing.T) {
 	scratch := make([]byte, 0, 1024) // pre-sized, so both rows provably resolve in one backing array
 	sink := newClickhouseSink(nil, "", "", "", getTableDesc(), func() string { return "" })
 
-	// two rows with different sketches, so overwriting the first row's bytes would show
+	// two rows with different aggregate states, so overwriting the first row's bytes would show
 	rich := func(value float64, unique uint64) *data_model.MultiValue {
 		v := &data_model.MultiValue{}
 		v.AddValueCounterHost(rand.New(goldenSeed), value, 3, data_model.TagUnion{I: 7})
@@ -572,7 +572,7 @@ func TestInsertRowScratchIsolation(t *testing.T) {
 	firstArray := &row.percentiles[0]
 	sink.AppendRow(&row)
 
-	// a second row through the same scratch rewrites the sketch slices
+	// a second row through the same scratch rewrites the aggregate-state slices
 	row, _ = resolveMultiValueRow(rnd, key, data_model.TagUnion{}, rich(9.75, 99), 1, appendCtx, scratch)
 	sink.AppendRow(&row)
 
@@ -584,7 +584,7 @@ func TestInsertRowScratchIsolation(t *testing.T) {
 	}
 	body := sinkRoundBody(sink)
 	if !bytes.Contains(body, firstP) || !bytes.Contains(body, firstU) {
-		t.Fatal("first row's sketch bytes were corrupted by the second append")
+		t.Fatal("first row's aggregate-state bytes were corrupted by the second append")
 	}
 }
 

@@ -129,16 +129,35 @@ func planStoreQuery(base tlstatshouse.StoreQueryBase) (*storeQueryPlan, error) {
 
 // layoutIndex resolves one tag reference against the request's layout. The
 // string top's flag alias names slot StringTopTagIndexV3, exactly as the
-// ClickHouse builder's colIntV3 does; anything else outside the layout is a
-// bad_request naming the offending reference.
+// ClickHouse builder's colIntV3 does. A reference inside the stored tag
+// columns but beyond the layout's kinds — a group-over-everything query
+// against a metric with fewer tags, or a metric-excluding query with no
+// layout at all — reads the plain tag and string columns, the way the
+// ClickHouse builder's writeSelectTagsV3 renders every grouped reference
+// unconditionally: every row carries all the columns, zero and the empty
+// string beyond its
+// metric's own tags, so the reference groups by a constant and changes
+// nothing. Anything outside [0, MaxTags) is a bad_request naming the
+// offending reference.
 func (p *storeQueryPlan) layoutIndex(x int32, what string) (int32, error) {
 	if x == format.StringTopTagIndex {
 		x = format.StringTopTagIndexV3
 	}
-	if x < 0 || int(x) >= format.MaxTags || int(x) >= len(p.base.TagLayout.Kinds) {
-		return 0, NewError(ErrCodeBadRequest, "%s tag %d is outside the tag layout of %d kinds", what, x, len(p.base.TagLayout.Kinds))
+	if x < 0 || int(x) >= format.MaxTags {
+		return 0, NewError(ErrCodeBadRequest, "%s tag %d is outside the %d stored tag columns", what, x, format.MaxTags)
 	}
 	return x, nil
+}
+
+// kindAt returns the layout kind of tag slot x, with the slots beyond the
+// layout's kinds reading as mapped tags: the tag-and-string column pair both
+// backends read for a reference the layout does not describe (see
+// layoutIndex).
+func (p *storeQueryPlan) kindAt(x int32) int32 {
+	if int(x) < len(p.base.TagLayout.Kinds) {
+		return p.base.TagLayout.Kinds[x]
+	}
+	return tagKindMapped
 }
 
 // seriesPlan is the validated form of one storeQuerySeries on top of its base.
@@ -219,7 +238,7 @@ func planSeriesQuery(args tlstatshouse.StoreQuerySeries) (*seriesPlan, error) {
 			stagExpr:  fmt.Sprintf("stag%d", x),
 			stagAlias: fmt.Sprintf("_stag%d", x),
 		}
-		switch kinds[x] {
+		switch p.kindAt(x) {
 		case tagKindMapped:
 			bc.stag = true
 		case tagKindRaw64:
@@ -451,7 +470,7 @@ func (p *storeQueryPlan) tagFilterPred(f tlstatshouse.StoreTagFilter, in bool, p
 	tagCol := fmt.Sprintf("tag%d", x)
 	stagCol := fmt.Sprintf("stag%d", x)
 	valueExpr := tagCol + "::BIGINT"
-	if kinds[x] == tagKindRaw64 {
+	if p.kindAt(x) == tagKindRaw64 {
 		if int(x)+1 >= format.MaxTags || int(x)+1 >= len(kinds) {
 			return "", NewError(ErrCodeBadRequest, "raw64 filter on tag %d has no high half in the tag layout", x)
 		}
@@ -460,13 +479,13 @@ func (p *storeQueryPlan) tagFilterPred(f tlstatshouse.StoreTagFilter, in bool, p
 
 	var arms []string
 	if f.IsSetMapped() && len(f.Mapped) > 0 {
-		if kinds[x] == tagKindRaw64 {
+		if p.kindAt(x) == tagKindRaw64 {
 			arms = append(arms, valueExpr+" = ANY("+param(f.Mapped)+")")
 		} else {
 			arms = append(arms, "list_contains("+param(f.Mapped)+", "+tagCol+"::BIGINT)")
 		}
 	}
-	if kinds[x] == tagKindMapped {
+	if p.kindAt(x) == tagKindMapped {
 		// the string half exists only for a mapped tag; a raw tag's stag
 		// column is unused and these arms are skipped, exactly as the
 		// ClickHouse builder skips them for raw tags
@@ -599,22 +618,27 @@ func (s *Store) withQuerySources(ctx context.Context, tier string, from, to int6
 	defer conn.Close()
 
 	// The alias is unique to this query, so two concurrent queries attaching
-	// windows to the shared delta instance never collide on a name.
+	// windows to the shared delta instance never collide on a name. Every
+	// alias is assigned and the DETACH defer registered before the first
+	// ATTACH runs, so a failed or cancelled attach still detaches the ones
+	// that made it — a leftover attachment would hold the window's file open
+	// on this pooled connection and make every later attach of the same file
+	// to it fail. Detaching an alias that never attached is a harmless
+	// ignored error.
 	seq := queryAliasSeq.Add(1)
 	for i := range wins {
-		alias := fmt.Sprintf("q%d_a%d", seq, i)
-		if _, err := conn.ExecContext(ctx, fmt.Sprintf("ATTACH %s AS %s (READ_ONLY)", sqlString(wins[i].path), alias)); err != nil {
-			return fmt.Errorf("duck-store: attach %s for store query: %w", wins[i].path, err)
-		}
-		wins[i].alias = alias
+		wins[i].alias = fmt.Sprintf("q%d_a%d", seq, i)
 	}
 	defer func() {
 		for i := range wins {
-			if wins[i].alias != "" {
-				_, _ = conn.ExecContext(context.Background(), "DETACH "+wins[i].alias)
-			}
+			_, _ = conn.ExecContext(context.Background(), "DETACH "+wins[i].alias)
 		}
 	}()
+	for i := range wins {
+		if _, err := conn.ExecContext(ctx, fmt.Sprintf("ATTACH %s AS %s (READ_ONLY)", sqlString(wins[i].path), wins[i].alias)); err != nil {
+			return fmt.Errorf("duck-store: attach %s for store query: %w", wins[i].path, err)
+		}
+	}
 
 	sources := make([]string, 0, len(wins)+1)
 	sources = append(sources, "") // the delta is the connection's own database
@@ -662,7 +686,7 @@ type seriesScanRow struct {
 }
 
 // scanSeriesRows consumes the query's rows into the response, folding the two
-// sketch columns per row and cutting batches at the target size. LIMIT
+// aggregate-state columns per row and cutting batches at the target size. LIMIT
 // row_limit+1 ran query-side: an extra row means truncation, and the whole
 // call fails with row_limit rather than return — and let the API cache — a
 // partial series result.

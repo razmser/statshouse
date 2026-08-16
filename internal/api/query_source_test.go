@@ -617,21 +617,35 @@ func TestInvalidateCacheThroughQuerySource(t *testing.T) {
 }
 
 func TestNewQuerySourceSelection(t *testing.T) {
-	require.Equal(t, chQuerySource{}, newQuerySource(duckstore.BackendClickHouse, nil, "", nil))
+	require.Equal(t, chQuerySource{}, newQuerySource(duckstore.BackendClickHouse, duckQuerySourceConfig{}))
 
-	duck := newQuerySource(duckstore.BackendDuck, nil, "", nil)
+	duck := newQuerySource(duckstore.BackendDuck, duckQuerySourceConfig{})
 	require.ErrorIs(t, duck.querySeries(context.Background(), nil, &seriesDataQuery{}, data_model.LOD{}, func(tsSelectRow) error { return nil }), errDuckQuerySourceMisconfigured)
 	require.ErrorIs(t, duck.queryTagValues(context.Background(), nil, &tagValuesDataQuery{}, data_model.LOD{}, func(selectRow) error { return nil }), errDuckQuerySourceMisconfigured)
 
 	// duck with shard addresses builds the fan-out source, sorted by shard
-	// number, with the shard-set modulus derived from them
-	src := newQuerySource(duckstore.BackendDuck, map[uint32]string{3: "s3:9099", 1: "s1:9099"}, "", nil)
+	// number; the routing modulus comes from the API's shard count (a bare
+	// zero, as tests building a source without validation pass it, falls
+	// back to the highest address)
+	src := newQuerySource(duckstore.BackendDuck, duckQuerySourceConfig{addrs: map[uint32]string{3: "s3:9099", 1: "s1:9099"}})
 	fan, ok := src.(*duckQuerySource)
 	require.True(t, ok)
 	require.Len(t, fan.clients, 2)
 	require.Equal(t, uint32(1), fan.clients[0].shardNum())
 	require.Equal(t, uint32(3), fan.clients[1].shardNum())
 	require.Equal(t, 3, fan.numShards)
+
+	// an explicit count overrides the address set's size: three configured
+	// shards of a sixteen-shard routing modulus — pruning must shard by
+	// metric_id % 16, exactly where the aggregator cluster put the data
+	src = newQuerySource(duckstore.BackendDuck, duckQuerySourceConfig{
+		addrs:     map[uint32]string{1: "s1:9099", 2: "s2:9099", 3: "s3:9099"},
+		numShards: 16,
+	})
+	fan, ok = src.(*duckQuerySource)
+	require.True(t, ok)
+	require.Equal(t, 16, fan.numShards)
+	require.Len(t, fan.clients, 3)
 
 	// handlers without a configured source fall back to ClickHouse
 	require.Equal(t, chQuerySource{}, (&requestHandler{}).querySource())

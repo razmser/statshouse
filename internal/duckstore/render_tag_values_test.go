@@ -10,6 +10,7 @@ package duckstore
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -287,12 +288,10 @@ func TestRenderTagValuesValidation(t *testing.T) {
 	}{
 		{"step not a LOD step", func(q *tlstatshouse.StoreQueryTagValues) { q.Base.Lod.StepSec = 7 },
 			"step_sec 7 is not a LOD step"},
-		{"tag outside layout", func(q *tlstatshouse.StoreQueryTagValues) { q.TagIndex = 16 },
-			"tag values on tag 16 is outside the tag layout of 2 kinds"},
+		{"tag beyond the stored columns", func(q *tlstatshouse.StoreQueryTagValues) { q.TagIndex = format.MaxTags },
+			fmt.Sprintf("tag values on tag %d is outside the %d stored tag columns", format.MaxTags, format.MaxTags)},
 		{"shard tag", func(q *tlstatshouse.StoreQueryTagValues) { q.TagIndex = format.ShardTagIndex },
 			"the shard tag is not a stored tag"},
-		{"string top without its slot", func(q *tlstatshouse.StoreQueryTagValues) { q.TagIndex = format.StringTopTagIndex },
-			"outside the tag layout"},
 		{"unknown layout kind", func(q *tlstatshouse.StoreQueryTagValues) {
 			q.Base.TagLayout.Kinds = []int32{5, 0}
 		}, "tag layout kind 5 at index 0 is not mapped, raw32 or raw64"},
@@ -303,11 +302,11 @@ func TestRenderTagValuesValidation(t *testing.T) {
 			q.Base.TagLayout.Kinds = []int32{tagKindMapped, tagKindRaw64}
 			q.TagIndex = 1
 		}, "raw64 tag 1 has no high half in the tag layout"},
-		{"filter outside layout", func(q *tlstatshouse.StoreQueryTagValues) {
-			f := tlstatshouse.StoreTagFilter{TagIndex: 9}
+		{"filter beyond the stored columns", func(q *tlstatshouse.StoreQueryTagValues) {
+			f := tlstatshouse.StoreTagFilter{TagIndex: format.MaxTags + 7}
 			f.SetMapped([]int64{1})
 			q.Base.FilterIn = []tlstatshouse.StoreTagFilter{f}
-		}, "filter on tag 9 is outside the tag layout"},
+		}, fmt.Sprintf("filter on tag %d is outside the %d stored tag columns", format.MaxTags+7, format.MaxTags)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -26,7 +26,7 @@ import (
 	"github.com/VKCOM/statshouse/internal/format"
 )
 
-// partialRow builds one partial row carrying real sketch states, so it
+// partialRow builds one partial row carrying real aggregate states, so it
 // survives the fold (testRow's placeholder bytes would not).
 func partialRow(t *testing.T, metric int32, ts uint32) Row {
 	t.Helper()
@@ -120,7 +120,7 @@ func (h hostPairDecoded) empty() bool { return h.id == 0 && h.s == "" }
 // decodedGroup is one key's aggregates the way a query decodes them: the
 // numerics folded, the hosts resolved by their skewed state values with empty
 // hosts losing the way ClickHouse's empty argMin/argMax states do, and the
-// sketches merged from their decoded states.
+// aggregate states merged from their decoded states.
 type decodedGroup struct {
 	rows int
 
@@ -207,7 +207,7 @@ func decodeRows(t *testing.T, rows []rawRow) map[decodedKey]*decodedGroup {
 }
 
 // requireSameDecoded compares a collapsed read against the uncollapsed
-// reference: exact for the numerics, banded for the sketches.
+// reference: exact for the numerics, banded for the aggregate states.
 func requireSameDecoded(t *testing.T, want, got map[decodedKey]*decodedGroup) {
 	t.Helper()
 	require.Len(t, got, len(want), "every key must survive the collapse")
@@ -235,7 +235,7 @@ func requireSameDecoded(t *testing.T, want, got map[decodedKey]*decodedGroup) {
 }
 
 // compactFixture writes three partial rows of one key and one row of another,
-// all with real sketch states, and returns nothing: the expected decoded view
+// all with real aggregate states, and returns nothing: the expected decoded view
 // is read off the delta before compaction runs.
 func writeCollapseFixture(t *testing.T, s *Store, w *Writer) {
 	t.Helper()
@@ -268,7 +268,7 @@ func writeCollapseFixture(t *testing.T, s *Store, w *Writer) {
 	a3.MaxHost = HostPair{Tag: HostTag{S: "hostD"}, Value: 7}
 	a3.MaxCountHost = HostPair{}
 
-	// a value-stat row: empty sketches, no hosts
+	// a value-stat row: empty aggregate states, no hosts
 	b := partialRow(t, testMetricID2, now-5)
 	b.Count, b.Min, b.Max, b.Sum, b.SumSquare = 2, 1, 2, 3, 5
 	b.Percentiles = nil
@@ -297,7 +297,7 @@ func expectedRows(t *testing.T, db *sql.DB, tier string) map[decodedKey]*decoded
 // TestCompactionCollapseMatchesUncollapsedRead proves the load-bearing
 // property: a collapsed archive window decodes to exactly what the uncollapsed
 // delta rows decoded to — every partial row counted once, hosts resolved by
-// their skewed state values, sketches folded — in all three tiers.
+// their skewed state values, aggregate states folded — in all three tiers.
 func TestCompactionCollapseMatchesUncollapsedRead(t *testing.T) {
 	s, w := newTestWriter(t)
 	writeCollapseFixture(t, s, w)

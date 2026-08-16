@@ -406,8 +406,9 @@ exec /statshouse-agg \
 // metadata/aggregator container IPs. The storage flags branch on the backend:
 // under clickhouse the api reads ClickHouse directly (`--clickhouse-v2-addrs`),
 // under duck it fans every query out to the aggregator's store-query listener
-// (`--storage-backend=duck` + `--duck-shard-query-addrs`, the same single
-// shard the aggregator owns, numbered 1).
+// (`--storage-backend=duck` + `--duck-shard-query-addrs` + the matching
+// `--shard-by-metric-shards=1`, the same single shard the aggregator owns,
+// numbered 1).
 func apiDaemonFlags(o daemonStackOpts, metaIP, aggIP string) []string {
 	flags := []string{
 		"--local-mode",
@@ -427,7 +428,11 @@ func apiDaemonFlags(o daemonStackOpts, metaIP, aggIP string) []string {
 	if o.backend == backendDuck {
 		flags = append(flags,
 			"--storage-backend=duck",
-			"--duck-shard-query-addrs=1="+storeQueryAddr(aggIP))
+			"--duck-shard-query-addrs=1="+storeQueryAddr(aggIP),
+			// the single-shard cluster routes by metric_id % 1; the API's
+			// copy of the count must match or startup refuses the mismatch
+			// between the default 16 and the one configured address
+			"--shard-by-metric-shards=1")
 	} else {
 		chV2 := strings.TrimSuffix(strings.Repeat(o.chIP+":9000,", 3), ",") // <ch-ip>:9000 three times (cluster config shape)
 		flags = append(flags, "--clickhouse-v2-addrs="+chV2)

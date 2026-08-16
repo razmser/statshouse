@@ -47,14 +47,16 @@ statshouse-agg \
 
 statshouse-api \
   --storage-backend=duck \
-  --duck-shard-query-addrs=1=agg1.example.com:9404
+  --duck-shard-query-addrs=1=agg1.example.com:9404 \
+  --shard-by-metric-shards=1
 ```
 
 Under duck there is no ClickHouse cluster to autodetect, so the shard and
 replica numbers come from `--local-shard` / `--local-replica` instead. For
 several shards, list every shard's query address in
 `--duck-shard-query-addrs` as comma-separated `shard=host:port` pairs with
-1-based shard numbers.
+1-based shard numbers, and copy the aggregator cluster's shard count into
+`--shard-by-metric-shards` — the routing modulus the query side prunes by.
 
 On the API, `--clickhouse-v2-addrs` is a ClickHouse-backend flag: under duck
 it is not required (the API substitutes an internal placeholder address for
@@ -75,9 +77,14 @@ Two caveats for sharded installs:
   before the resize live on their old shard while the API prunes queries to
   the new one, so old data answers as missing until retention expires it.
   Changing the shard count is a fresh-start operation.
-- the API derives the shard count from the highest shard number configured in
-  `--duck-shard-query-addrs`, so that list must cover every shard of the
-  cluster, not a subset.
+- the API routes by the `--shard-by-metric-shards` copy of the aggregator
+  cluster's count, so `--duck-shard-query-addrs` must cover shards `1..N` of
+  that count — listing fewer fails at startup, because by-metric-id data
+  lands on a shard with no address (the default count is 16; a single-shard
+  install passes `--shard-by-metric-shards=1`). Listing more than the count
+  is fine: the cluster may hold shards beyond the modulus, and fixed-shard
+  metrics and fan-outs still read them. The numbering must also be contiguous
+  from 1: a gap (say `1=...,3=...`) fails at startup.
 
 Nonsensical combinations fail at startup with a message naming the offending
 flags: `--kh` with duck, duck without `--duck-store-dir` or
@@ -109,9 +116,9 @@ background compactor moves delta rows into the archive window their own
 timestamp belongs to; a window is *sealed* (rewritten into one sorted run,
 reopened read-only) at window end plus 48 hours; retention then removes whole
 window files. Rows older than the historic window (48 hours) are dropped at
-write time: a window freezes at its end plus the historic window, so an older
+write time: a window seals at its end plus the historic window, so an older
 row could only target a sealed window. This is tighter than ClickHouse's
-materialized-view guard (three days), which does not freeze windows.
+materialized-view guard (three days), which does not seal windows.
 
 ## Retention
 
@@ -153,9 +160,9 @@ with the same meaning, operators already use on ClickHouse.
 
 **Caveat:** the `duck_bytes_per_rowbinary_byte` constant is **unmeasured**.
 The ~10 bytes-per-row figure behind it came from synthetic rows with no
-percentile or unique sketch payloads. Do not capacity-plan against this
+percentile or unique aggregate-state payloads. Do not capacity-plan against this
 formula until the constant has been measured against the real wide schema
-with realistic sketch states; until then treat the formula's output as a
+with realistic aggregate states; until then treat the formula's output as a
 lower bound.
 
 ## Resource flags

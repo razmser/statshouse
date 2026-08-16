@@ -126,7 +126,7 @@ func TestSealRewritesRunsIntoOnePreservingDecodedContents(t *testing.T) {
 	}
 }
 
-// TestSealedFileRejectsWrites proves the freeze at both levels: the read-only
+// TestSealedFileRejectsWrites proves the seal at both levels: the read-only
 // handle the store reopens through refuses an INSERT, and the consume
 // protocol drops a late round for a sealed window loudly instead of
 // corrupting the window — or wedging consumption on rows it can never place.

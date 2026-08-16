@@ -235,8 +235,11 @@ func (s *Store) Quarantined() []QuarantineInfo {
 
 // openDeltas scans delta-<generation>.duckdb files, quarantines the ones the
 // running binary cannot vouch for, finishes unlinking the generations whose
-// archives already record them as consumed, resumes the newest valid
-// generation and — only when none is valid — creates the next fresh one.
+// archives already record them as consumed, resumes the physically newest
+// generation as active when it is valid, and otherwise — the newest was
+// quarantined or unlinked, so every survivor was already sealed by a roll —
+// keeps the survivors for consumption to resume on and creates the next
+// fresh generation as active.
 func (s *Store) openDeltas() error {
 	entries, err := os.ReadDir(s.cfg.Dir)
 	if err != nil {
@@ -264,29 +267,40 @@ func (s *Store) openDeltas() error {
 
 	// Every generation but the newest was sealed by a roll, so its rows are
 	// on their way into archive windows: unlink the ones already recorded as
-	// consumed, keep the rest for consumption to resume on. The newest
-	// resumes as the active generation — a generation still being written
-	// cannot have been consumed.
+	// consumed, keep the rest for consumption to resume on. The one exempt
+	// from that fate is the physically newest generation on disk (maxSeen,
+	// whatever became of it): a generation still being written cannot have
+	// been consumed, so it resumes as the active one. When no valid
+	// generation is the physically newest — the newest was quarantined or
+	// already unlinked — every survivor was sealed by a roll before it: none
+	// of them resumes active (writes into a rolled-off, possibly
+	// half-consumed file would re-serve rows its windows already hold), they
+	// all wait for consumption, and a fresh generation takes over.
 	deltas := make([]int64, 0, len(valid))
-	for i, gen := range valid {
-		if i != len(valid)-1 && s.unlinkDeltaIfConsumed(gen) {
+	resumed := false
+	for _, gen := range valid {
+		if gen != maxSeen && s.unlinkDeltaIfConsumed(gen) {
 			continue
+		}
+		if gen == maxSeen {
+			resumed = true
 		}
 		deltas = append(deltas, gen)
 	}
-	s.deltas = deltas
 
-	if len(s.deltas) == 0 {
-		// Every generation present was quarantined or consumed (or the
-		// directory is fresh). Start the next generation number so a
-		// quarantined or consumed file is never reused or shadowed.
+	if !resumed {
+		// No valid generation is the physically newest one — every survivor
+		// was sealed by a roll, or nothing survived. Start the next
+		// generation number so a quarantined, consumed or shadowed file is
+		// never reused.
 		gen := maxSeen + 1
 		path := filepath.Join(s.cfg.Dir, deltaFileName(gen))
 		if err := createFile(path, allTierTables(), s.currentStamp(), s.cfg.Resources); err != nil {
 			return fmt.Errorf("duck-store: %w", err)
 		}
-		s.deltas = append(s.deltas, gen)
+		deltas = append(deltas, gen)
 	}
+	s.deltas = deltas
 
 	// Resume the newest valid generation: writes go to it, older ones wait
 	// for consumption to take them.
@@ -336,6 +350,21 @@ func (s *Store) stampMismatchAxis(st stamp) QuarantineAxis {
 	}
 }
 
+// staleWindowTemp reports whether name is a leftover temporary of a window
+// file this store creates: an archive window name under the .tmp suffix
+// createArchiveWindow builds with, or the write-ahead log DuckDB may leave
+// next to it. Foreign files ending in .tmp do not match — the store never
+// creates them and must not delete them.
+func staleWindowTemp(name string) bool {
+	for _, suffix := range []string{windowTmpSuffix + ".wal", windowTmpSuffix} {
+		if base, ok := strings.CutSuffix(name, suffix); ok {
+			_, _, isWindow := parseArchiveFileName(base)
+			return isWindow
+		}
+	}
+	return false
+}
+
 // scanArchives verifies the version stamp of every archive window file,
 // keeping the valid ones for queries with their consumed-generations records,
 // and quarantining the rest.
@@ -346,6 +375,23 @@ func (s *Store) scanArchives() error {
 	}
 	for _, e := range entries {
 		if e.IsDir() {
+			continue
+		}
+		// A window file mid-creation (createArchiveWindow builds under a
+		// temporary name): a leftover can only come from a crashed attempt,
+		// whose retry rebuilds it from scratch, so sweep it here instead of
+		// letting it linger next to the window it never became. Only names
+		// this store could have created — an archive window name under the
+		// temporary suffix: the archive directory tolerates foreign files
+		// everywhere else, and an unrelated operator file ending in .tmp is
+		// not the store's to delete. A failed removal is logged, not fatal:
+		// the retry path clears the stale temporary itself, so a failed sweep
+		// only leaves the leftover where it lies.
+		if staleWindowTemp(e.Name()) {
+			path := filepath.Join(s.cfg.Dir, archiveSubdir, e.Name())
+			if err := os.Remove(path); err != nil {
+				s.cfg.Logf("[error] duck-store: failed to remove stale temporary %s: %v", path, err)
+			}
 			continue
 		}
 		tier, windowStart, ok := parseArchiveFileName(e.Name())
@@ -490,13 +536,22 @@ func openStoreFile(path string, readOnly bool, res ResourcesConfig) (*sql.DB, er
 // created the same way, so every file the store owns carries the same stamp
 // and the same metadata. The database is closed again; callers open it through
 // their own handle. A file already stamped by this binary is left as it was,
-// so re-running against a leftover is harmless.
+// so re-running against a leftover is harmless. When it returns successfully,
+// the schema and stamp are checkpointed into the main file itself, so no
+// write-ahead log needs to survive alongside it.
 func createFile(path string, tables []string, st stamp, res ResourcesConfig) error {
 	db, err := openStoreFile(path, false, res)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
+	// DuckDB would flush the log on close anyway, but silently: a
+	// shutdown-checkpoint failure (disk full, I/O error) cannot stop the
+	// publication. Disable it, so the explicit checkpoint below is the one
+	// flush that happens and its failure is the only way this can end.
+	if _, err := db.Exec("PRAGMA disable_checkpoint_on_shutdown"); err != nil {
+		return fmt.Errorf("disable shutdown checkpoint of %s: %w", path, err)
+	}
 	tx, err := db.Begin()
 	if err != nil {
 		return err
@@ -533,6 +588,18 @@ func createFile(path string, tables []string, st stamp, res ResourcesConfig) err
 	}
 	if err := tx.Commit(); err != nil {
 		return err
+	}
+	// The commit lands in the write-ahead log, and the shutdown checkpoint
+	// is disabled above — so this explicit checkpoint is what moves the
+	// schema and the stamp into the main file. Archive-window creation
+	// renames the file into place and discards the temporary's log, so a
+	// schema that still lived only in the log would be published tableless
+	// at the final path — where the consume path's existence check skips
+	// rebuilding it forever. Checkpointing here lets a failure (disk full,
+	// I/O error) stop the publication; the leftover temporary pair is
+	// removed and rebuilt by the next attempt.
+	if _, err := db.Exec("CHECKPOINT"); err != nil {
+		return fmt.Errorf("checkpoint %s: %w", path, err)
 	}
 	return nil
 }

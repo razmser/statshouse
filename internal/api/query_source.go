@@ -63,15 +63,14 @@ type tagValuesDataQuery struct {
 	utcOffset   int64
 }
 
-// newQuerySource picks the QuerySource for the configured storage backend.
-// The duck backend needs the per-shard query addresses, the RPC crypto key
-// their handshakes present, and the metrics journal for its mismatch retry.
+// newQuerySource picks the QuerySource for the configured storage backend;
+// duck carries everything the duck source needs (see duckQuerySourceConfig).
 // Startup validation rejects duck without addresses, so the stub below is a
 // defensive backstop for a handler built bypassing validation — it reports
 // the misconfiguration per query instead of answering empty.
-func newQuerySource(backend duckstore.StorageBackend, duckAddrs map[uint32]string, duckCryptoKey string, journal metricsStorageRef) QuerySource {
+func newQuerySource(backend duckstore.StorageBackend, duck duckQuerySourceConfig) QuerySource {
 	if backend == duckstore.BackendDuck {
-		if src := newDuckQuerySource(duckAddrs, duckCryptoKey, journal); src != nil {
+		if src := newDuckQuerySource(duck); src != nil {
 			return src
 		}
 		return duckQuerySourceMisconfigured{}

@@ -268,12 +268,14 @@ func TestAggRunScriptClickHouseFlags(t *testing.T) {
 
 // TestAPIDaemonFlagsDuck pins the duck api wiring: the api reads through the
 // aggregator's store-query listener (shard 1 = the single agg the stack runs)
-// instead of ClickHouse.
+// instead of ClickHouse, and declares the matching by-metric-id shard count —
+// the api's --duck-shard-query-addrs must cover the count's shards.
 func TestAPIDaemonFlagsDuck(t *testing.T) {
 	flags := strings.Join(apiDaemonFlags(testStackOpts(backendDuck), "10.77.0.2", "10.77.0.3"), " ")
 	for _, want := range []string{
 		"--storage-backend=duck",
 		"--duck-shard-query-addrs=1=10.77.0.3:" + strconv.Itoa(aggQueryPort),
+		"--shard-by-metric-shards=1",
 	} {
 		if !strings.Contains(flags, want) {
 			t.Errorf("duck api flags missing %q\ngot: %s", want, flags)

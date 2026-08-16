@@ -295,7 +295,7 @@ func newDuckSink(w *duckstore.Writer) *duckSink {
 	return &duckSink{writer: w}
 }
 
-// AppendRow converts one resolved row and copies its sketch bytes (the
+// AppendRow converts one resolved row and copies its aggregate-state bytes (the
 // conveyor reuses the scratch they were encoded into), reporting the row's
 // RowBinary size so the insertSize accounting matches the ClickHouse sink's.
 func (s *duckSink) AppendRow(row *insertRow) int {

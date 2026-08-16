@@ -612,16 +612,21 @@ func NewHandler(staticDir fs.FS, jsSettings JSSettings, showInvisible bool, chV2
 		mappingsTracker = mappings_tracker.New()
 	}
 	h := &Handler{
-		HandlerOptions:        opt,
-		showInvisible:         showInvisible,
-		staticDir:             http.FS(staticDir),
-		indexTemplate:         tmpl,
-		indexSettings:         string(settings),
-		metadataLoader:        metadataLoader,
-		mappingsStorage:       mappingsStorage,
-		mappingsTracker:       mappingsTracker,
-		ch:                    chV2,
-		querySource:           newQuerySource(cfg.StorageBackend, cfg.DuckShardQueryAddrs, cfg.DuckQueryRPCCryptoKey, metricStorage),
+		HandlerOptions:  opt,
+		showInvisible:   showInvisible,
+		staticDir:       http.FS(staticDir),
+		indexTemplate:   tmpl,
+		indexSettings:   string(settings),
+		metadataLoader:  metadataLoader,
+		mappingsStorage: mappingsStorage,
+		mappingsTracker: mappingsTracker,
+		ch:              chV2,
+		querySource: newQuerySource(cfg.StorageBackend, duckQuerySourceConfig{
+			addrs:     cfg.DuckShardQueryAddrs,
+			numShards: cfg.ShardByMetricShards,
+			cryptoKey: cfg.DuckQueryRPCCryptoKey,
+			journal:   metricStorage,
+		}),
 		metricsStorage:        metricStorage,
 		selectSettings:        cfg.BuildSelectSettings(),
 		blockedMetricPrefixes: cfg.BlockedMetricPrefixes,
@@ -858,21 +863,28 @@ func (h *Handler) invalidateCache(ctx context.Context, from int64, seen map[cach
 	return from, newSeen
 }
 
+// blockedQueryError applies the blocked-metric-prefix and blocked-user policy
+// to one query, returning the bad-request refusal the policy maps to, or nil
+// when the query is allowed. The ClickHouse path runs it in doSelect; the
+// duck path runs it before fanning a query out — both over the same pair the
+// ClickHouse query metadata carried (the addressed metric's name and the
+// requesting user), so the two backends refuse the same queries.
+func (h *requestHandler) blockedQueryError(metricName, user string) error {
+	h.Handler.ConfigMu.RLock()
+	defer h.Handler.ConfigMu.RUnlock()
+	for _, prefix := range h.blockedMetricPrefixes {
+		if strings.HasPrefix(metricName, prefix) {
+			return httpErr(http.StatusBadRequest, fmt.Errorf("metric %q is blocked", metricName))
+		}
+	}
+	if slices.Contains(h.blockedUsers, user) {
+		return httpErr(http.StatusBadRequest, fmt.Errorf("user %q is blocked", user))
+	}
+	return nil
+}
+
 func (h *requestHandler) doSelect(ctx context.Context, meta chutil.QueryMetaInto, query ch.Query) error {
-	err := func() error {
-		h.Handler.ConfigMu.RLock()
-		defer h.Handler.ConfigMu.RUnlock()
-		for _, prefix := range h.blockedMetricPrefixes {
-			if strings.HasPrefix(meta.Metric.Name, prefix) {
-				return httpErr(http.StatusBadRequest, fmt.Errorf("metric %q is blocked", meta.Metric.Name))
-			}
-		}
-		if slices.Contains(h.blockedUsers, meta.User) {
-			return httpErr(http.StatusBadRequest, fmt.Errorf("user %q is blocked", meta.User))
-		}
-		return nil
-	}()
-	if err != nil {
+	if err := h.blockedQueryError(meta.Metric.Name, meta.User); err != nil {
 		return err
 	}
 
