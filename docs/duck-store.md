@@ -108,8 +108,10 @@ before contributors are acked, exactly as a ClickHouse 200 does today. A
 background compactor moves delta rows into the archive window their own
 timestamp belongs to; a window is *sealed* (rewritten into one sorted run,
 reopened read-only) at window end plus 48 hours; retention then removes whole
-window files. Rows older than three days are dropped at write time, matching
-ClickHouse's materialized-view guard.
+window files. Rows older than the historic window (48 hours) are dropped at
+write time: a window freezes at its end plus the historic window, so an older
+row could only target a sealed window. This is tighter than ClickHouse's
+materialized-view guard (three days), which does not freeze windows.
 
 ## Retention
 
@@ -205,8 +207,9 @@ diagnosed from StatsHouse:
 - `__duck_store_maintenance_time` — duration of compaction, sealing and
   retention passes, by kind and outcome.
 - `__duck_store_windows` — archive windows acted on: sealed, unlinked,
-  **early-evicted** (the watermark shortening history) or unlink-deferred by
-  a reader's lease, per tier.
+  **early-evicted** (the watermark shortening history), unlink-deferred by
+  a reader's lease, or **late-dropped** (a consume found the window already
+  sealed and dropped that generation's rows for it), per tier.
 - `__duck_store_quarantined_files` — quarantined file count per reason axis.
 - `__duck_store_query_time` — store-query latency and errors per verb
   (series, tag values) — the query load.

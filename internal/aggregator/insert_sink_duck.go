@@ -174,6 +174,8 @@ func duckWindowEventTag(kind duckstore.WindowEventKind) int32 {
 		return format.TagValueIDDuckWindowEarlyEvicted
 	case duckstore.WindowLeaseDeferred:
 		return format.TagValueIDDuckWindowLeaseDeferred
+	case duckstore.WindowLateDropped:
+		return format.TagValueIDDuckWindowLateDropped
 	}
 	return 0
 }

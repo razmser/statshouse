@@ -22,10 +22,10 @@ import (
 )
 
 // agedWindowsFixture writes one row at each age — seconds back from the
-// frozen writer clock, all inside the three-day ingest guard — and compacts
-// them, so each tier holds one archive window per distinct age bucket: three
-// hourly 1s windows, three daily 1m windows and (50 h all within one 30-day
-// span) a single 1h window.
+// frozen writer clock, all inside the historic-window ingest guard — and
+// compacts them, so each tier holds one archive window per distinct age
+// bucket: three hourly 1s windows, three daily 1m windows and (47 h all
+// within one 30-day span) a single 1h window.
 func agedWindowsFixture(t *testing.T, ages ...int64) *Store {
 	t.Helper()
 	s, w := newTestWriter(t)
@@ -89,7 +89,7 @@ func windowPath(s *Store, tier string, windowStart int64) string {
 // every 1s window (52 h retention) and every 1m window (33 d) is unlinked —
 // file and served entry both — while the 1h window (unbounded) survives.
 func TestRetainerUnlinksExpiredWindows(t *testing.T) {
-	s := agedWindowsFixture(t, 5, 26*3600, 50*3600)
+	s := agedWindowsFixture(t, 5, 26*3600, 47*3600)
 	now := writerNowUnix
 	h1 := testWindowStart(Tier1h, now-5)
 
@@ -119,7 +119,7 @@ func TestRetainerUnlinksExpiredWindows(t *testing.T) {
 // its own flag-shaped knob: with only the 1h tier bounded, sixty days on,
 // exactly the 1h window goes while the unbounded tiers keep every window.
 func TestRetainerRetentionIsPerTierConfigurable(t *testing.T) {
-	s := agedWindowsFixture(t, 5, 26*3600, 50*3600)
+	s := agedWindowsFixture(t, 5, 26*3600, 47*3600)
 	now := writerNowUnix
 	h1 := testWindowStart(Tier1h, now-5)
 
@@ -143,7 +143,7 @@ func TestRetainerRetentionIsPerTierConfigurable(t *testing.T) {
 // reader holds survives the pass that expired it, the pass after the reader
 // finishes takes it, and a window that is no longer served leases nothing.
 func TestRetainerLeaseDefersUnlink(t *testing.T) {
-	s := agedWindowsFixture(t, 5, 26*3600, 50*3600)
+	s := agedWindowsFixture(t, 5, 26*3600, 47*3600)
 	now := writerNowUnix
 	leased := testWindowStart(Tier1s, now-26*3600)
 
@@ -179,7 +179,7 @@ func TestRetainerLeaseDefersUnlink(t *testing.T) {
 // windows by window end, earliest data first, until space recovers — and
 // every eviction is reported as early.
 func TestRetainerLowWatermarkEvictsOldestFirst(t *testing.T) {
-	s := agedWindowsFixture(t, 5, 26*3600, 50*3600)
+	s := agedWindowsFixture(t, 5, 26*3600, 47*3600)
 
 	const watermark = uint64(1 << 20)
 	const keep = 2 // free space recovers once this many windows remain
@@ -224,10 +224,10 @@ func TestRetainerRunsAlongsideIngestion(t *testing.T) {
 	s, w := newTestWriter(t)
 	now := uint32(writerNowUnix)
 
-	// a row 50 hours old: its 1s window is past the 52 h retention under the
-	// retainer's clock, its 1m and 1h windows are not — written and consumed
-	// before the loops start
-	const oldAge = 50 * 3600
+	// a row 40 hours old — near the ingest guard's historic-window bound: its
+	// 1s window is past the 52 h retention under the retainer's clock, its 1m
+	// and 1h windows are not — written and consumed before the loops start
+	const oldAge = 40 * 3600
 	old := partialRow(t, testMetricID, now-oldAge)
 	old.Count, old.Sum = 2, 20
 	require.NoError(t, w.WriteRound(context.Background(), []Row{old}))
@@ -236,8 +236,8 @@ func TestRetainerRunsAlongsideIngestion(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	// the spec defaults under a clock four hours past the writer clock: past
-	// the old 1s window's boundary, nowhere near the fresh windows'
+	// the spec defaults under a clock thirteen hours past the writer clock:
+	// past the old 1s window's boundary, nowhere near the fresh windows'
 	cfg := RetentionConfig{
 		Retention1s:        DefaultRetention1s,
 		Retention1m:        DefaultRetention1m,
@@ -245,7 +245,7 @@ func TestRetainerRunsAlongsideIngestion(t *testing.T) {
 		FreeSpaceWatermark: DefaultFreeSpaceWatermark,
 	}
 	cfg.Interval = 10 * time.Millisecond
-	cfg.NowFunc = func() time.Time { return time.Unix(int64(now)+4*3600, 0) }
+	cfg.NowFunc = func() time.Time { return time.Unix(int64(now)+13*3600, 0) }
 	events := &recordingMetrics{}
 	cfg.Metrics = events
 	retainer := NewRetainer(s, cfg)
@@ -312,7 +312,7 @@ func TestRetainerRunsAlongsideIngestion(t *testing.T) {
 // TestRetainerUnboundedRetentionKeepsEverything pins the zero-retention
 // meaning: no clock, however far ahead, unlinks an unbounded tier's windows.
 func TestRetainerUnboundedRetentionKeepsEverything(t *testing.T) {
-	s := agedWindowsFixture(t, 5, 26*3600, 50*3600)
+	s := agedWindowsFixture(t, 5, 26*3600, 47*3600)
 	before := s.Windows()
 
 	m := &recordingMetrics{}
@@ -360,7 +360,7 @@ func TestRetainerFreeSpaceProbeFailures(t *testing.T) {
 	const watermark = uint64(1 << 20)
 
 	t.Run("first_probe_fails", func(t *testing.T) {
-		s := agedWindowsFixture(t, 5, 26*3600, 50*3600)
+		s := agedWindowsFixture(t, 5, 26*3600, 47*3600)
 		before := len(s.Windows())
 		retainer := NewRetainer(s, RetentionConfig{
 			FreeSpaceWatermark: watermark,
@@ -372,7 +372,7 @@ func TestRetainerFreeSpaceProbeFailures(t *testing.T) {
 	})
 
 	t.Run("remeasure_fails_after_one_eviction", func(t *testing.T) {
-		s := agedWindowsFixture(t, 5, 26*3600, 50*3600)
+		s := agedWindowsFixture(t, 5, 26*3600, 47*3600)
 		before := len(s.Windows())
 		calls := 0
 		retainer := NewRetainer(s, RetentionConfig{
@@ -415,7 +415,7 @@ func TestRetainerLowWatermarkNothingLeftToEvict(t *testing.T) {
 // non-empty directory) stays served — the next pass retries — and once the
 // obstacle is gone the window leaves normally.
 func TestDropWindowUnlinkFailureRestoresService(t *testing.T) {
-	s := agedWindowsFixture(t, 5, 26*3600, 50*3600)
+	s := agedWindowsFixture(t, 5, 26*3600, 47*3600)
 	wf := findWindow(t, s, Tier1s, testWindowStart(Tier1s, writerNowUnix-26*3600))
 
 	require.NoError(t, os.Remove(wf.Path))

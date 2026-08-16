@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/VKCOM/statshouse/internal/data_model"
 )
 
 // writerNowUnix is the frozen clock writer tests run under; rows near it are
@@ -159,14 +161,14 @@ func TestWriterRoundLandsInAllTiersTruncated(t *testing.T) {
 	require.Equal(t, testRow(testMetricID, ts).Unique, uniq)
 }
 
-// TestWriterDropsRowsOutsideIngestGuard checks the ClickHouse matview guard's
+// TestWriterDropsRowsOutsideIngestGuard checks the ingest guard's
 // counterpart, including both boundaries.
 func TestWriterDropsRowsOutsideIngestGuard(t *testing.T) {
 	s, w := newTestWriter(t)
 	now := uint32(writerNow.Unix())
 
 	rows := []Row{
-		testRow(testMetricID, now-ingestGuardOldSecs),      // exactly three days old: kept
+		testRow(testMetricID, now-ingestGuardOldSecs),      // exactly the historic window old: kept
 		testRow(testMetricID, now-ingestGuardOldSecs-1),    // one second older: dropped
 		testRow(testMetricID, now-4*86400),                 // far past: dropped
 		testRow(testMetricID, now+ingestGuardFutureSecs-1), // just under an hour ahead: kept
@@ -420,15 +422,24 @@ func TestWriterSerializesConcurrentRounds(t *testing.T) {
 	}
 }
 
-// TestWithinIngestGuard pins the guard bounds to the ClickHouse matview
-// predicate they mirror.
+// TestWithinIngestGuard pins the guard bounds, and TestIngestGuardHorizon
+// below pins the old bound to the seal horizon they must not cross.
 func TestWithinIngestGuard(t *testing.T) {
 	const now = int64(1740000000)
 	require.True(t, withinIngestGuard(now, now))
-	require.True(t, withinIngestGuard(now-ingestGuardOldSecs, now), "exactly three days old is kept")
+	require.True(t, withinIngestGuard(now-ingestGuardOldSecs, now), "exactly the historic window old is kept")
 	require.False(t, withinIngestGuard(now-ingestGuardOldSecs-1, now))
 	require.True(t, withinIngestGuard(now+ingestGuardFutureSecs-1, now), "just under an hour ahead is kept")
 	require.False(t, withinIngestGuard(now+ingestGuardFutureSecs, now))
+}
+
+// TestIngestGuardHorizon pins the guard's old bound to the historic window:
+// windows freeze at their end plus data_model.MaxHistoricWindow, so a row
+// older than that could only target an already-sealed window. Widening this
+// bound past the historic window re-opens the wedge consumeWindow guards
+// against; change the two together or not at all.
+func TestIngestGuardHorizon(t *testing.T) {
+	require.EqualValues(t, data_model.MaxHistoricWindow, ingestGuardOldSecs)
 }
 
 // TestWriterEmptyRoundIsNoop keeps the never-empty conveyor honest: an empty

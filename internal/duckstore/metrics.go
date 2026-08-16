@@ -47,6 +47,11 @@ const (
 	// WindowLeaseDeferred: a reader's lease deferred an expired window's
 	// unlink to a later pass.
 	WindowLeaseDeferred WindowEventKind = "lease_deferred"
+	// WindowLateDropped: compaction found the window already sealed and
+	// dropped that generation's rows for it. The writer's ingest guard makes
+	// this unreachable for conforming senders, so any count is a sender
+	// violating the historic window.
+	WindowLateDropped WindowEventKind = "late_dropped"
 )
 
 // QuarantineAxis is why a store file was quarantined on open: which of the

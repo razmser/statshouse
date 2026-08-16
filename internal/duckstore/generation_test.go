@@ -13,6 +13,7 @@ import (
 	"database/sql"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -342,4 +343,81 @@ func TestConsumeGenerationEmptyGenerationUnlinksAlone(t *testing.T) {
 	require.Equal(t, []int64{1}, s.DeltaGenerations())
 	require.NoFileExists(t, filepath.Join(dir, deltaFileName(0)))
 	require.Empty(t, s.Windows())
+}
+
+// TestConsumeGenerationSealedWindowDropsAndCompletes reproduces the wedge a
+// row for an already-sealed window used to cause: consumption refused the
+// append and failed the generation on every pass, wedging the generation's
+// later windows and every future roll. Now the sealed window's share is
+// dropped loudly — error log, metric, consumption record — and the
+// generation completes: the sealed window keeps its contents, the unsealed
+// tiers still land, and the delta file is unlinked.
+func TestConsumeGenerationSealedWindowDropsAndCompletes(t *testing.T) {
+	dir := t.TempDir()
+	rec := &recordingMetrics{}
+	var logs []string
+	s, err := OpenStore(StoreConfig{
+		Dir:               dir,
+		StatshouseVersion: testStatshouseVersion,
+		Logf:              func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) },
+		Metrics:           rec,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+	w, err := NewWriter(s, WriterConfig{NowFunc: func() time.Time { return writerNow }})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	// land one row in the previous 1s-tier window, then freeze that window;
+	// the 1m and 1h windows sharing the timestamp stay open
+	lateTS := uint32(writerNow.Unix() - 3700)
+	first := testRow(testMetricID, lateTS)
+	first.Count, first.Sum = 2, 20
+	require.NoError(t, w.WriteRound(context.Background(), []Row{first}))
+	require.NoError(t, s.RollGeneration())
+	require.NoError(t, s.ConsumeGeneration(context.Background(), 0, ConsumeOptions{}))
+	require.NoError(t, s.SealWindow(context.Background(), Tier1s, testWindowStart(Tier1s, int64(lateTS))))
+
+	// a second row for the same, now sealed, 1s window — inside the ingest
+	// guard, so the writer takes it; only the consume meets the seal
+	late := testRow(testMetricID, lateTS)
+	late.Count, late.Sum = 3, 30
+	require.NoError(t, w.WriteRound(context.Background(), []Row{late}))
+	require.NoError(t, s.RollGeneration())
+	require.NoError(t, s.ConsumeGeneration(context.Background(), 1, ConsumeOptions{}))
+
+	// the generation completed instead of wedging
+	require.Equal(t, []int64{2}, s.DeltaGenerations())
+	require.NoFileExists(t, filepath.Join(dir, deltaFileName(1)))
+
+	// the sealed 1s window kept exactly its pre-seal contents; the open
+	// tiers landed both rows
+	windowTotals := func(tier string) (cnt, sum float64) {
+		db, err := openStoreFile(filepath.Join(dir, archiveSubdir, archiveFileName(tier, testWindowStart(tier, int64(lateTS)))), true, ResourcesConfig{})
+		require.NoError(t, err)
+		defer db.Close()
+		require.NoError(t, db.QueryRow(
+			fmt.Sprintf("SELECT sum(count), sum(sum) FROM %s WHERE metric = $1", TierTable(tier)), testMetricID).Scan(&cnt, &sum))
+		return cnt, sum
+	}
+	cnt, sum := windowTotals(Tier1s)
+	require.EqualValues(t, 2, cnt, "sealed 1s window must keep its pre-seal contents")
+	require.EqualValues(t, 20, sum)
+	for _, tier := range []string{Tier1m, Tier1h} {
+		cnt, sum = windowTotals(tier)
+		require.EqualValues(t, 5, cnt, "%s windows are unsealed and must land both rows", tier)
+		require.EqualValues(t, 50, sum)
+	}
+
+	// the drop is loud: one window event and one error log among the pass's
+	// informational ones
+	require.Equal(t, []recordedWindow{{kind: WindowLateDropped, tier: Tier1s}}, rec.snapshotWindows())
+	var errors []string
+	for _, line := range logs {
+		if strings.HasPrefix(line, "[error]") {
+			errors = append(errors, line)
+		}
+	}
+	require.Len(t, errors, 1)
+	require.Contains(t, errors[0], "is sealed")
 }

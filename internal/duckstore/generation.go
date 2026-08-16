@@ -188,7 +188,8 @@ func (s *Store) ConsumeGeneration(ctx context.Context, gen int64, opts ConsumeOp
 // file, skipped entirely when an earlier attempt already committed it. The
 // whole window maintenance holds archiveMu, so the append can never interleave
 // with the sealer's rewrite of the same file, and a sealed window — whose
-// contents must never change again — refuses the append instead.
+// contents must never change again — records the generation without
+// appending, so one unplaceable row cannot wedge consumption.
 func (s *Store) consumeWindow(ctx context.Context, gen int64, deltaPath string, k windowKey, opts ConsumeOptions) error {
 	s.archiveMu.Lock()
 	defer s.archiveMu.Unlock()
@@ -218,15 +219,38 @@ func (s *Store) consumeWindow(ctx context.Context, gen int64, deltaPath string, 
 	}
 
 	// A sealed window is frozen: its rows were rewritten into one run past the
-	// historic window, so only a sender violating that window could land here.
-	// Refuse loudly rather than corrupt the sealed collapse or drop the rows
-	// silently; the compaction pass surfaces the error and keeps retrying.
+	// historic window, so only a sender violating that window could land here
+	// — the writer's ingest guard drops such rows, and this is the backstop.
+	// The rows can never be appended, and failing here would wedge this
+	// generation and every later one on rows that are unplaceable by
+	// construction, so they are dropped loudly instead: an error log, a
+	// metric, and the consumption record in its own transaction, so the
+	// generation still completes and its other windows still land.
 	sealed, err := readSealed(db)
 	if err != nil {
 		return fmt.Errorf("duck-store: read %s of %s: %w", SealedTable, path, err)
 	}
 	if sealed {
-		return fmt.Errorf("duck-store: %s is sealed: generation %d holds rows for a window past the historic window", path, gen)
+		s.cfg.Logf("[error] duck-store: %s is sealed: dropping generation %d rows for a window past the historic window", path, gen)
+		recordMaintenanceWindow(s.cfg.Metrics, WindowLateDropped, k.tier)
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("duck-store: record generation %d in %s: %w", gen, path, err)
+		}
+		if _, err := tx.Exec("INSERT INTO "+ConsumedTable+" VALUES ($1)", gen); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("duck-store: record generation %d in %s: %w", gen, path, err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("duck-store: commit generation %d record in %s: %w", gen, path, err)
+		}
+		s.mu.Lock()
+		if s.consumed[k] == nil {
+			s.consumed[k] = map[int64]struct{}{}
+		}
+		s.consumed[k][gen] = struct{}{}
+		s.mu.Unlock()
+		return nil
 	}
 
 	conn, err := db.Conn(ctx)

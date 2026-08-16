@@ -19,14 +19,20 @@ import (
 
 	"github.com/duckdb/duckdb-go/v2"
 
+	"github.com/VKCOM/statshouse/internal/data_model"
 	"github.com/VKCOM/statshouse/internal/format"
 )
 
-// Ingestion-time age guard, mirroring the ClickHouse matview predicate
-// `WHERE time >= now() - 3 * 86400 AND time < now() + 3600` that drops
-// absurd rows instead of storing them.
+// Ingestion-time age guard. The future bound is the ClickHouse matview
+// predicate's (`time < now() + 3600`); the old bound is deliberately tighter
+// than the matview's three days: a duck-store window freezes at its end plus
+// the historic window, so a row older than that could only land in a window
+// that is already sealed and can never take it. Conforming agents are capped
+// at the same bound (the agent config refuses a wider historic window), so
+// this guard is the duck-side defense of the seal invariant, not a loss of
+// reachable data.
 const (
-	ingestGuardOldSecs    = 3 * 86400
+	ingestGuardOldSecs    = data_model.MaxHistoricWindow
 	ingestGuardFutureSecs = 3600
 )
 
@@ -321,7 +327,7 @@ func (w *Writer) writeRound(ctx context.Context, rows []Row) error {
 	for i := range rows {
 		r := &rows[i]
 		if !withinIngestGuard(int64(r.Time), nowUnix) {
-			continue // the ClickHouse matview predicate drops these rows
+			continue // older than the historic window or far future: unplaceable
 		}
 		for _, tier := range tiers {
 			if err := w.appendTierRow(tier, r); err != nil {
@@ -352,9 +358,8 @@ func (w *Writer) writeRound(ctx context.Context, rows []Row) error {
 }
 
 // withinIngestGuard reports whether a row with the given unix seconds is
-// stored at all, given "now" in unix seconds. The bounds are the ClickHouse
-// matview's: nothing older than three days, nothing an hour or more in the
-// future.
+// stored at all, given "now" in unix seconds: nothing older than the historic
+// window (see the guard's comment), nothing an hour or more in the future.
 func withinIngestGuard(rowTime, nowUnix int64) bool {
 	return rowTime >= nowUnix-ingestGuardOldSecs && rowTime < nowUnix+ingestGuardFutureSecs
 }

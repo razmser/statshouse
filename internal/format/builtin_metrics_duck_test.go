@@ -96,6 +96,7 @@ func TestDuckStoreMetricValueComments(t *testing.T) {
 				TagValueIDDuckWindowUnlinked:      "unlinked",
 				TagValueIDDuckWindowEarlyEvicted:  "early_evicted",
 				TagValueIDDuckWindowLeaseDeferred: "lease_deferred",
+				TagValueIDDuckWindowLateDropped:   "late_dropped",
 			},
 		},
 		{

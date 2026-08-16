@@ -94,6 +94,14 @@ func (m *recordingMetrics) StoreSize(location SizeLocation, used, free int64) {
 	m.sizes = append(m.sizes, recordedSize{location: location, used: used, free: free})
 }
 
+// snapshotWindows returns a copy of the recorded window events, safe to read
+// while maintenance still runs.
+func (m *recordingMetrics) snapshotWindows() []recordedWindow {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]recordedWindow(nil), m.windows...)
+}
+
 // snapshotSizes returns a copy of the recorded sizes, safe to read while the
 // sampler still runs.
 func (m *recordingMetrics) snapshotSizes() []recordedSize {
@@ -191,7 +199,7 @@ func TestSealerReportsPassAndSealedWindows(t *testing.T) {
 // lease-deferred unlink — each emit their event, alongside the pass timing.
 func TestRetainerReportsWindowEvents(t *testing.T) {
 	t.Run("unlinks_by_retention", func(t *testing.T) {
-		s := agedWindowsFixture(t, 5, 26*3600, 50*3600)
+		s := agedWindowsFixture(t, 5, 26*3600, 47*3600)
 
 		m := &recordingMetrics{}
 		cfg := RetentionConfig{
@@ -221,7 +229,7 @@ func TestRetainerReportsWindowEvents(t *testing.T) {
 	})
 
 	t.Run("early_evicts_for_free_space", func(t *testing.T) {
-		s := agedWindowsFixture(t, 5, 26*3600, 50*3600)
+		s := agedWindowsFixture(t, 5, 26*3600, 47*3600)
 
 		const watermark = uint64(1 << 20)
 		const keep = 2
@@ -250,7 +258,7 @@ func TestRetainerReportsWindowEvents(t *testing.T) {
 	})
 
 	t.Run("lease_defers_unlink", func(t *testing.T) {
-		s := agedWindowsFixture(t, 5, 26*3600, 50*3600)
+		s := agedWindowsFixture(t, 5, 26*3600, 47*3600)
 		leased := testWindowStart(Tier1s, writerNowUnix-26*3600)
 		l := s.AcquireWindowLease(Tier1s, leased)
 		require.NotNil(t, l)

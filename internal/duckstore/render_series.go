@@ -612,9 +612,10 @@ func (s *Store) withQuerySources(ctx context.Context, tier string, from, to int6
 }
 
 // deltaConn checks a connection out of the active delta generation's pool. A
-// generation roll swaps the pool under the store lock and closes the old one,
-// which waits for in-flight queries; a query racing the swap retries once on
-// the new pool rather than failing.
+// generation roll swaps the pool under the store lock and closes the old one:
+// a query already holding a connection runs to completion on the old file,
+// while a caller that reaches the closed pool gets an error — so a query
+// racing the swap retries once on the new pool rather than failing.
 func (s *Store) deltaConn(ctx context.Context) (*sql.Conn, error) {
 	var err error
 	for attempt := 0; attempt < 2; attempt++ {

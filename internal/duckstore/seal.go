@@ -159,20 +159,23 @@ func windowSealDue(tier string, windowStart, nowUnix int64) bool {
 // bookkeeping completes quietly.
 func (s *Store) SealWindow(ctx context.Context, tier string, windowStart int64) error {
 	path := filepath.Join(s.cfg.Dir, archiveSubdir, archiveFileName(tier, windowStart))
+	table := tierTables[tier]
+
+	// Serialize against compaction's appends and retention's unlinks of the
+	// same file: a rewrite and an append must never interleave, and the
+	// existence check below must not race an unlink — a read-write open of a
+	// freshly unlinked path would create a fresh empty database there. The
+	// check runs under the lock, where unlinks are serialized away.
+	// Ingestion never takes this lock, so a seal can never delay a write.
+	s.archiveMu.Lock()
+	defer s.archiveMu.Unlock()
+
 	if _, err := os.Stat(path); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return fmt.Errorf("duck-store: window %s: %w", path, fs.ErrNotExist)
 		}
 		return fmt.Errorf("duck-store: seal %s: %w", path, err)
 	}
-	table := tierTables[tier]
-
-	// Serialize against compaction's appends to the same file: a rewrite and
-	// an append must never interleave. Ingestion never takes this lock, so a
-	// seal can never delay a write.
-	s.archiveMu.Lock()
-	defer s.archiveMu.Unlock()
-
 	db, err := openStoreFile(path, false, s.cfg.Resources)
 	if err != nil {
 		return fmt.Errorf("duck-store: seal %s: %w", path, err)

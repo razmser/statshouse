@@ -127,8 +127,9 @@ func TestSealRewritesRunsIntoOnePreservingDecodedContents(t *testing.T) {
 }
 
 // TestSealedFileRejectsWrites proves the freeze at both levels: the read-only
-// handle the store reopens through refuses an INSERT, and the consume protocol
-// refuses to append a late round to a sealed window instead of corrupting it.
+// handle the store reopens through refuses an INSERT, and the consume
+// protocol drops a late round for a sealed window loudly instead of
+// corrupting the window — or wedging consumption on rows it can never place.
 func TestSealedFileRejectsWrites(t *testing.T) {
 	s, sealer := sealTestStore(t)
 	now := uint32(writerNow.Unix())
@@ -142,8 +143,9 @@ func TestSealedFileRejectsWrites(t *testing.T) {
 	require.Error(t, err, "a read-only open must reject writes")
 	require.NoError(t, db.Close())
 
-	// a late row for the sealed window — possible only from a sender violating
-	// the historic window — is refused by the consume protocol, loudly
+	// a late row for the sealed window — possible only from a sender racing
+	// the historic window — is dropped by the consume protocol, loudly, and
+	// the generation still completes
 	w, err := NewWriter(s, WriterConfig{NowFunc: func() time.Time { return writerNow }})
 	require.NoError(t, err)
 	late := partialRow(t, testMetricID, now-5)
@@ -151,11 +153,11 @@ func TestSealedFileRejectsWrites(t *testing.T) {
 	require.NoError(t, w.WriteRound(context.Background(), []Row{late}))
 	require.NoError(t, w.Close())
 
-	err = NewCompactor(s, CompactorConfig{}).CompactOnce(context.Background())
-	require.Error(t, err, "consuming into a sealed window must fail loudly")
-	require.Contains(t, err.Error(), "is sealed")
+	require.NoError(t, NewCompactor(s, CompactorConfig{}).CompactOnce(context.Background()))
+	require.Equal(t, []int64{s.ActiveDeltaGeneration()}, s.DeltaGenerations(),
+		"the generation holding the unplaceable row must still be consumed")
 
-	// the refused append left the window exactly as the seal wrote it: the
+	// the dropped append left the window exactly as the seal wrote it: the
 	// fixture's two keys, one row each
 	db, err = openStoreFile(wf.Path, true, ResourcesConfig{})
 	require.NoError(t, err)
@@ -209,9 +211,10 @@ func TestSealerRunsAlongsideIngestion(t *testing.T) {
 	s, w := newTestWriter(t)
 	now := uint32(writerNow.Unix())
 
-	// rows 50 hours old: inside the three-day ingest guard, in windows the
-	// sealer's clock finds due — written and consumed before the loops start
-	const oldAge = 50 * 3600
+	// rows 47 hours old: inside the historic-window ingest guard, in windows
+	// the sealer's clock finds due — written and consumed before the loops
+	// start
+	const oldAge = 47 * 3600
 	old := partialRow(t, testMetricID, now-oldAge)
 	old.Count, old.Sum = 2, 20
 	require.NoError(t, w.WriteRound(context.Background(), []Row{old}))
