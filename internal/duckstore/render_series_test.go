@@ -344,6 +344,42 @@ func TestRenderSeriesEmptyFilterArm(t *testing.T) {
 	require.Equal(t, []float64{1}, flattenSeries(t, resp).count, "NOT Empty keeps the tagged row")
 }
 
+// TestRenderSeriesRawTagFilterNoArmMatchesNothing pins the builder's
+// empty-filter fallback on a raw tag: the re2 and string-values arms never
+// render for a raw kind, so an IN filter carrying only them matches no rows
+// (the builder's literal 0!=0) instead of being dropped — dropping it would
+// return every series of the metric where ClickHouse returns none. The same
+// filter on the NOT IN side is a nop, like the builder's 0=0. A PromQL regex
+// matcher on a raw tag arrives exactly this way whenever the pattern matches
+// no enumerated value.
+func TestRenderSeriesRawTagFilterNoArmMatchesNothing(t *testing.T) {
+	s, w := newTestWriter(t)
+	b1 := (writerNowUnix - 7200) / 60 * 60
+	kinds := []int32{tagKindRaw32, tagKindMapped}
+	require.NoError(t, w.WriteRound(context.Background(), []Row{
+		{Metric: testMetricID, Time: uint32(b1), Tags: tag0(11), Count: 1},
+		{Metric: testMetricID, Time: uint32(b1), Tags: tag0(12), Count: 1},
+	}))
+	what := []int32{int32(data_model.DigestCount)}
+
+	f := tlstatshouse.StoreTagFilter{TagIndex: 0}
+	f.SetRe2(`^1`)
+	r := renderSeriesSorted(t, s, 1, withFilterIn(seriesReq(testMetricID, kinds, what, []int32{0}, b1, b1+60, 60), f))
+	require.Empty(t, r.time, "an IN filter on a raw tag whose only arm is the pattern matches nothing, as under ClickHouse")
+
+	f = tlstatshouse.StoreTagFilter{TagIndex: 0}
+	f.SetValues([]string{"11"})
+	r = renderSeriesSorted(t, s, 1, withFilterIn(seriesReq(testMetricID, kinds, what, []int32{0}, b1, b1+60, 60), f))
+	require.Empty(t, r.time, "the same holds when the filter's only arm is a string value")
+
+	q := seriesReq(testMetricID, kinds, what, []int32{0}, b1, b1+60, 60)
+	q.Base.FilterNotIn = []tlstatshouse.StoreTagFilter{f}
+	q.SetSortAsc(true)
+	resp, err := s.RenderSeries(context.Background(), 1, q)
+	require.NoError(t, err)
+	require.Len(t, flattenSeries(t, resp).time, 2, "the same filter on the NOT IN side is a nop")
+}
+
 // TestRenderSeriesHostsByIdentifyingValue seeds partial rows whose skewed
 // state values disagree with the true extremes, so a correct host column must
 // pick the host of the smallest/largest SKEW — the value-weighted sample
@@ -515,26 +551,37 @@ func TestRenderSeriesShardTagFromLiteral(t *testing.T) {
 	require.Len(t, r.stags[1], 2)
 }
 
-// TestRenderSeriesSortOrder checks the two explicit orders; a request with
-// neither must still answer, its order its own choice.
+// TestRenderSeriesSortOrder checks the two explicit orders against the
+// ClickHouse builder's clause: the plain column list with one trailing DESC
+// for descending — never a direction per column, so _time and every column
+// but the last stay ascending. The two same-bucket rows tie on every column
+// but the last, so only that column's direction separates them. A request
+// with neither flag must still answer, its order its own choice.
 func TestRenderSeriesSortOrder(t *testing.T) {
 	s, w := newTestWriter(t)
 	b1 := (writerNowUnix - 7200) / 60 * 60
-	require.NoError(t, w.WriteRound(context.Background(), []Row{
-		{Metric: testMetricID, Time: uint32(b1), Tags: tag0(12), Count: 1},
-		{Metric: testMetricID, Time: uint32(b1), Tags: tag0(11), Count: 1},
-		{Metric: testMetricID, Time: uint32(b1 + 60), Tags: tag0(10), Count: 1},
-	}))
+	// tag1 carries unmapped string values, the only way two rows tie on every
+	// column but the last (a set tag id drops its string half at write time)
+	rows := []Row{
+		{Metric: testMetricID, Time: uint32(b1), Tags: tags01(7, 0), Count: 1},
+		{Metric: testMetricID, Time: uint32(b1), Tags: tags01(7, 0), Count: 1},
+		{Metric: testMetricID, Time: uint32(b1 + 60), Tags: tags01(9, 1), Count: 1},
+	}
+	rows[0].STags[1] = "zzz"
+	rows[1].STags[1] = "aaa"
+	require.NoError(t, w.WriteRound(context.Background(), rows))
 
-	base := seriesReq(testMetricID, twoMappedKinds, []int32{int32(data_model.DigestCount)}, []int32{0}, b1, b1+120, 60)
+	base := seriesReq(testMetricID, twoMappedKinds, []int32{int32(data_model.DigestCount)}, []int32{0, 1}, b1, b1+120, 60)
 
 	desc := base
 	desc.SetSortDesc(true)
 	resp, err := s.RenderSeries(context.Background(), 1, desc)
 	require.NoError(t, err)
 	r := flattenSeries(t, resp)
-	require.Equal(t, []int64{b1 + 60, b1, b1}, r.time)
-	require.Equal(t, []int64{10, 12, 11}, r.tags[0])
+	require.Equal(t, []int64{b1, b1, b1 + 60}, r.time, "_time stays ascending under DESC")
+	require.Equal(t, []int64{7, 7, 9}, r.tags[0], "every column but the last stays ascending")
+	require.Equal(t, []int64{0, 0, 1}, r.tags[1])
+	require.Equal(t, []string{"zzz", "aaa", ""}, r.stags[1], "the trailing column alone is DESC")
 
 	asc := base
 	asc.SetSortAsc(true)
@@ -542,7 +589,16 @@ func TestRenderSeriesSortOrder(t *testing.T) {
 	require.NoError(t, err)
 	r = flattenSeries(t, resp)
 	require.Equal(t, []int64{b1, b1, b1 + 60}, r.time)
-	require.Equal(t, []int64{11, 12, 10}, r.tags[0])
+	require.Equal(t, []int64{7, 7, 9}, r.tags[0])
+	require.Equal(t, []int64{0, 0, 1}, r.tags[1])
+	require.Equal(t, []string{"aaa", "zzz", ""}, r.stags[1])
+}
+
+// tags01 returns the tag array of a row with tag0 and tag1 set.
+func tags01(v0, v1 int32) [format.MaxTags]int32 {
+	var tags [format.MaxTags]int32
+	tags[0], tags[1] = v0, v1
+	return tags
 }
 
 // TestRenderSeriesRaw64GroupAndFilter covers the raw64 layout: grouping and

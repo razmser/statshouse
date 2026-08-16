@@ -386,12 +386,16 @@ func buildSeriesSQL(p *seriesPlan, sources []string) (*seriesQuerySQL, error) {
 	sb.WriteString(" GROUP BY ")
 	sb.WriteString(strings.Join(group, ", "))
 	if p.order != "" {
-		ordered := make([]string, len(group))
-		for i, g := range group {
-			ordered[i] = g + " " + p.order
-		}
+		// the builder's writeOrderBy shape: the plain column list with no
+		// per-column directions and one trailing DESC when sorting
+		// descending — _time and every column but the last stay ascending.
+		// Which rows survive the table view's page truncation depends on
+		// this order, so it must match ClickHouse's clause exactly.
 		sb.WriteString(" ORDER BY ")
-		sb.WriteString(strings.Join(ordered, ", "))
+		sb.WriteString(strings.Join(group, ", "))
+		if p.order == "DESC" {
+			sb.WriteString(" DESC")
+		}
 	}
 	sb.WriteString(" LIMIT " + param(int64(p.rowLimit+1)))
 	return &seriesQuerySQL{sql: sb.String(), args: args}, nil
@@ -434,8 +438,10 @@ func (p *storeQueryPlan) where(param func(any) string) (string, error) {
 	return strings.Join(preds, " AND "), nil
 }
 
-// tagFilterPred renders one storeTagFilter into a parenthesized predicate, or
-// "" for a filter with no arms at all (the builder's Empty() skip).
+// tagFilterPred renders one storeTagFilter into a parenthesized predicate, ""
+// for a fully-empty filter (the builder's Empty() skip), or the always-false
+// "(0!=0)" for an IN filter whose arms all rendered away — a raw tag's re2 and
+// string-values arms never render, so such a filter has no row satisfying it.
 func (p *storeQueryPlan) tagFilterPred(f tlstatshouse.StoreTagFilter, in bool, param func(any) string) (string, error) {
 	x, err := p.layoutIndex(f.TagIndex, "filter on")
 	if err != nil {
@@ -480,6 +486,13 @@ func (p *storeQueryPlan) tagFilterPred(f tlstatshouse.StoreTagFilter, in bool, p
 		arms = append(arms, valueExpr+" = 0")
 	}
 	if len(arms) == 0 {
+		// the builder's empty-filter fallback: an IN filter with no rendered
+		// arm has no row satisfying it (its literal 0!=0), while an empty NOT
+		// IN filter is a nop (0=0), so dropping it is equivalent. A filter
+		// with nothing set at all is the builder's Empty() skip above.
+		if in && (f.IsSetMapped() || f.IsSetValues() || f.IsSetRe2() || f.IsSetEmpty()) {
+			return "(0!=0)", nil
+		}
 		return "", nil
 	}
 

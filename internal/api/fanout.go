@@ -8,6 +8,7 @@ package api
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"fmt"
 	"sort"
@@ -224,8 +225,10 @@ func decodeSeriesResponse(q *seriesDataQuery, resp tlstatshouse.StoreSeriesRespo
 // evaluation — after every shard's contribution is folded in. Host ties
 // resolve to the lower shard's row, deterministically.
 //
-// The merged rows come back ordered by (time, tags, shard number), matching
-// the ClickHouse builder's ascending ORDER BY shape.
+// The merged rows come back in the caller's order — mergedRowLess, which
+// mirrors the ClickHouse builder's ORDER BY clause for the query, so the
+// table view's page truncation reads the same rows in the same order the
+// ClickHouse backend delivers.
 // tsMergeKey is a merged row's identity: the timestamp plus the grouped
 // tags. tsTags alone is not enough — it does not carry time, so rows of the
 // same series at different timestamps would fold into one.
@@ -234,7 +237,10 @@ type tsMergeKey struct {
 	tags tsTags
 }
 
-func mergeShardRows(perShard [][]tsSelectRow, rowCap int) ([]tsSelectRow, error) {
+func mergeShardRows(perShard [][]tsSelectRow, rowCap int, less func(l, r *tsSelectRow) bool) ([]tsSelectRow, error) {
+	if less == nil {
+		less = lessTsSelectRow
+	}
 	var total int
 	for _, rows := range perShard {
 		total += len(rows)
@@ -256,12 +262,70 @@ func mergeShardRows(perShard [][]tsSelectRow, rowCap int) ([]tsSelectRow, error)
 			merged[ix].tsValues.merge(rows[i].tsValues)
 		}
 	}
-	sort.Slice(merged, func(i, j int) bool { return lessTsSelectRow(&merged[i], &merged[j]) })
+	sort.Slice(merged, func(i, j int) bool { return less(&merged[i], &merged[j]) })
 	return merged, nil
 }
 
-// lessTsSelectRow orders rows by (time, tags, shard number) — the comparator
-// behind the deterministic merged-row order.
+// mergedRowLess builds the merged rows' order, mirroring the ClickHouse
+// builder's ORDER BY clause for the query: _time, then per by-entry the tag's
+// int value and its string half interleaved (the shard entry its shard number
+// alone), and for a descending table request the FINAL column's direction
+// alone flipped — the builder's single trailing DESC, never a direction per
+// column. This order is what the table view's page truncation reads, so it
+// must match the ClickHouse backend's clause exactly; the builder emits no
+// ORDER BY for plain series requests, where any deterministic order is fine.
+func mergedRowLess(by []int, descending bool) func(l, r *tsSelectRow) bool {
+	const (
+		colTime int8 = iota
+		colTag
+		colStag
+		colShard
+	)
+	type orderCol struct {
+		kind int8
+		x    int
+	}
+	cols := make([]orderCol, 0, 1+2*len(by))
+	cols = append(cols, orderCol{colTime, 0})
+	for _, x := range by {
+		if x == format.ShardTagIndex {
+			cols = append(cols, orderCol{colShard, 0})
+			continue
+		}
+		if x == format.StringTopTagIndex {
+			x = format.StringTopTagIndexV3 // the v3 slot the string top decodes into
+		}
+		cols = append(cols, orderCol{colTag, x}, orderCol{colStag, x})
+	}
+	last := len(cols) - 1
+	return func(l, r *tsSelectRow) bool {
+		for i := range cols {
+			var c int
+			switch cols[i].kind {
+			case colTime:
+				c = cmp.Compare(l.time, r.time)
+			case colTag:
+				c = cmp.Compare(l.tag[cols[i].x], r.tag[cols[i].x])
+			case colStag:
+				c = cmp.Compare(l.stag[cols[i].x], r.stag[cols[i].x])
+			case colShard:
+				c = cmp.Compare(l.shardNum, r.shardNum)
+			}
+			if c == 0 {
+				continue
+			}
+			if i == last && descending {
+				c = -c
+			}
+			return c < 0
+		}
+		return false
+	}
+}
+
+// lessTsSelectRow orders rows by (time, tags, shard number) — the fallback
+// comparator behind a deterministic merged-row order when the query's own
+// ordering is not at hand.
 func lessTsSelectRow(l, r *tsSelectRow) bool {
 	if l.time != r.time {
 		return l.time < r.time

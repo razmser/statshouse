@@ -157,7 +157,7 @@ func (s *duckQuerySource) querySeries(ctx context.Context, h *requestHandler, q 
 		}
 		perShard[i] = rows
 	}
-	merged, err := mergeShardRows(perShard, fanoutRowCap)
+	merged, err := mergeShardRows(perShard, fanoutRowCap, mergedRowLess(q.by, q.sort == sortDescending))
 	if err != nil {
 		return err
 	}

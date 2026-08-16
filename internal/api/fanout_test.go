@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net"
 	"slices"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -941,9 +942,9 @@ func TestFanoutMergeDeterminism(t *testing.T) {
 		}
 		return rows
 	}
-	forward, err := mergeShardRows([][]tsSelectRow{makeRows(1), makeRows(2)}, fanoutRowCap)
+	forward, err := mergeShardRows([][]tsSelectRow{makeRows(1), makeRows(2)}, fanoutRowCap, nil)
 	require.NoError(t, err)
-	backward, err := mergeShardRows([][]tsSelectRow{makeRows(2), makeRows(1)}, fanoutRowCap)
+	backward, err := mergeShardRows([][]tsSelectRow{makeRows(2), makeRows(1)}, fanoutRowCap, nil)
 	require.NoError(t, err)
 	require.Len(t, forward, 1)
 	require.Len(t, backward, 1)
@@ -953,9 +954,69 @@ func TestFanoutMergeDeterminism(t *testing.T) {
 	a := tsSelectRow{time: 100}
 	b := tsSelectRow{time: 100}
 	b.shardNum = 2
-	distinct, err := mergeShardRows([][]tsSelectRow{{a}, {b}}, fanoutRowCap)
+	distinct, err := mergeShardRows([][]tsSelectRow{{a}, {b}}, fanoutRowCap, nil)
 	require.NoError(t, err)
 	require.Len(t, distinct, 2)
+}
+
+// TestMergedRowOrderMirrorsClickHouse pins the merged rows' order against the
+// ClickHouse builder's ORDER BY clause: _time, then per by-entry the tag's
+// int value and its string half interleaved (the shard entry its shard number
+// alone), and for a descending table request the FINAL column's direction
+// alone flipped — the builder's single trailing DESC, never a direction per
+// column. The table view truncates pages in this order, so it must match the
+// ClickHouse backend's delivered order exactly.
+func TestMergedRowOrderMirrorsClickHouse(t *testing.T) {
+	row := func(time int64, tag0 int64, stag0 string, tag1 int64, stag1 string) tsSelectRow {
+		r := tsSelectRow{time: time}
+		r.tag[0], r.stag[0] = tag0, stag0
+		r.tag[1], r.stag[1] = tag1, stag1
+		return r
+	}
+	// three rows in one bucket — the first and third tie on every column but
+	// the last — plus one row in a later bucket
+	shuffled := []tsSelectRow{
+		row(100, 7, "x", 3, "zzz"),
+		row(200, 9, "", 1, ""),
+		row(100, 7, "a", 2, "yyy"),
+		row(100, 7, "x", 3, "aaa"),
+	}
+	order := func(less func(l, r *tsSelectRow) bool) []string {
+		rows := slices.Clone(shuffled)
+		sort.Slice(rows, func(i, j int) bool { return less(&rows[i], &rows[j]) })
+		out := make([]string, len(rows))
+		for i := range rows {
+			out[i] = fmt.Sprintf("%d %s %s", rows[i].time, rows[i].stag[0], rows[i].stag[1])
+		}
+		return out
+	}
+
+	// ascending: tag0's string half outranks tag1, and the tie inside it is
+	// broken by tag1's string half ascending
+	require.Equal(t, []string{"100 a yyy", "100 x aaa", "100 x zzz", "200  "}, order(mergedRowLess([]int{0, 1}, false)))
+	// descending: _time and every column but the last stay ascending; the
+	// trailing column alone flips
+	require.Equal(t, []string{"100 a yyy", "100 x zzz", "100 x aaa", "200  "}, order(mergedRowLess([]int{0, 1}, true)))
+
+	// the shard by-entry is its shard number alone, mid-list; the trailing
+	// column here is tag0's string half
+	shardRow := func(shard uint32, tag0 int64, stag0 string) tsSelectRow {
+		r := tsSelectRow{time: 100, tsTags: tsTags{shardNum: shard}}
+		r.tag[0], r.stag[0] = tag0, stag0
+		return r
+	}
+	shuffledShard := []tsSelectRow{shardRow(2, 5, "b"), shardRow(1, 9, ""), shardRow(2, 5, "a")}
+	orderShard := func(less func(l, r *tsSelectRow) bool) []string {
+		rows := slices.Clone(shuffledShard)
+		sort.Slice(rows, func(i, j int) bool { return less(&rows[i], &rows[j]) })
+		out := make([]string, len(rows))
+		for i := range rows {
+			out[i] = fmt.Sprintf("%d %d %s", rows[i].shardNum, rows[i].tag[0], rows[i].stag[0])
+		}
+		return out
+	}
+	require.Equal(t, []string{"1 9 ", "2 5 a", "2 5 b"}, orderShard(mergedRowLess([]int{format.ShardTagIndex, 0}, false)))
+	require.Equal(t, []string{"1 9 ", "2 5 b", "2 5 a"}, orderShard(mergedRowLess([]int{format.ShardTagIndex, 0}, true)))
 }
 
 // TestRPCStoreShardClientCryptoKey proves the fan-out client presents the
