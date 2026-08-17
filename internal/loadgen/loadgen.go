@@ -28,7 +28,7 @@ func RunClientLoad() {
 		baseCard = card
 	}
 	ctx := makeInterruptibleContext()
-	apiClient := api.NewClient("http://127.0.0.1:10888", "loadgen")
+	apiClient := api.NewClient(apiURL(), "loadgen")
 	sh := statshouse.NewClient(log.Printf, "tcp", statshouse.DefaultAddr, "")
 	g := Generator{
 		rng:     rand.New(),
@@ -114,9 +114,18 @@ func makeInterruptibleContext() context.Context {
 	return ctx
 }
 
+// apiURL lets a local stack on a non-default port (localdebug/run-in-herdr.sh
+// picks one when 10888 is taken) point loadgen's ensure calls at its own api
+func apiURL() string {
+	if u := os.Getenv("STATSHOUSE_API_URL"); u != "" {
+		return u
+	}
+	return "http://127.0.0.1:10888"
+}
+
 func RunEnableNewPipeline() {
 	ctx := makeInterruptibleContext()
-	c := api.NewClient("http://127.0.0.1:10888", "loadgen")
+	c := api.NewClient(apiURL(), "loadgen")
 	ensureMetricWithDescription(ctx, c, format.StatshouseAPIRemoteConfig, ``)
 	ensureMetricWithDescription(ctx, c, format.StatshouseAgentRemoteConfigMetric, ``)
 	ensureMetricWithDescription(ctx, c, format.StatshouseAggregatorRemoteConfigMetric, ``)
@@ -163,7 +172,7 @@ func RunSetSharding() {
 		}
 	}
 	ctx := makeInterruptibleContext()
-	c := api.NewClient("http://127.0.0.1:10888", "loadgen")
+	c := api.NewClient(apiURL(), "loadgen")
 	m, err := c.GetMetric(ctx, metric)
 	if err != nil {
 		log.Fatalf("Failed to get metric: %v", err)
