@@ -92,9 +92,9 @@ type ConfigAggregator struct {
 	DuckQueryAddr string
 
 	// DuckQueryConcurrency is how many store queries may execute at once per
-	// shard; the next concurrent query is refused as overloaded rather than
-	// queued, so a burst of heavy queries cannot eat the machine ingestion
-	// needs.
+	// shard; concurrent queries beyond it wait briefly for a slot and are
+	// then refused as overloaded, so a burst of heavy queries cannot eat the
+	// machine ingestion needs.
 	DuckQueryConcurrency int
 
 	// DuckMemoryLimit is DuckDB's memory_limit per store file, in bytes,

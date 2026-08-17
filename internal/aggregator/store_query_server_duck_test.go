@@ -22,13 +22,15 @@ import (
 )
 
 // Ingestion must never yield to queries: with both admission slots held by
-// running queries, a third query is refused as overloaded while insert rounds
-// keep landing in the real store behind the real wiring (openDuckStore's
-// writer, its sink, the resource-bounded store files). WriteRound returns only
-// after the round is flushed and fsynced, so answered rounds mean ingestion
-// genuinely progressed under query saturation — the refusal path touches no
-// store file and takes no lock the insert path needs.
+// running queries, a third query waits out the (here shrunk) queue wait and
+// is refused as overloaded while insert rounds keep landing in the real
+// store behind the real wiring (openDuckStore's writer, its sink, the
+// resource-bounded store files). WriteRound returns only after the round is
+// flushed and fsynced, so answered rounds mean ingestion genuinely progressed
+// under query saturation — the admission and refusal paths touch no store
+// file and take no lock the insert path needs.
 func TestStoreQueryServerIngestKeepsRunningWhileQueriesRefused(t *testing.T) {
+	shrinkQueryQueueWait(t, 10*time.Millisecond)
 	config := DefaultConfigAggregator()
 	config.DuckStoreDir = t.TempDir()
 	handle, err := openDuckStore(config, nil)

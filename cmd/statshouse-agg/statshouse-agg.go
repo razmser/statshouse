@@ -296,7 +296,7 @@ func parseCommandLine() error {
 	flag.DurationVar(&argv.DuckRetention1h, "duck-retention-1h", aggregator.DefaultConfigAggregator().DuckRetention1h, "duck-store: how long 1h-tier archive window files are kept after the window ended, before being unlinked whole; 0 keeps them forever")
 	flag.Int64Var(&argv.DuckFreeSpaceWatermark, "duck-free-space-watermark", aggregator.DefaultConfigAggregator().DuckFreeSpaceWatermark, "duck-store: minimum free disk bytes on the store volume; below it the oldest archive windows are evicted early instead of stopping ingestion; 0 disables")
 	flag.StringVar(&argv.DuckQueryAddr, "duck-query-addr", aggregator.DefaultConfigAggregator().DuckQueryAddr, "duck-store: address the store-query RPC listener serves on; required with --storage-backend=duck (query traffic gets its own bounded, admission-controlled endpoint)")
-	flag.IntVar(&argv.DuckQueryConcurrency, "duck-query-concurrency", aggregator.DefaultConfigAggregator().DuckQueryConcurrency, "duck-store: how many store queries execute at once; the next concurrent query is refused as overloaded")
+	flag.IntVar(&argv.DuckQueryConcurrency, "duck-query-concurrency", aggregator.DefaultConfigAggregator().DuckQueryConcurrency, "duck-store: how many store queries execute at once; a query finding every slot busy waits up to 5s for one, then is refused as overloaded")
 	flag.Int64Var(&argv.DuckMemoryLimit, "duck-memory-limit", aggregator.DefaultConfigAggregator().DuckMemoryLimit, "duck-store: DuckDB memory limit per store file, in bytes")
 	flag.StringVar(&argv.KHUser, "kh-user", "", "clickhouse user")
 	flag.StringVar(&argv.KHPasswordFile, "kh-password-file", "", "file with clickhouse password")

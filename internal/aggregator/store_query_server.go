@@ -28,8 +28,17 @@ import (
 // traffic, which is why queries get their own listener with their own numbers.
 const (
 	// DefaultQueryConcurrency is how many store queries may execute at once
-	// per shard; the next one is refused as overloaded rather than queued.
+	// per shard; the next one waits for a free slot and is refused as
+	// overloaded only once DefaultQueryQueueWait elapses without one.
 	DefaultQueryConcurrency = 2
+
+	// DefaultQueryQueueWait is how long a store query that found every slot
+	// busy waits for one before being refused as overloaded. It exists so a
+	// burst — a dashboard's tiles all firing at once — drains through the
+	// slots instead of failing on collision; it is never longer than the
+	// query's own timeout, which aborts the wait. Sustained overload still
+	// refuses, so queries cannot pile up behind a permanently busy shard.
+	DefaultQueryQueueWait = 5 * time.Second
 
 	// DefaultQueryTimeout bounds a store query that did not ask for a
 	// timeout. It is applied both as the body timeout (when timeout_ms is
@@ -57,6 +66,11 @@ type storeQueryExecutor interface {
 // journals disagree. It is a variable only so tests can shrink it; production
 // leaves it alone.
 var storeQueryJournalWait = 5 * time.Second
+
+// storeQueryQueueWait is how long a query finding every admission slot busy
+// waits for one before the overloaded refusal. It is a variable only so tests
+// can shrink it; production leaves it at DefaultQueryQueueWait.
+var storeQueryQueueWait = DefaultQueryQueueWait
 
 // validateStoreQueryMetadata checks a store query against the aggregator's
 // own journal before any row is read: every metric the query addresses must
@@ -142,8 +156,9 @@ type storeQueryServerConfig struct {
 	// so this is documentation and diagnostics, not something Serve reads.
 	Address string
 
-	// Concurrency is how many queries execute at once; one more than that
-	// is refused as overloaded. Defaults to DefaultQueryConcurrency.
+	// Concurrency is how many queries execute at once; queries beyond it
+	// wait DefaultQueryQueueWait for a slot and are then refused as
+	// overloaded. Defaults to DefaultQueryConcurrency.
 	Concurrency int
 
 	// CryptoKeys and TrustedSubnetGroups configure the RPC transport the same
@@ -168,7 +183,10 @@ var (
 // permissive settings — workers are bounded, request timeouts apply to the
 // handler context, and the default response timeout is nonzero — and it holds
 // the admission control that keeps a burst of heavy queries from eating the
-// machine ingestion needs.
+// machine ingestion needs. Admission bounds how many queries execute at once;
+// queries beyond the bound wait briefly for a slot (a dashboard's tiles all
+// firing at once must drain, not collide) and are refused as overloaded once
+// the wait expires, so sustained overload never piles queries up.
 //
 // Each admitted query is registered as an RPC longpoll, which is the
 // transport's cancellation registry: a client that cancels the call or drops
@@ -282,11 +300,11 @@ func (q *runningStoreQuery) WriteEmptyResponse(lh rpc.LongpollHandle, hctx *rpc.
 	return rpc.ErrLongpollNoEmptyResponse
 }
 
-// handleQuerySeries and handleQueryTagValues share one body: parse, admit,
-// clamp the timeout, register for cancellation, then run the executor on its
-// own goroutine and answer through the longpoll. Nothing here takes a lock on
-// the ingest path, and admission is refused before any work starts, so
-// ingestion never yields to queries.
+// handleQuerySeries and handleQueryTagValues share one body: parse, clamp
+// the timeout, register for cancellation, then admit and run the executor on
+// its own goroutine and answer through the longpoll. Nothing here takes a
+// lock on the ingest path, and admission bounds how much query work runs at
+// once, so ingestion never yields to queries.
 func (s *storeQueryServer) handleQuerySeries(ctx context.Context, hctx *rpc.HandlerContext) error {
 	var args tlstatshouse.StoreQuerySeries
 	if _, err := args.ReadTL1(hctx.Request); err != nil {
@@ -323,29 +341,21 @@ func badStoreQueryRequest(verb string, err error) error {
 	return duckstore.NewError(duckstore.ErrCodeBadRequest, "malformed %s request: %v", verb, err)
 }
 
-// executeQuery runs one admitted store query. It returns nil when the answer
-// (or the error) is sent through the longpoll; a non-nil return travels the
-// ordinary response path, which is what refusals use. run executes the verb
-// with the query's context; write serializes its result into the response
-// context — which FinishLongpoll hands out only afterwards, a fresh context
-// rather than the handler's own (the transport reuses that one the moment the
+// executeQuery runs one store query. It returns nil once the query —
+// admission included — is handed to its own goroutine; every outcome,
+// refusals included, then travels the longpoll. run executes the verb with
+// the query's context; write serializes its result into the response context
+// — which FinishLongpoll hands out only afterwards, a fresh context rather
+// than the handler's own (the transport reuses that one the moment the
 // handler returns).
 func executeQuery[R any](s *storeQueryServer, ctx context.Context, hctx *rpc.HandlerContext, base tlstatshouse.StoreQueryBase,
 	run func(qctx context.Context) (R, error), write func(respCtx *rpc.HandlerContext, resp R) error) error {
-	// Admission before any work: the slot is refused, not queued. It is held
-	// for as long as the query executes and released only after its answer is
-	// built, so the semaphore counts executing queries, not pending handlers.
-	select {
-	case s.sema <- struct{}{}:
-	default:
-		return duckstore.NewError(duckstore.ErrCodeOverloaded,
-			"all %d query slots busy, retry later", cap(s.sema))
-	}
-
 	// Two cancel layers: the cause-carrying cancel lets the longpoll
 	// canceller record WHY the query died, and the timeout layer bounds it by
 	// the request's clamped timeout_ms (its expiry carries the transport
-	// deadline cause, so an elapsed timeout classifies as one).
+	// deadline cause, so an elapsed timeout classifies as one). The same
+	// layers bound the admission wait: a client that drops or a timeout_ms
+	// that elapses while queued takes the wait — and only the wait — with it.
 	timeout := clampQueryTimeout(base.TimeoutMs)
 	qctx, cancel := context.WithCancelCause(ctx)
 	qctx, timeoutCancel := context.WithTimeoutCause(qctx, timeout, errStoreQueryTransportTimeout)
@@ -355,16 +365,23 @@ func executeQuery[R any](s *storeQueryServer, ctx context.Context, hctx *rpc.Han
 	if err != nil {
 		timeoutCancel()
 		cancel(nil)
-		<-s.sema
 		return err // server shutting down
 	}
-	// The query runs on its own goroutine: the sync handler (and the
-	// connection reader behind it) is freed immediately, so a running query
-	// never blocks the connection reading its own cancel, and heavy queries
-	// cannot block the listener's other traffic.
+	// Admission and execution both run on the query's own goroutine: the sync
+	// handler (and the connection reader behind it) is freed immediately, so
+	// a queued or running query never blocks the connection reading its own
+	// cancel, and heavy queries cannot block the listener's other traffic.
 	go func() {
 		defer timeoutCancel()
 		defer func() { cancel(nil) }() // plain cleanup once the query is done
+		if err := admitQuery(qctx, s.sema); err != nil {
+			// Refused, or the query itself died while waiting: the error is
+			// the answer, exactly as an executor failure is below.
+			if respCtx, ok := lh.FinishLongpoll(); ok {
+				respCtx.SendLongpollResponse(mapStoreQueryError(qctx, err))
+			}
+			return
+		}
 		defer func() { <-s.sema }()
 		resp, err := run(qctx)
 		respCtx, ok := lh.FinishLongpoll()
@@ -382,6 +399,40 @@ func executeQuery[R any](s *storeQueryServer, ctx context.Context, hctx *rpc.Han
 		respCtx.SendLongpollResponse(err)
 	}()
 	return nil
+}
+
+// admitQuery acquires an admission slot, waiting at most storeQueryQueueWait
+// (and never past the query's own context) for one to free up: the wait is
+// what lets a burst of dashboard queries drain through the slots instead of
+// failing on collision. It returns nil once the slot is held — released by
+// the caller — the context's cause when the query died while waiting, or the
+// overloaded refusal when no slot freed in time. Parked senders on the
+// semaphore free up roughly in arrival order, so the queue is roughly FIFO.
+func admitQuery(ctx context.Context, sema chan struct{}) error {
+	if wait := storeQueryQueueWait; wait > 0 {
+		timer := time.NewTimer(wait)
+		defer timer.Stop()
+		select {
+		case sema <- struct{}{}:
+			return nil
+		case <-ctx.Done():
+			return context.Cause(ctx)
+		case <-timer.C:
+		}
+	}
+	// The wait is over: one last look, so a slot freed as the timer fired is
+	// still taken, then the refusal. The slot is held for as long as the
+	// query executes and released only after its answer is built, so the
+	// semaphore counts executing queries, not waiting ones.
+	select {
+	case sema <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	default:
+		return duckstore.NewError(duckstore.ErrCodeOverloaded,
+			"all %d query slots stayed busy for %v, retry later", cap(sema), storeQueryQueueWait)
+	}
 }
 
 // clampQueryTimeout interprets the request's timeout_ms: absent or zero means

@@ -78,6 +78,7 @@ func TestDuckStoreDocDefaultsMatchCode(t *testing.T) {
 		fmt.Sprintf("%d days", int(duckstore.DefaultRetention1m.Hours()/24)),
 		fmt.Sprintf("%d MB", duckstore.DefaultMemoryLimitBytes>>20),
 		fmt.Sprintf("%d concurrent", aggregator.DefaultQueryConcurrency),
+		fmt.Sprintf("%d seconds", int(aggregator.DefaultQueryQueueWait.Seconds())),
 	} {
 		if !strings.Contains(doc, want) {
 			t.Errorf("docs/duck-store.md does not state the code default %q", want)

@@ -171,8 +171,10 @@ Defaults target the smallest viable node, not the available envelope:
 
 - `--duck-memory-limit` — DuckDB memory limit per store file, default 256 MB
   (the temp directory spill bound matches it).
-- `--duck-query-concurrency` — 2 concurrent queries per shard by default; the
-  next concurrent query is refused as overloaded rather than queued.
+- `--duck-query-concurrency` — 2 concurrent queries per shard by default; a
+  query finding every slot busy waits up to 5 seconds for one (so a dashboard's
+  tiles all firing at once drain through the slots instead of failing) and is
+  then refused as overloaded rather than queued indefinitely.
 
 DuckDB runs single-threaded, compaction and sealing run at lowest priority,
 and ingestion never yields to queries — a dashboard cannot starve the insert

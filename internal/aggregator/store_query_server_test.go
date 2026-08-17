@@ -29,6 +29,7 @@ type gatedQueryExecutor struct {
 	mu      sync.Mutex
 	causes  []error // context.Cause of every ended query, in order
 	started chan struct{}
+	total   int // every query that ever reached the executor, waiting or not
 	release chan struct{}
 }
 
@@ -40,35 +41,52 @@ func newGatedQueryExecutor() *gatedQueryExecutor {
 }
 
 func (f *gatedQueryExecutor) QuerySeries(ctx context.Context, args tlstatshouse.StoreQuerySeries) (tlstatshouse.StoreSeriesResponse, error) {
-	f.started <- struct{}{}
+	f.recordStarted()
 	select {
 	case <-f.release:
 		return tlstatshouse.StoreSeriesResponse{}, nil
 	case <-ctx.Done():
-		f.mu.Lock()
-		f.causes = append(f.causes, context.Cause(ctx))
-		f.mu.Unlock()
+		f.recordCause(context.Cause(ctx))
 		return tlstatshouse.StoreSeriesResponse{}, ctx.Err()
 	}
 }
 
 func (f *gatedQueryExecutor) QueryTagValues(ctx context.Context, args tlstatshouse.StoreQueryTagValues) (tlstatshouse.StoreTagValuesResponse, error) {
-	f.started <- struct{}{}
+	f.recordStarted()
 	select {
 	case <-f.release:
 		return tlstatshouse.StoreTagValuesResponse{}, nil
 	case <-ctx.Done():
-		f.mu.Lock()
-		f.causes = append(f.causes, context.Cause(ctx))
-		f.mu.Unlock()
+		f.recordCause(context.Cause(ctx))
 		return tlstatshouse.StoreTagValuesResponse{}, ctx.Err()
 	}
+}
+
+// recordStarted signals waitStarted and bumps the total, which — unlike the
+// channel waitStarted drains — keeps counting every query that arrived.
+func (f *gatedQueryExecutor) recordStarted() {
+	f.mu.Lock()
+	f.total++
+	f.mu.Unlock()
+	f.started <- struct{}{}
+}
+
+func (f *gatedQueryExecutor) recordCause(cause error) {
+	f.mu.Lock()
+	f.causes = append(f.causes, cause)
+	f.mu.Unlock()
 }
 
 func (f *gatedQueryExecutor) endedCauses() []error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]error(nil), f.causes...)
+}
+
+func (f *gatedQueryExecutor) startedTotal() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.total
 }
 
 func (f *gatedQueryExecutor) openGate() { close(f.release) }
@@ -119,10 +137,20 @@ func requireErrorCode(t *testing.T, err error, code int32, what string) {
 	require.Equal(t, code, got, "%s: wrong store error code (%s)", what, name)
 }
 
-// The admission contract: two concurrent queries execute, the third is refused
-// as overloaded instead of queueing, and the admitted pair answer once their
-// executor returns.
+// shrinkQueryQueueWait shortens the admission wait so the refusal tests see
+// their overloaded answer promptly instead of after the production 5 s.
+func shrinkQueryQueueWait(t *testing.T, d time.Duration) {
+	t.Helper()
+	old := storeQueryQueueWait
+	storeQueryQueueWait = d
+	t.Cleanup(func() { storeQueryQueueWait = old })
+}
+
+// The admission contract: two concurrent queries execute, the third waits for
+// a slot for the (here shrunk) queue wait and is then refused as overloaded,
+// and the admitted pair answer once their executor returns.
 func TestStoreQueryServerThirdConcurrentQueryRefusedAsOverloaded(t *testing.T) {
+	shrinkQueryQueueWait(t, 10*time.Millisecond)
 	f := newGatedQueryExecutor()
 	cl := startTestQueryServer(t, f, 2)
 
@@ -175,8 +203,11 @@ func TestStoreQueryServerThirdConcurrentQueryRefusedAsOverloaded(t *testing.T) {
 	require.Empty(t, f.endedCauses(), "no admitted query should have been cancelled")
 }
 
-// The refusal path is immediate: a refused query must not wait for the gate.
+// The refusal path does not wait for admitted queries: once the (here
+// shrunk) queue wait expires, the refusal arrives while the gate is still
+// closed.
 func TestStoreQueryServerRefusalDoesNotWaitForAdmittedQueries(t *testing.T) {
+	shrinkQueryQueueWait(t, 10*time.Millisecond)
 	f := newGatedQueryExecutor()
 	cl := startTestQueryServer(t, f, 1)
 
@@ -191,7 +222,7 @@ func TestStoreQueryServerRefusalDoesNotWaitForAdmittedQueries(t *testing.T) {
 	var ret tlstatshouse.StoreSeriesResponse
 	err := cl.StoreQuerySeries(context.Background(), tlstatshouse.StoreQuerySeries{}, nil, &ret)
 	requireErrorCode(t, err, duckstore.ErrCodeOverloaded, "second concurrent query")
-	require.Less(t, time.Since(start), time.Second, "refusal must be immediate, not queued behind the running query")
+	require.Less(t, time.Since(start), time.Second, "the refusal must follow the queue wait promptly, not the running query")
 
 	f.openGate()
 	select {
@@ -200,6 +231,109 @@ func TestStoreQueryServerRefusalDoesNotWaitForAdmittedQueries(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the admitted query never answered after the gate opened")
 	}
+}
+
+// A burst beyond the slots must queue and drain, not collide: with one slot
+// and the gate closed, three queries arrive together, one executes and two
+// wait; opening the gate must run all three to completion. This is the
+// dashboard shape — every tile firing at once against a shard whose slots
+// are cheaper than the burst — and the reason admission waits instead of
+// refusing on first sight of a busy slot.
+func TestStoreQueryServerBurstQueuesAndDrainsThroughSlots(t *testing.T) {
+	f := newGatedQueryExecutor()
+	cl := startTestQueryServer(t, f, 1)
+
+	const burst = 3
+	errs := make(chan error, burst)
+	for i := 0; i < burst; i++ {
+		go func() {
+			var ret tlstatshouse.StoreSeriesResponse
+			errs <- cl.StoreQuerySeries(context.Background(), tlstatshouse.StoreQuerySeries{}, nil, &ret)
+		}()
+	}
+	// Only the admitted one reaches the executor while the gate is closed;
+	// the other two sit in the admission wait.
+	waitStarted(t, f, 1)
+	select {
+	case err := <-errs:
+		t.Fatalf("a queued query failed instead of waiting: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	f.openGate()
+	for i := 0; i < burst; i++ {
+		select {
+		case err := <-errs:
+			require.NoError(t, err, "every burst query must answer once the gate opens")
+		case <-time.After(5 * time.Second):
+			t.Fatalf("burst query %d of %d never answered", i+1, burst)
+		}
+	}
+	require.Empty(t, f.endedCauses(), "no burst query should have been cancelled")
+}
+
+// A client that drops while queued takes only its wait with it: the query
+// never reaches the executor, no slot is consumed, and a later query still
+// runs once the running one finishes.
+//
+// The waiter carries a short timeout_ms as the test's deterministic backstop:
+// the client-side cancel returns before the server has necessarily processed
+// it, but the server's own body timeout kills the wait at a known time — so
+// by the time the gate opens (after that time) the waiter is provably gone
+// and cannot take the slot the running query releases.
+func TestStoreQueryServerCancelledWaiterTakesNoSlot(t *testing.T) {
+	f := newGatedQueryExecutor()
+	cl := startTestQueryServer(t, f, 1)
+
+	// The running query holds the only slot.
+	done := make(chan error, 1)
+	go func() {
+		var ret tlstatshouse.StoreSeriesResponse
+		done <- cl.StoreQuerySeries(context.Background(), tlstatshouse.StoreQuerySeries{}, nil, &ret)
+	}()
+	waitStarted(t, f, 1)
+
+	// The waiter parks in the admission wait behind it; its client drops well
+	// inside the 300 ms body timeout that bounds the wait server-side.
+	start := time.Now()
+	waiterCtx, cancelWaiter := context.WithCancel(context.Background())
+	waiterArgs := tlstatshouse.StoreQuerySeries{}
+	waiterArgs.Base.TimeoutMs = 300
+	waiterDone := make(chan error, 1)
+	go func() {
+		var ret tlstatshouse.StoreSeriesResponse
+		waiterDone <- cl.StoreQuerySeries(waiterCtx, waiterArgs, nil, &ret)
+	}()
+	select {
+	case err := <-waiterDone:
+		t.Fatalf("the queued query gave up before its client cancelled: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	cancelWaiter()
+	select {
+	case err := <-waiterDone:
+		require.ErrorIs(t, err, context.Canceled, "the cancelled waiter must observe its own cancellation")
+	case <-time.After(5 * time.Second):
+		t.Fatal("the cancelled waiter call never returned")
+	}
+
+	// Only open the gate once the waiter is dead server-side too — the cancel
+	// may still be in flight, but the body timeout has fired for certain.
+	time.Sleep(time.Until(start.Add(400 * time.Millisecond)))
+
+	// The slot went to no one but the running query: a fresh query is
+	// admitted the moment the gate opens, and the waiter never executed.
+	f.openGate()
+	var ret tlstatshouse.StoreSeriesResponse
+	err := cl.StoreQuerySeries(context.Background(), tlstatshouse.StoreQuerySeries{}, nil, &ret)
+	require.NoError(t, err, "the freed slot must serve the next query, not the cancelled waiter")
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the running query never answered after the gate opened")
+	}
+	require.Equal(t, 2, f.startedTotal(), "exactly two queries — the running one and the fresh one — must reach the executor")
 }
 
 // A client that cancels its RPC must actually stop the query: the executor
