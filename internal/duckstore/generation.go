@@ -106,11 +106,16 @@ func (p CrashPoint) String() string {
 // ConsumeOptions tunes ConsumeGeneration.
 type ConsumeOptions struct {
 	// AppendWindow appends one window's share of the generation's rows to the
-	// tier table inside tx, which is already bound to the window file's own
-	// connection with the delta generation attached read-only as
-	// deltaSrcAlias. The default copies the window's rows verbatim;
-	// compaction passes its collapse query instead.
-	AppendWindow func(tx *sql.Tx, tier string, windowStart, windowEnd int64) error
+	// tier table inside one open transaction on conn — driven by BEGIN
+	// TRANSACTION / COMMIT through conn.ExecContext, the writer's protocol —
+	// so an Appender built on the raw connection underneath conn.Raw
+	// participates in the same transaction as the consumption record:
+	// appender flushes join the connection's open transaction rather than
+	// auto-committing. conn is already bound to the window file's own
+	// database with the delta generation attached read-only as deltaSrcAlias.
+	// The default copies the window's rows verbatim; compaction passes its
+	// collapse query instead.
+	AppendWindow func(ctx context.Context, conn *sql.Conn, tier string, windowStart, windowEnd int64) error
 
 	// Fault, when set, is consulted at each CrashPoint; a non-nil error
 	// aborts the consume exactly there, standing in for a process crash:
@@ -265,15 +270,20 @@ func (s *Store) consumeWindow(ctx context.Context, gen int64, deltaPath string, 
 	if sealed {
 		s.cfg.Logf("[error] duck-store: %s is sealed: dropping generation %d rows for a window past the historic window", path, gen)
 		recordMaintenanceWindow(s.cfg.Metrics, WindowLateDropped, k.tier)
-		tx, err := db.BeginTx(ctx, nil)
+		conn, err := db.Conn(ctx)
 		if err != nil {
+			return fmt.Errorf("duck-store: connection to %s: %w", path, err)
+		}
+		defer conn.Close()
+		if _, err := conn.ExecContext(ctx, "BEGIN TRANSACTION"); err != nil {
 			return fmt.Errorf("duck-store: record generation %d in %s: %w", gen, path, err)
 		}
-		if _, err := tx.Exec("INSERT INTO "+ConsumedTable+" VALUES ($1)", gen); err != nil {
-			_ = tx.Rollback()
+		if _, err := conn.ExecContext(ctx, "INSERT INTO "+ConsumedTable+" VALUES ($1)", gen); err != nil {
+			_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
 			return fmt.Errorf("duck-store: record generation %d in %s: %w", gen, path, err)
 		}
-		if err := tx.Commit(); err != nil {
+		if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+			_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
 			return fmt.Errorf("duck-store: commit generation %d record in %s: %w", gen, path, err)
 		}
 		s.mu.Lock()
@@ -295,29 +305,39 @@ func (s *Store) consumeWindow(ctx context.Context, gen int64, deltaPath string, 
 	}
 	defer func() { _, _ = conn.ExecContext(context.Background(), "DETACH "+deltaSrcAlias) }()
 
-	tx, err := conn.BeginTx(ctx, nil)
-	if err != nil {
+	// The writer's transaction protocol, not database/sql's: an explicit BEGIN
+	// TRANSACTION / COMMIT through the connection, so the append's Appender —
+	// which reaches the raw driver connection underneath conn.Raw — flushes
+	// into the very transaction the consumption record and the commit land in
+	// (the writer's tx-probe test pins that appender flushes join the
+	// connection's open transaction). Rollbacks run on a background context by
+	// necessity: the consume's own context may be exactly what died.
+	if _, err := conn.ExecContext(ctx, "BEGIN TRANSACTION"); err != nil {
 		return fmt.Errorf("duck-store: consume generation %d into %s: %w", gen, path, err)
+	}
+	rollback := func() {
+		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
 	}
 	appendWindow := opts.AppendWindow
 	if appendWindow == nil {
 		appendWindow = copyWindowRows
 	}
-	if err := appendWindow(tx, k.tier, k.start, k.start+tierWindowSecs[k.tier]); err != nil {
-		_ = tx.Rollback()
+	if err := appendWindow(ctx, conn, k.tier, k.start, k.start+tierWindowSecs[k.tier]); err != nil {
+		rollback()
 		return fmt.Errorf("duck-store: append generation %d to %s: %w", gen, path, err)
 	}
 	if err := opts.fault(CrashAfterAppendBeforeCommit); err != nil {
-		_ = tx.Rollback()
+		rollback()
 		return err
 	}
 	// The record rides in the append's transaction: same file, so the two
 	// commit together and neither can exist without the other.
-	if _, err := tx.Exec("INSERT INTO "+ConsumedTable+" VALUES ($1)", gen); err != nil {
-		_ = tx.Rollback()
+	if _, err := conn.ExecContext(ctx, "INSERT INTO "+ConsumedTable+" VALUES ($1)", gen); err != nil {
+		rollback()
 		return fmt.Errorf("duck-store: record generation %d in %s: %w", gen, path, err)
 	}
-	if err := tx.Commit(); err != nil {
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		rollback()
 		return fmt.Errorf("duck-store: commit generation %d into %s: %w", gen, path, err)
 	}
 
@@ -335,9 +355,9 @@ func (s *Store) consumeWindow(ctx context.Context, gen int64, deltaPath string, 
 // they sit in the delta. Compaction passes its collapsing AppendWindow
 // instead; correctness never depends on the collapse, because read-time
 // GROUP BY folds whatever rows it finds.
-func copyWindowRows(tx *sql.Tx, tier string, windowStart, windowEnd int64) error {
+func copyWindowRows(ctx context.Context, conn *sql.Conn, tier string, windowStart, windowEnd int64) error {
 	table := tierTables[tier]
-	_, err := tx.Exec(
+	_, err := conn.ExecContext(ctx,
 		fmt.Sprintf("INSERT INTO %s SELECT * FROM %s.%s WHERE time >= $1 AND time < $2", table, deltaSrcAlias, table),
 		windowStart, windowEnd)
 	return err

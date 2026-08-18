@@ -13,6 +13,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io/fs"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -286,6 +288,129 @@ func seq(lo, hi uint64) []uint64 {
 		out = append(out, v)
 	}
 	return out
+}
+
+// writeGoldenSet writes the deterministic golden row set the collapse paths are
+// byte-compared against: keys with tags in both encodings and a string top,
+// real percentile and unique states of varied sizes (including none), hosts in
+// all three columns — empty ones included, skews disagreeing with the true
+// extremes — several partial runs per key across rounds, and rows spanning two
+// 1s-tier windows whose times share 1m and 1h buckets with the fresh ones.
+// Tasks 1, 2 and 9 compare their rewrites byte-for-byte against what this set
+// collapses to.
+func writeGoldenSet(t *testing.T, w *Writer) {
+	t.Helper()
+	now := uint32(writerNow.Unix())
+
+	// key A: three partial rows in one 1s bucket, the skews deliberately
+	// disagreeing with the true extremes — the states, not the values, pick
+	// the hosts
+	a1 := partialRow(t, testMetricID, now-5)
+	a1.Count, a1.Min, a1.Max, a1.Sum, a1.SumSquare = 3, 1.5, 9.75, 21, 101.25
+	a1.Percentiles = pctState(t, 10, 20, 30)
+	a1.Unique = uniqState(t, seq(1, 10)...)
+	a1.MinHost = HostPair{Tag: HostTag{ID: 7}, Value: 0.4}
+	a1.MaxHost = HostPair{Tag: HostTag{S: "hostB"}, Value: 10}
+	a1.MaxCountHost = HostPair{Tag: HostTag{ID: 3}, Value: 1.5}
+
+	a2 := partialRow(t, testMetricID, now-5)
+	a2.Count, a2.Min, a2.Max, a2.Sum, a2.SumSquare = 4, 0.5, 5, 40, 200
+	a2.Percentiles = pctState(t, 40, 50)
+	a2.Unique = uniqState(t, seq(5, 15)...)
+	a2.MinHost = HostPair{Tag: HostTag{ID: 9}, Value: 0.9}
+	a2.MaxHost = HostPair{Tag: HostTag{S: "hostC"}, Value: 6}
+	a2.MaxCountHost = HostPair{Tag: HostTag{ID: 4}, Value: 3.5}
+
+	a3 := partialRow(t, testMetricID, now-5)
+	a3.Count, a3.Min, a3.Max, a3.Sum, a3.SumSquare = 5, 2, 12, 60, 300
+	a3.Percentiles = pctState(t, 60, 70, 80, 90)
+	a3.Unique = uniqState(t, seq(10, 20)...)
+	a3.MinHost = HostPair{}
+	a3.MaxHost = HostPair{Tag: HostTag{S: "hostD"}, Value: 7}
+	a3.MaxCountHost = HostPair{}
+
+	// key A once more, five seconds earlier: a 1s row of its own that shares
+	// key A's 1m and 1h buckets, so the coarser tiers collapse it in while
+	// the 1s tier keeps it apart
+	a4 := partialRow(t, testMetricID, now-10)
+	a4.Count, a4.Min, a4.Max, a4.Sum, a4.SumSquare = 2, 0.25, 3, 5, 12.5
+	a4.Percentiles = pctState(t, 5)
+	a4.Unique = uniqState(t, seq(90, 99)...)
+	a4.MaxHost = HostPair{Tag: HostTag{S: "hostE"}, Value: 2}
+
+	// key B: a value-stat row — no aggregate states, no hosts
+	b := partialRow(t, testMetricID2, now-5)
+	b.Count, b.Min, b.Max, b.Sum, b.SumSquare = 2, 1, 2, 3, 5
+	b.Percentiles = nil
+	b.Unique = nil
+	b.MinHost, b.MaxHost, b.MaxCountHost = HostPair{}, HostPair{}, HostPair{}
+
+	// key C: two partial runs in the previous 1s-tier window, overlapping
+	// unique states
+	c1 := partialRow(t, testMetricID2+1, now-3700)
+	c1.Count, c1.Sum = 4, 44
+	c1.Percentiles = pctState(t, 500, 600)
+	c1.Unique = uniqState(t, seq(200, 240)...)
+	c1.MinHost = HostPair{Tag: HostTag{ID: 21}, Value: 0.1}
+	c2 := partialRow(t, testMetricID2+1, now-3700)
+	c2.Count, c2.Sum = 6, 66
+	c2.Percentiles = pctState(t, 700)
+	c2.Unique = uniqState(t, seq(220, 260)...)
+
+	// key D: a different tag shape and the largest unique, one run
+	d := partialRow(t, testMetricID2+2, now-5)
+	d.Count = 1
+	d.Tags[5] = 55
+	d.STags[6] = "golden raw"
+	d.Top = HostTag{ID: 99}
+	d.Unique = uniqState(t, seq(1000, 1127)...)
+	d.MaxCountHost = HostPair{Tag: HostTag{ID: 12}, Value: 7}
+
+	require.NoError(t, w.WriteRound(context.Background(), []Row{a1, a2, a3, d}))
+	require.NoError(t, w.WriteRound(context.Background(), []Row{a4, b, c1}))
+	require.NoError(t, w.WriteRound(context.Background(), []Row{c2}))
+}
+
+// seedGoldenGeneration writes the golden set into generation 0 of a fresh store
+// in dir, rolls to generation 1 and closes everything: the on-disk state a
+// process that died right after the roll leaves, for whoever opens the
+// directory next to consume.
+func seedGoldenGeneration(t *testing.T, dir string) {
+	t.Helper()
+	s, _ := openTestStore(t, dir)
+	w, err := NewWriter(s, WriterConfig{NowFunc: func() time.Time { return writerNow }})
+	require.NoError(t, err)
+	writeGoldenSet(t, w)
+	require.NoError(t, w.Close())
+	require.NoError(t, s.RollGeneration())
+	require.NoError(t, s.Close())
+}
+
+// copyTree copies a directory tree byte-for-byte, so two stores can consume
+// the very same generation file.
+func copyTree(t *testing.T, src, dst string) {
+	t.Helper()
+	require.NoError(t, filepath.WalkDir(src, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(src, p)
+		if err != nil {
+			return err
+		}
+		out := filepath.Join(dst, rel)
+		if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
+			return err
+		}
+		b, err := os.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(out, b, 0o644)
+	}))
 }
 
 // expectedRows reads a tier's rows off a database and folds them in Go.
@@ -632,6 +757,231 @@ func TestCompactorCrashedCollapseResumesExactlyOnce(t *testing.T) {
 		"s1h/" + fmt.Sprint(testMetricID):  {count: 2, sum: 20, min: 1.5, max: 9.75, sumsquare: 101.25},
 		"s1h/" + fmt.Sprint(testMetricID2): {count: 3, sum: 30, min: 1.5, max: 9.75, sumsquare: 101.25},
 	}, readerTotals(t, s2))
+}
+
+// goldenReferenceInsert is the retired prepared-statement append, verbatim from
+// insertCollapsedGroups before the Appender rewrite: one INSERT per group
+// through a prepared 116-parameter statement.
+func goldenReferenceInsert(tx *sql.Tx, table string, groups []collapsedGroup) error {
+	if len(groups) == 0 {
+		return nil
+	}
+	placeholders := make([]string, tierColumnCount)
+	for i := range placeholders {
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+	}
+	stmt, err := tx.Prepare(fmt.Sprintf("INSERT INTO %s VALUES (%s)", table, strings.Join(placeholders, ", ")))
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	args := make([]any, 0, tierColumnCount)
+	for i := range groups {
+		g := &groups[i]
+		args = args[:0]
+		args = append(args, g.metric, g.time)
+		for ti := range g.tags {
+			args = append(args, g.tags[ti], g.stags[ti])
+		}
+		args = append(args,
+			g.count, g.min, g.max, g.maxCount, g.sum, g.sumSquare,
+			g.minHostID, g.minHostS, g.minHostValue,
+			g.maxHostID, g.maxHostS, g.maxHostValue,
+			g.maxCountHostID, g.maxCountHostS, g.maxCountHostValue,
+			g.percentiles, g.uniq)
+		if _, err := stmt.Exec(args...); err != nil {
+			return fmt.Errorf("insert metric %d at %d: %w", g.metric, g.time, err)
+		}
+	}
+	return nil
+}
+
+// goldenReferenceConsume is the retired consume protocol — a database/sql
+// transaction plus the prepared-statement insert loop — kept verbatim as the
+// byte-identity reference for the Appender rewrite: the same window plan, the
+// same collapse query and fold, the same insert order, the same consumption
+// record. This is the shape consumeWindow and collapseWindowRows had before
+// the connection-level transaction landed.
+func goldenReferenceConsume(t *testing.T, s *Store, gen int64) {
+	t.Helper()
+	ctx := context.Background()
+	deltaPath := filepath.Join(s.cfg.Dir, deltaFileName(gen))
+	windows, err := generationWindows(deltaPath, s.cfg.Resources)
+	require.NoError(t, err)
+	for _, k := range sortedWindowKeys(windows) {
+		path := filepath.Join(s.cfg.Dir, archiveSubdir, archiveFileName(k.tier, k.start))
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			require.NoError(t, createArchiveWindow(path, k.tier, s.currentStamp(), s.cfg.Resources))
+		}
+		db, err := openStoreFile(path, false, s.cfg.Resources)
+		require.NoError(t, err)
+		recorded, err := readConsumed(db)
+		require.NoError(t, err)
+		if _, done := recorded[gen]; done {
+			require.NoError(t, db.Close())
+			continue
+		}
+		conn, err := db.Conn(ctx)
+		require.NoError(t, err)
+		_, err = conn.ExecContext(ctx, fmt.Sprintf("ATTACH %s AS %s (READ_ONLY)", sqlString(deltaPath), deltaSrcAlias))
+		require.NoError(t, err)
+		tx, err := conn.BeginTx(ctx, nil)
+		require.NoError(t, err)
+		table := tierTables[k.tier]
+		groups, err := queryCollapsedGroups(ctx, tx, deltaSrcAlias, table, k.start, k.start+tierWindowSecs[k.tier])
+		require.NoError(t, err)
+		require.NoError(t, goldenReferenceInsert(tx, table, groups))
+		_, err = tx.Exec("INSERT INTO "+ConsumedTable+" VALUES ($1)", gen)
+		require.NoError(t, err)
+		require.NoError(t, tx.Commit())
+		_, _ = conn.ExecContext(ctx, "DETACH "+deltaSrcAlias)
+		require.NoError(t, conn.Close())
+		require.NoError(t, db.Close())
+		s.mu.Lock()
+		s.recordWindowLocked(k, path)
+		if s.consumed[k] == nil {
+			s.consumed[k] = map[int64]struct{}{}
+		}
+		s.consumed[k][gen] = struct{}{}
+		s.mu.Unlock()
+	}
+	s.mu.Lock()
+	s.deltas = removeGeneration(s.deltas, gen)
+	s.mu.Unlock()
+	require.True(t, s.unlinkDelta(deltaPath, gen), "the reference consume must finish like the real one")
+}
+
+// TestCollapseAppenderMatchesPreparedStatementPath pins the Appender rewrite's
+// byte identity: the same golden generation consumed by the retired
+// prepared-statement protocol and by the Appender protocol produces window
+// files holding the same rows — every column, the two aggregate-state blobs
+// included — in the same physical order, with the same consumption records.
+// This golden set is the reference Tasks 2 and 9 keep comparing against.
+func TestCollapseAppenderMatchesPreparedStatementPath(t *testing.T) {
+	refDir := t.TempDir()
+	seedGoldenGeneration(t, refDir)
+	appenderDir := t.TempDir()
+	copyTree(t, refDir, appenderDir)
+
+	ref, _ := openTestStore(t, refDir)
+	defer func() { _ = ref.Close() }()
+	goldenReferenceConsume(t, ref, 0)
+
+	prod, _ := openTestStore(t, appenderDir)
+	defer func() { _ = prod.Close() }()
+	require.NoError(t, prod.ConsumeGeneration(context.Background(), 0, ConsumeOptions{AppendWindow: collapseWindowRows}))
+
+	require.Equal(t, []int64{1}, prod.DeltaGenerations())
+	require.NoFileExists(t, filepath.Join(appenderDir, deltaFileName(0)))
+	require.NoFileExists(t, filepath.Join(refDir, deltaFileName(0)))
+
+	wins := prod.Windows()
+	require.Len(t, wins, 4, "two 1s windows, one 1m window, one 1h window")
+	for _, wf := range wins {
+		refDB, err := openStoreFile(filepath.Join(refDir, archiveSubdir, archiveFileName(wf.Tier, wf.WindowStart)), true, ResourcesConfig{})
+		require.NoError(t, err)
+		prodDB, err := openStoreFile(wf.Path, true, ResourcesConfig{})
+		require.NoError(t, err)
+		refRows := scanTableRows(t, refDB, tierTables[wf.Tier])
+		require.Equal(t, refRows, scanTableRows(t, prodDB, tierTables[wf.Tier]),
+			"%s window %d: every column byte-identical, aggregate-state blobs and physical order included", wf.Tier, wf.WindowStart)
+		refRecorded, err := readConsumed(refDB)
+		require.NoError(t, err)
+		prodRecorded, err := readConsumed(prodDB)
+		require.NoError(t, err)
+		require.Equal(t, refRecorded, prodRecorded)
+		require.NoError(t, refDB.Close())
+		require.NoError(t, prodDB.Close())
+	}
+
+	// the golden set really exercised the collapse: the current 1s window
+	// holds four keys (A's three runs collapsed into one, A again at its own
+	// second, B, D), the previous one holds C's two runs collapsed into one
+	now := uint32(writerNow.Unix())
+	for _, tc := range []struct {
+		tier  string
+		start int64
+		rows  int
+	}{
+		{Tier1s, testWindowStart(Tier1s, int64(now)-3700), 1},
+		{Tier1s, testWindowStart(Tier1s, int64(now)-5), 4},
+		{Tier1m, testWindowStart(Tier1m, int64(now)-5), 4},
+		{Tier1h, testWindowStart(Tier1h, int64(now)-5), 4},
+	} {
+		db, err := openStoreFile(filepath.Join(appenderDir, archiveSubdir, archiveFileName(tc.tier, tc.start)), true, ResourcesConfig{})
+		require.NoError(t, err)
+		require.Len(t, scanTableRows(t, db, tierTables[tc.tier]), tc.rows,
+			"%s window %d", tc.tier, tc.start)
+		require.NoError(t, db.Close())
+	}
+}
+
+// TestConsumeCancelledMidAppendHoldsNeitherRowsNorRecord cancels the consume's
+// context after a window's appender rows are flushed into the open
+// transaction — before the consumption record lands — and proves the rollback
+// leaves the window holding neither the rows nor the record: a flush that
+// escaped the transaction would survive its rollback and double-count on the
+// retry. The resumed consume must then land every value exactly once.
+func TestConsumeCancelledMidAppendHoldsNeitherRowsNorRecord(t *testing.T) {
+	crashDir := t.TempDir()
+	seedGoldenGeneration(t, crashDir)
+	// the same generation consumed cleanly, to compare the resume against
+	cleanDir := t.TempDir()
+	copyTree(t, crashDir, cleanDir)
+
+	s, _ := openTestStore(t, crashDir)
+	defer func() { _ = s.Close() }()
+	ctx, cancel := context.WithCancel(context.Background())
+	appends := 0
+	err := s.ConsumeGeneration(ctx, 0, ConsumeOptions{
+		AppendWindow: func(ctx context.Context, conn *sql.Conn, tier string, windowStart, windowEnd int64) error {
+			if err := collapseWindowRows(ctx, conn, tier, windowStart, windowEnd); err != nil {
+				return err
+			}
+			appends++
+			cancel() // rows flushed into the open transaction; the context dies before the record
+			return nil
+		},
+	})
+	require.Error(t, err)
+	require.Equal(t, 1, appends)
+
+	// the aborted window — the plan's first — holds neither rows nor record
+	deltaPath := filepath.Join(crashDir, deltaFileName(0))
+	windows, err := generationWindows(deltaPath, s.cfg.Resources)
+	require.NoError(t, err)
+	first := sortedWindowKeys(windows)[0]
+	aborted, err := openStoreFile(filepath.Join(crashDir, archiveSubdir, archiveFileName(first.tier, first.start)), true, ResourcesConfig{})
+	require.NoError(t, err)
+	var rows int
+	require.NoError(t, aborted.QueryRow("SELECT count(*) FROM " + tierTables[first.tier]).Scan(&rows))
+	require.Zero(t, rows, "appender rows flushed into the open transaction must not survive its rollback")
+	recorded, err := readConsumed(aborted)
+	require.NoError(t, err)
+	require.Empty(t, recorded, "an aborted append must leave no consumption record")
+	require.NoError(t, aborted.Close())
+
+	// the generation survived, unlinked nowhere; resuming lands everything the
+	// clean consume landed, exactly once
+	require.Equal(t, []int64{0, 1}, s.DeltaGenerations())
+	require.NoError(t, s.ConsumeGeneration(context.Background(), 0, ConsumeOptions{AppendWindow: collapseWindowRows}))
+	require.Equal(t, []int64{1}, s.DeltaGenerations())
+	require.NoFileExists(t, deltaPath)
+
+	clean, _ := openTestStore(t, cleanDir)
+	defer func() { _ = clean.Close() }()
+	require.NoError(t, clean.ConsumeGeneration(context.Background(), 0, ConsumeOptions{AppendWindow: collapseWindowRows}))
+	require.Len(t, clean.Windows(), len(s.Windows()))
+	for _, wf := range clean.Windows() {
+		cleanDB, err := openStoreFile(wf.Path, true, ResourcesConfig{})
+		require.NoError(t, err)
+		resumedDB, err := openStoreFile(filepath.Join(crashDir, archiveSubdir, archiveFileName(wf.Tier, wf.WindowStart)), true, ResourcesConfig{})
+		require.NoError(t, err)
+		require.Equal(t, scanTableRows(t, cleanDB, tierTables[wf.Tier]), scanTableRows(t, resumedDB, tierTables[wf.Tier]),
+			"%s window %d: the resumed consume must land exactly what a clean one does", wf.Tier, wf.WindowStart)
+		require.NoError(t, cleanDB.Close())
+		require.NoError(t, resumedDB.Close())
+	}
 }
 
 // TestCompactOnceIdleStoreKeepsItsGeneration pins the idle path: no rows, no

@@ -292,6 +292,75 @@ func TestSealerRunsAlongsideIngestion(t *testing.T) {
 	require.EqualValues(t, 2, c, "the sealed window's own value must survive the loops")
 }
 
+// TestSealRewriteRollsBackAppendedRowsWithMarker fails the seal's transaction
+// AFTER the sealed table is filled through the appender — the moment a flush
+// escaping the transaction would leak rows — and proves the rollback leaves
+// the window exactly as it was: no sealed table, no marker, every original row
+// intact. With the fault removed, the seal completes and lands the rewrite
+// and the marker together.
+func TestSealRewriteRollsBackAppendedRowsWithMarker(t *testing.T) {
+	s, w := newTestWriter(t)
+	writeCollapseFixture(t, s, w)
+	require.NoError(t, w.Close())
+	require.NoError(t, NewCompactor(s, CompactorConfig{}).CompactOnce(context.Background()))
+
+	start := testWindowStart(Tier1s, int64(uint32(writerNow.Unix()))-5)
+	wf := findWindow(t, s, Tier1s, start)
+	ro, err := openStoreFile(wf.Path, true, ResourcesConfig{})
+	require.NoError(t, err)
+	before := scanTableRows(t, ro, tierTables[Tier1s])
+	require.NoError(t, ro.Close())
+
+	// a marker table that cannot take the marker row makes the rewrite fail
+	// after its fill: the sealed table's rows are appended by then, and the
+	// one-value INSERT no longer matches the table's widened column count
+	rw, err := openStoreFile(wf.Path, false, ResourcesConfig{})
+	require.NoError(t, err)
+	_, err = rw.Exec("ALTER TABLE " + SealedTable + " ADD COLUMN probe INTEGER")
+	require.NoError(t, err)
+	require.NoError(t, rw.Close())
+
+	err = s.SealWindow(context.Background(), Tier1s, start)
+	require.Error(t, err, "the seal must fail when the marker cannot land")
+	require.Contains(t, err.Error(), "plant the marker")
+
+	// the rollback discarded the whole rewrite: no sealed table, no marker,
+	// and the window's rows exactly as they were
+	db, err := openStoreFile(wf.Path, true, ResourcesConfig{})
+	require.NoError(t, err)
+	require.Equal(t, before, scanTableRows(t, db, tierTables[Tier1s]),
+		"the rolled-back rewrite must leave the original run untouched")
+	var sealedTables int
+	require.NoError(t, db.QueryRow(
+		"SELECT count(*) FROM duckdb_tables() WHERE table_name = $1", tierTables[Tier1s]+"_sealed").Scan(&sealedTables))
+	require.Zero(t, sealedTables, "the appender-filled sealed table must not survive the rollback")
+	sealed, err := readSealed(db)
+	require.NoError(t, err)
+	require.False(t, sealed)
+	require.NoError(t, db.Close())
+	require.False(t, findWindow(t, s, Tier1s, start).Sealed, "a failed seal must not mark the window sealed")
+
+	// with the fault removed the seal completes: the rewrite and the marker
+	// commit together
+	rw2, err := openStoreFile(wf.Path, false, ResourcesConfig{})
+	require.NoError(t, err)
+	_, err = rw2.Exec("ALTER TABLE " + SealedTable + " DROP COLUMN probe")
+	require.NoError(t, err)
+	require.NoError(t, rw2.Close())
+
+	require.NoError(t, s.SealWindow(context.Background(), Tier1s, start))
+	require.True(t, findWindow(t, s, Tier1s, start).Sealed)
+	db2, err := openStoreFile(wf.Path, true, ResourcesConfig{})
+	require.NoError(t, err)
+	defer db2.Close()
+	after := scanTableRows(t, db2, tierTables[Tier1s])
+	require.Len(t, after, len(decodeRows(t, before)), "one row per key: the runs were rewritten into one")
+	requireSameDecoded(t, decodeRows(t, before), decodeRows(t, after))
+	sealed, err = readSealed(db2)
+	require.NoError(t, err)
+	require.True(t, sealed)
+}
+
 // TestWindowSealDue pins the boundary arithmetic: window end plus the historic
 // window, per tier.
 func TestWindowSealDue(t *testing.T) {

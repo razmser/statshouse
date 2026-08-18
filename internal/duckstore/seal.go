@@ -216,39 +216,44 @@ func (s *Store) SealWindow(ctx context.Context, tier string, windowStart int64) 
 // rewriteWindowRuns is the seal's transaction: collapse the window's rows —
 // reading the window's own table, the same statement compaction runs over the
 // delta — into a fresh table, swap it in under the original name, and plant
-// the sealed marker, all committing or rolling back together.
+// the sealed marker, all committing or rolling back together. The transaction
+// is the writer's protocol — explicit BEGIN TRANSACTION / COMMIT through the
+// connection — so the appender filling the fresh table flushes into the very
+// transaction the swap and the marker land in.
 func (s *Store) rewriteWindowRuns(ctx context.Context, conn *sql.Conn, tier, table string, windowStart int64) error {
-	tx, err := conn.BeginTx(ctx, nil)
-	if err != nil {
+	if _, err := conn.ExecContext(ctx, "BEGIN TRANSACTION"); err != nil {
 		return err
 	}
 	fail := func(err error) error {
-		_ = tx.Rollback()
+		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
 		return err
 	}
-	groups, err := queryCollapsedGroups(tx, "main", table, windowStart, windowStart+tierWindowSecs[tier])
+	groups, err := queryCollapsedGroups(ctx, conn, "main", table, windowStart, windowStart+tierWindowSecs[tier])
 	if err != nil {
 		return fail(fmt.Errorf("collapse %s: %w", table, err))
 	}
 	sealedTable := table + "_sealed"
-	if _, err := tx.Exec(tierTableDDL(sealedTable)); err != nil {
+	if _, err := conn.ExecContext(ctx, tierTableDDL(sealedTable)); err != nil {
 		return fail(fmt.Errorf("create %s: %w", sealedTable, err))
 	}
-	if err := insertCollapsedGroups(tx, sealedTable, groups); err != nil {
+	if err := insertCollapsedGroups(ctx, conn, sealedTable, groups); err != nil {
 		return fail(fmt.Errorf("fill %s: %w", sealedTable, err))
 	}
-	if _, err := tx.Exec("DROP TABLE " + table); err != nil {
+	if _, err := conn.ExecContext(ctx, "DROP TABLE "+table); err != nil {
 		return fail(fmt.Errorf("drop %s: %w", table, err))
 	}
-	if _, err := tx.Exec(fmt.Sprintf("ALTER TABLE %s RENAME TO %s", sealedTable, table)); err != nil {
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s RENAME TO %s", sealedTable, table)); err != nil {
 		return fail(fmt.Errorf("rename %s to %s: %w", sealedTable, table, err))
 	}
 	// The marker rides in the rewrite's transaction: same file, so neither
 	// can exist without the other.
-	if _, err := tx.Exec("INSERT INTO " + SealedTable + " VALUES (true)"); err != nil {
+	if _, err := conn.ExecContext(ctx, "INSERT INTO "+SealedTable+" VALUES (true)"); err != nil {
 		return fail(fmt.Errorf("plant the marker in %s: %w", SealedTable, err))
 	}
-	return tx.Commit()
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return fail(err)
+	}
+	return nil
 }
 
 // markWindowSealed flips the served window's in-memory sealed flag.
