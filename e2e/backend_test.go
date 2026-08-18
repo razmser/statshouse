@@ -131,6 +131,13 @@ func TestDuckAggSpecCrossCompileFlags(t *testing.T) {
 	if !agg.duckDB {
 		t.Fatal("the duck agg spec must carry duckDB (the -tags duckdb + static-link path in buildOneDaemon)")
 	}
+	// osusergo is load-bearing for the static link: without it the cgo
+	// getgrnam cannot resolve even "root" and the agg dies at ChangeUserGroup
+	for _, tag := range []string{"duckdb", "osusergo"} {
+		if !strings.Contains(" "+duckBuildTags+" ", " "+tag+" ") {
+			t.Fatalf("duckBuildTags %q must carry %q", duckBuildTags, tag)
+		}
+	}
 	plain := findSpec(t, backendClickHouse, "./cmd/statshouse-agg")
 	if plain.duckDB || plain.cgo {
 		t.Fatalf("the clickhouse agg spec %+v must stay the pure-Go CGO_ENABLED=0 build", plain)

@@ -418,12 +418,6 @@ func copyTree(t *testing.T, src, dst string) {
 	}))
 }
 
-// expectedRows reads a tier's rows off a database and folds them in Go.
-func expectedRows(t *testing.T, db *sql.DB, tier string) map[decodedKey]*decodedGroup {
-	t.Helper()
-	return decodeRows(t, scanTableRows(t, db, tierTables[tier]))
-}
-
 // floorRowsToTier returns the rows with time truncated to the tier's
 // interval — the derivation the coarser tiers are over the delta's 1s rows,
 // applied to the reference read so it can stand in for the retired per-tier

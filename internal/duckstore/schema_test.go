@@ -80,6 +80,44 @@ func TestTierSeconds(t *testing.T) {
 	require.EqualValues(t, 3600, tierSeconds[Tier1h])
 }
 
+// TestTierTimeExpr pins the exact derivation expressions, in the untagged
+// build where this file is their only visible surface: the 1s tier must read
+// the plain column — the byte-identity of every 1s-tier and archive statement
+// depends on it — and the coarser tiers must floor, never round, so the
+// derived bucket is the one the retired per-tier tables held.
+func TestTierTimeExpr(t *testing.T) {
+	require.Equal(t, "time", tierTimeExpr(Tier1s))
+	require.Equal(t, "time - time % 60", tierTimeExpr(Tier1m))
+	require.Equal(t, "time - time % 3600", tierTimeExpr(Tier1h))
+}
+
+// TestDerivedTierSelectMatchesDDLColumnOrder pins the whole-row projection's
+// shape: time — and only time — is read through the expression, everything
+// else stays the plain column, and the order is the physical DDL order the
+// INSERT INTO <table> SELECT projection depends on.
+func TestDerivedTierSelectMatchesDDLColumnOrder(t *testing.T) {
+	require.Equal(t, "*", derivedTierSelect("time"))
+
+	var ddlCols []string
+	for _, line := range strings.Split(tierTableDDL(TierTable(Tier1s)), "\n") {
+		f := strings.Fields(line)
+		if len(f) == 0 || f[0] == "CREATE" || strings.HasPrefix(f[0], ")") {
+			continue
+		}
+		ddlCols = append(ddlCols, f[0])
+	}
+	require.Equal(t, tierColumns, ddlCols)
+
+	proj := strings.Split(derivedTierSelect(tierTimeExpr(Tier1m)), ", ")
+	require.Len(t, proj, len(tierColumns))
+	require.Equal(t, "metric", proj[0])
+	require.Equal(t, tierTimeExpr(Tier1m)+" AS time", proj[1])
+	// substituting the plain column back in must restore the DDL order —
+	// anything else was projected or dropped
+	restored := append([]string{proj[0], "time"}, proj[2:]...)
+	require.Equal(t, tierColumns, restored)
+}
+
 // TestSchemaVersionAxesAreScopedByFileKind pins the file-kind taxonomy the two
 // schema-version axes hang on (DeltaSchemaVersion / ArchiveSchemaVersion) —
 // in the untagged build, where this file is the axes' only visible surface.

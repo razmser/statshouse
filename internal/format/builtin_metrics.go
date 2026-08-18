@@ -1621,11 +1621,6 @@ const (
 	TagValueIDDuckQueryRefused = 4
 )
 
-var duckQueryAdmissionToValue = map[int32]string{
-	TagValueIDDuckQueryQueued:  "queued",
-	TagValueIDDuckQueryRefused: "refused",
-}
-
 const (
 	TagValueIDDuckSizeDelta   = 1
 	TagValueIDDuckSizeArchive = 2

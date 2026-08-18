@@ -30,6 +30,13 @@ var daemonCmds = []daemonSpec{
 	{bin: "statshouse", pkg: "./cmd/statshouse", cgo: false},
 }
 
+// duckBuildTags is the DuckDB-tagged aggregator's build-tag set: duckdb for
+// the store itself, osusergo so os/user reads /etc/group directly instead of
+// going through the cgo getgrnam a static glibc link cannot serve (no NSS
+// modules to dlopen) — the agg's fatal ChangeUserGroup would otherwise kill
+// the daemon at startup.
+const duckBuildTags = "duckdb osusergo"
+
 type daemonSpec struct {
 	bin string
 	pkg string
@@ -124,7 +131,7 @@ func buildOneDaemon(ctx context.Context, repoRoot, arch string, d daemonSpec, ou
 		if err != nil {
 			return fmt.Errorf("build %s: %w", d.pkg, err)
 		}
-		args = append(args, "-tags", "duckdb", "-ldflags", "-s -extldflags '"+ext+"'")
+		args = append(args, "-tags", duckBuildTags, "-ldflags", "-s -extldflags '"+ext+"'")
 		env = append(env, "CGO_ENABLED=1", "CC="+cc)
 	case d.cgo:
 		cc, err := crossCC(arch)
