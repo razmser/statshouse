@@ -193,6 +193,8 @@ func duckWindowEventTag(kind duckstore.WindowEventKind) int32 {
 		return format.TagValueIDDuckWindowLeaseDeferred
 	case duckstore.WindowLateDropped:
 		return format.TagValueIDDuckWindowLateDropped
+	case duckstore.WindowRecollapsed:
+		return format.TagValueIDDuckWindowRecollapsed
 	}
 	return 0
 }

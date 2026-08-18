@@ -45,11 +45,34 @@ import (
 // only behind the barrier (sealBarrier): a coordinated roll-and-drain that
 // establishes, durably, that no generation — the active one included — can
 // still contribute a row to any window the pass is about to seal.
+//
+// A pass also tends the windows that are not going anywhere yet: the
+// intra-window re-collapse. A window stays unsealed — still accepting rows —
+// for its whole length plus the historic window, while compaction appends a
+// fresh partial run every pass, so an unsealed window's table accumulates
+// runs for up to two days (1s tier) or a month (1h tier) before the seal
+// folds them. The sweep after the sealing half rewrites the windows
+// compaction appended to, through the very statement the seal uses minus the
+// marker, whenever a window's physical rows exceed a factor of its collapsed
+// count — so no unsealed window holds more than that factor times its
+// collapsed rows for longer than one sealer interval.
 
 // DefaultSealerInterval is how often the sealer wakes to look for windows past
 // their seal time. Sealing is rare — one rewrite per window lifetime, 48
 // hours after the window closed — so the cadence is relaxed.
 const DefaultSealerInterval = 30 * time.Second
+
+// DefaultRecollapseFactor is the re-collapse trigger: how many physical rows
+// per collapsed row an unsealed archive window may accumulate before the
+// sealer's sweep folds them back into one run. The trade it picks is
+// amortized — each rewrite processes at most factor times the collapsed rows
+// while at least factor-1 times them were appended since the previous one,
+// so the steady-state cost is O(factor/(factor-1)) row-rewrites per appended
+// row, 4/3 at this default — against the read and disk cost of an unsealed
+// window holding up to factor times its collapsed rows between sweeps. It is
+// a constant, not a flag: the amortization argument, not a deployment
+// property, picks it.
+const DefaultRecollapseFactor = 4
 
 // SealerConfig configures a Sealer.
 type SealerConfig struct {
@@ -62,8 +85,14 @@ type SealerConfig struct {
 	NowFunc func() time.Time
 
 	// Metrics receives each pass's timing (MaintenanceSealing) and one
-	// MaintenanceWindow per window the pass sealed. Optional.
+	// MaintenanceWindow per window the pass sealed or re-collapsed. Optional.
 	Metrics MetricsRecorder
+
+	// RecollapseFactor is how many physical rows per collapsed row an
+	// unsealed archive window may accumulate before the pass's re-collapse
+	// sweep rewrites it; see DefaultRecollapseFactor. Values below one take
+	// the default.
+	RecollapseFactor int
 
 	// DrainFault, when set, is consulted at each crash point of every
 	// generation the seal barrier consumes — the ConsumeOptions.Fault
@@ -96,6 +125,9 @@ type Sealer struct {
 func NewSealer(s *Store, cfg SealerConfig) *Sealer {
 	if cfg.Interval <= 0 {
 		cfg.Interval = DefaultSealerInterval
+	}
+	if cfg.RecollapseFactor <= 0 {
+		cfg.RecollapseFactor = DefaultRecollapseFactor
 	}
 	if cfg.NowFunc == nil {
 		cfg.NowFunc = time.Now
@@ -150,24 +182,54 @@ func (sl *Sealer) sealOnce(ctx context.Context) error {
 		}
 		due = append(due, windowKey{tier: wf.Tier, start: wf.WindowStart})
 	}
-	if len(due) == 0 {
-		return nil
+	if len(due) > 0 {
+		if err := sl.store.sealBarrier(ctx, due, sl.cfg.DrainFault); err != nil {
+			return err
+		}
+		for _, k := range due {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if err := sl.store.SealWindow(ctx, k.tier, k.start); err != nil {
+				if errors.Is(err, fs.ErrNotExist) {
+					continue // the window left between the barrier and the rewrite
+				}
+				return fmt.Errorf("duck-store: seal %s: %w",
+					filepath.Join(sl.store.cfg.Dir, archiveSubdir, archiveFileName(k.tier, k.start)), err)
+			}
+			recordMaintenanceWindow(sl.cfg.Metrics, WindowSealed, k.tier)
+		}
 	}
-	if err := sl.store.sealBarrier(ctx, due, sl.cfg.DrainFault); err != nil {
-		return err
-	}
-	for _, k := range due {
+	// The other half of the pass tends the windows not going anywhere yet:
+	// folding the partial rows compaction keeps appending to them.
+	return sl.recollapseSweep(ctx)
+}
+
+// recollapseSweep re-collapses the archive windows compaction appended to
+// since the previous pass: each candidate is measured, and the ones holding
+// more physical rows than RecollapseFactor times their collapsed count are
+// rewritten in place through the seal's own statement, minus the marker. The
+// sweep drains the candidate set before opening any file — an append that
+// lands while it works cannot hold the window's write lock, so it either
+// marked before the drain and is being checked, or marks after it and is the
+// next pass's candidate; no append is missed either way. A window whose check
+// fails is re-armed before the pass gives up, so the next pass retries it.
+func (sl *Sealer) recollapseSweep(ctx context.Context) error {
+	for _, k := range sl.store.takeRecollapseCandidates() {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if err := sl.store.SealWindow(ctx, k.tier, k.start); err != nil {
+		recollapsed, err := sl.store.RecollapseWindow(ctx, k.tier, k.start, sl.cfg.RecollapseFactor)
+		if err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
-				continue // the window left between the barrier and the rewrite
+				continue // the window left between the sweep and the rewrite
 			}
-			return fmt.Errorf("duck-store: seal %s: %w",
-				filepath.Join(sl.store.cfg.Dir, archiveSubdir, archiveFileName(k.tier, k.start)), err)
+			sl.store.markRecollapse(k) // the next pass retries this window
+			return err
 		}
-		recordMaintenanceWindow(sl.cfg.Metrics, WindowSealed, k.tier)
+		if recollapsed {
+			recordMaintenanceWindow(sl.cfg.Metrics, WindowRecollapsed, k.tier)
+		}
 	}
 	return nil
 }
@@ -324,7 +386,7 @@ func (s *Store) SealWindow(ctx context.Context, tier string, windowStart int64) 
 		_ = db.Close()
 		return fmt.Errorf("duck-store: seal %s: %w", path, err)
 	}
-	if err := s.rewriteWindowRuns(ctx, conn, tier, table, windowStart); err != nil {
+	if err := s.rewriteWindowRuns(ctx, conn, tier, table, windowStart, true); err != nil {
 		_ = conn.Close()
 		_ = db.Close()
 		return fmt.Errorf("duck-store: seal %s: %w", path, err)
@@ -358,14 +420,15 @@ func (s *Store) SealWindow(ctx context.Context, tier string, windowStart int64) 
 	return nil
 }
 
-// rewriteWindowRuns is the seal's transaction: collapse the window's rows —
-// the same one-statement collapse compaction runs over the delta, reading the
-// window's own table — into a fresh table, swap it in under the original name,
-// and plant the sealed marker, all committing or rolling back together. The
-// transaction is the writer's protocol — explicit BEGIN TRANSACTION / COMMIT
-// through the connection — and the collapse's fold UDFs are registered on the
-// connection before it opens, since DuckDB UDFs live per-connection.
-func (s *Store) rewriteWindowRuns(ctx context.Context, conn *sql.Conn, tier, table string, windowStart int64) error {
+// rewriteWindowRuns is the seal's and the re-collapse's shared transaction:
+// collapse the window's rows — the same one-statement collapse compaction
+// runs over the delta, reading the window's own table — into a fresh table,
+// swap it in under the original name and, when sealing, plant the sealed
+// marker, all committing or rolling back together. The transaction is the
+// writer's protocol — explicit BEGIN TRANSACTION / COMMIT through the
+// connection — and the collapse's fold UDFs are registered on the connection
+// before it opens, since DuckDB UDFs live per-connection.
+func (s *Store) rewriteWindowRuns(ctx context.Context, conn *sql.Conn, tier, table string, windowStart int64, seal bool) error {
 	if err := registerFoldUDFs(conn); err != nil {
 		return err
 	}
@@ -376,32 +439,150 @@ func (s *Store) rewriteWindowRuns(ctx context.Context, conn *sql.Conn, tier, tab
 		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
 		return err
 	}
-	sealedTable := table + "_sealed"
-	if _, err := conn.ExecContext(ctx, tierTableDDL(sealedTable)); err != nil {
-		return fail(fmt.Errorf("create %s: %w", sealedTable, err))
+	fresh := table + "_sealed"
+	if !seal {
+		fresh = table + "_recollapsed"
+	}
+	if _, err := conn.ExecContext(ctx, tierTableDDL(fresh)); err != nil {
+		return fail(fmt.Errorf("create %s: %w", fresh, err))
 	}
 	// The window's rows are already tier-truncated, so the collapse reads
 	// the plain time column — the statement stays the one the tier's own
 	// table always produced.
 	if _, err := conn.ExecContext(ctx,
-		collapseInsert(sealedTable, "main", table, "time"), windowStart, windowStart+tierWindowSecs[tier]); err != nil {
-		return fail(fmt.Errorf("collapse %s into %s: %w", table, sealedTable, err))
+		collapseInsert(fresh, "main", table, "time"), windowStart, windowStart+tierWindowSecs[tier]); err != nil {
+		return fail(fmt.Errorf("collapse %s into %s: %w", table, fresh, err))
 	}
 	if _, err := conn.ExecContext(ctx, "DROP TABLE "+table); err != nil {
 		return fail(fmt.Errorf("drop %s: %w", table, err))
 	}
-	if _, err := conn.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s RENAME TO %s", sealedTable, table)); err != nil {
-		return fail(fmt.Errorf("rename %s to %s: %w", sealedTable, table, err))
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s RENAME TO %s", fresh, table)); err != nil {
+		return fail(fmt.Errorf("rename %s to %s: %w", fresh, table, err))
 	}
-	// The marker rides in the rewrite's transaction: same file, so neither
-	// can exist without the other.
-	if _, err := conn.ExecContext(ctx, "INSERT INTO "+SealedTable+" VALUES (true)"); err != nil {
-		return fail(fmt.Errorf("plant the marker in %s: %w", SealedTable, err))
+	if seal {
+		// The marker rides in the rewrite's transaction: same file, so neither
+		// can exist without the other.
+		if _, err := conn.ExecContext(ctx, "INSERT INTO "+SealedTable+" VALUES (true)"); err != nil {
+			return fail(fmt.Errorf("plant the marker in %s: %w", SealedTable, err))
+		}
 	}
 	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
 		return fail(err)
 	}
 	return nil
+}
+
+// RecollapseWindow rewrites one unsealed archive window's accumulated partial
+// runs in place: the same collapse statement the seal plants its marker with,
+// minus the marker, so the window keeps accepting rows afterwards. The stored
+// contents come out decode-equivalent — every column the collapse folds is
+// safe to fold again — merely physically denser: one collapsed, (metric,
+// time)-sorted run per key. It reports whether it rewrote. A window holding
+// no more than factor times its collapsed count is left alone, and so is a
+// sealed window, whose contents must never change again; a window whose file
+// is gone reports fs.ErrNotExist. The whole check-and-rewrite holds the
+// window's own write lock (window_locks.go), serializing against
+// compaction's appends, the sealer's rewrite and retention's unlink of the
+// same file while work on every other window proceeds in parallel. The file
+// is not reopened read-only afterwards: an unsealed window stays writable —
+// exactly the state it serves in.
+func (s *Store) RecollapseWindow(ctx context.Context, tier string, windowStart int64, factor int) (bool, error) {
+	if factor <= 0 {
+		factor = DefaultRecollapseFactor
+	}
+	k := windowKey{tier: tier, start: windowStart}
+	path := filepath.Join(s.cfg.Dir, archiveSubdir, archiveFileName(tier, windowStart))
+	table := tierTables[tier]
+
+	unlock := s.lockWindowWrite(k)
+	defer unlock()
+
+	if _, err := os.Stat(path); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, fmt.Errorf("duck-store: window %s: %w", path, fs.ErrNotExist)
+		}
+		return false, fmt.Errorf("duck-store: recollapse %s: %w", path, err)
+	}
+	db, err := openStoreFile(path, false, s.cfg.Resources)
+	if err != nil {
+		return false, fmt.Errorf("duck-store: recollapse %s: %w", path, err)
+	}
+	defer db.Close()
+
+	// The marker decides, not the served list's in-memory flag: a window
+	// sealed between the sweep's snapshot and this lock already holds its
+	// final, folded state, and rewriting it again is at best wasted work —
+	// at worst it churnes a file nothing may change again.
+	sealed, err := readSealed(db)
+	if err != nil {
+		return false, fmt.Errorf("duck-store: read %s of %s: %w", SealedTable, path, err)
+	}
+	if sealed {
+		return false, nil
+	}
+
+	physical, collapsed, err := countCollapseGroups(db, table)
+	if err != nil {
+		return false, fmt.Errorf("duck-store: count %s in %s: %w", table, path, err)
+	}
+	if physical <= int64(factor)*collapsed {
+		return false, nil
+	}
+
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return false, fmt.Errorf("duck-store: recollapse %s: %w", path, err)
+	}
+	err = s.rewriteWindowRuns(ctx, conn, tier, table, windowStart, false)
+	_ = conn.Close()
+	if err != nil {
+		return false, fmt.Errorf("duck-store: recollapse %s: %w", path, err)
+	}
+
+	// Fold the rewrite's dead blocks into the file itself — half the point of
+	// re-collapsing is the disk. Best-effort, the way the seal's is: a failure
+	// leaves a correct, merely uncompact file.
+	if _, err := db.Exec("CHECKPOINT"); err != nil {
+		s.cfg.Logf("[error] duck-store: checkpoint %s after re-collapsing: %v", path, err)
+	}
+	s.cfg.Logf("[info] duck-store: re-collapsed %s: %d partial rows folded into %d", path, physical, collapsed)
+	return true, nil
+}
+
+// markRecollapseLocked adds k to the re-collapse candidate set; callers hold
+// s.mu. Every window an append lands in is a candidate — compaction's
+// consumeWindow marks on commit — and an open seeds the unsealed windows it
+// recovers from disk, because a restarted process owes them a check no append
+// of its own will trigger.
+func (s *Store) markRecollapseLocked(k windowKey) {
+	if s.recollapsePending == nil {
+		s.recollapsePending = map[windowKey]struct{}{}
+	}
+	s.recollapsePending[k] = struct{}{}
+}
+
+// markRecollapse is markRecollapseLocked taking s.mu itself.
+func (s *Store) markRecollapse(k windowKey) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.markRecollapseLocked(k)
+}
+
+// takeRecollapseCandidates drains the re-collapse candidate set in the
+// canonical window order. Draining under one lock, before any file is opened,
+// is what keeps the sweep correct against concurrent appends: an append
+// landing while the sweep works cannot hold its window's write lock, so it
+// either marked before the drain and is being checked, or marks after it and
+// is the next pass's candidate — no append is missed either way.
+func (s *Store) takeRecollapseCandidates() []windowKey {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.recollapsePending) == 0 {
+		return nil
+	}
+	ks := sortedWindowKeys(s.recollapsePending)
+	s.recollapsePending = map[windowKey]struct{}{}
+	return ks
 }
 
 // markWindowSealed flips the served window's in-memory sealed flag.

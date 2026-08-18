@@ -134,6 +134,13 @@ type Store struct {
 	windows     []WindowFile
 	consumed    map[windowKey]map[int64]struct{} // per archive window, the delta generations it already holds
 	evicted     map[windowKey]struct{}           // per successfully unlinked window: a tombstone marking "consumed, then evicted" so an absent s.consumed entry keeps meaning "never consumed" (see DropWindow)
+	// recollapsePending is the set of archive windows whose tables may hold
+	// more partial rows than the re-collapse factor allows: every window an
+	// append commits into is marked, and the sealer's sweep drains the set
+	// and rewrites the ones past the factor (seal.go). Bounded by the window
+	// count, in-memory only — an open re-seeds it from the unsealed windows
+	// it recovers, which is the same information a restart has.
+	recollapsePending map[windowKey]struct{}
 	leases      map[windowKey]int                // per archive window, the read leases queries hold; retention defers unlinks to them
 	deltaPins   map[int64]*deltaPinState         // per delta generation, the read pins queries hold; consumption's unlink waits for them (see lease.go)
 	quarantined []QuarantineInfo
@@ -162,6 +169,7 @@ func OpenStore(cfg StoreConfig) (*Store, error) {
 		archiveSchemaVersion: ArchiveSchemaVersion,
 		consumed:             map[windowKey]map[int64]struct{}{},
 		evicted:              map[windowKey]struct{}{},
+		recollapsePending:    map[windowKey]struct{}{},
 		rolledOff:            map[int64]time.Time{},
 	}
 
@@ -490,6 +498,12 @@ func (s *Store) scanArchives() error {
 			continue
 		}
 		s.windows = append(s.windows, WindowFile{Tier: tier, WindowStart: windowStart, Path: path, Sealed: sealed})
+		if !sealed {
+			// A window recovered unsealed may hold partial runs a previous
+			// process's sealer never folded, and no append of this process's
+			// own will mark it — the open owes it the re-collapse check.
+			s.markRecollapseLocked(windowKey{tier: tier, start: windowStart})
+		}
 	}
 	sort.Slice(s.windows, func(i, j int) bool { return lessWindow(s.windows[i], s.windows[j]) })
 	return nil

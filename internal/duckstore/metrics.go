@@ -54,6 +54,13 @@ const (
 	// before sealing it, and the guard rejects rows for a window once due —
 	// so any count is a sender violating the historic window.
 	WindowLateDropped WindowEventKind = "late_dropped"
+	// WindowRecollapsed: the sealer's intra-window re-collapse folded an
+	// unsealed window's accumulated partial runs back into one, ahead of the
+	// seal and without freezing anything — the window keeps accepting rows
+	// afterwards. A steady stream of these is the expected shape of a busy
+	// store; a window recollapsed far more often than its peers is holding
+	// more distinct keys than its collapse can densify.
+	WindowRecollapsed WindowEventKind = "recollapsed"
 )
 
 // QuarantineAxis is why a store file was quarantined on open: which of the

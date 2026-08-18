@@ -91,6 +91,7 @@ func openTestStoreWithSchemaAxes(t *testing.T, dir string, deltaAxis, archiveAxi
 		deltaSchemaVersion:   deltaAxis,
 		archiveSchemaVersion: archiveAxis,
 		consumed:             map[windowKey]map[int64]struct{}{},
+		recollapsePending:    map[windowKey]struct{}{},
 		rolledOff:            map[int64]time.Time{},
 	}
 	require.NoError(t, s.scanArchives())

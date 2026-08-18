@@ -1563,6 +1563,7 @@ const (
 	TagValueIDDuckWindowEarlyEvicted  = 3
 	TagValueIDDuckWindowLeaseDeferred = 4
 	TagValueIDDuckWindowLateDropped   = 5
+	TagValueIDDuckWindowRecollapsed   = 6
 )
 
 var duckWindowEventToValue = map[int32]string{
@@ -1571,6 +1572,7 @@ var duckWindowEventToValue = map[int32]string{
 	TagValueIDDuckWindowEarlyEvicted:  "early_evicted",
 	TagValueIDDuckWindowLeaseDeferred: "lease_deferred",
 	TagValueIDDuckWindowLateDropped:   "late_dropped",
+	TagValueIDDuckWindowRecollapsed:   "recollapsed",
 }
 
 const (
@@ -1666,7 +1668,7 @@ Set by aggregator.`,
 var BuiltinMetricMetaDuckWindows = &MetricMetaValue{
 	Name: "__duck_store_windows",
 	Kind: MetricKindCounter,
-	Description: `Archive windows duck-store maintenance acted on: sealed by the sealer, unlinked by retention, evicted early by the free-space watermark, whose unlink a reader's lease deferred, or whose late rows a consume dropped because the window was already sealed.
+	Description: `Archive windows duck-store maintenance acted on: sealed by the sealer, unlinked by retention, evicted early by the free-space watermark, whose unlink a reader's lease deferred, whose late rows a consume dropped because the window was already sealed, or whose accumulated partial rows the sealer re-collapsed into one ahead of the seal.
 Set by aggregator.`,
 	NoSampleAgent:           true, // generated on aggregators, must be delivered without losses
 	BuiltinAllowedToReceive: false,

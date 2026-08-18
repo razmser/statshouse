@@ -379,6 +379,7 @@ func TestWindowSealDue(t *testing.T) {
 func TestNewSealerDefaults(t *testing.T) {
 	sl := NewSealer(&Store{}, SealerConfig{})
 	require.Equal(t, DefaultSealerInterval, sl.cfg.Interval)
+	require.Equal(t, DefaultRecollapseFactor, sl.cfg.RecollapseFactor)
 	require.NotNil(t, sl.cfg.NowFunc)
 	require.NotNil(t, sl.cfg.Logf)
 }

@@ -249,6 +249,29 @@ func collapseStateCol(col, udf string) string {
 		col, col, udf, col, col)
 }
 
+// collapseKeyCols is the collapse's group key as a column list: metric, time
+// and every tag pair — exactly the columns GROUP BY ALL keys on, since every
+// other column of the collapse's SELECT is an aggregate.
+func collapseKeyCols() string {
+	cols := make([]string, 0, 2+2*format.MaxTags)
+	cols = append(cols, "metric", "time")
+	for i := 0; i < format.MaxTags; i++ {
+		cols = append(cols, fmt.Sprintf("tag%d", i), fmt.Sprintf("stag%d", i))
+	}
+	return strings.Join(cols, ", ")
+}
+
+// countCollapseGroups measures one tier table's physical row count and the
+// collapsed count the collapse statement would leave it at — one row per
+// distinct full key, the trigger the sealer's re-collapse sweep compares the
+// two by.
+func countCollapseGroups(db *sql.DB, table string) (physical, collapsed int64, err error) {
+	err = db.QueryRow(fmt.Sprintf(
+		"SELECT (SELECT count(*) FROM %s), (SELECT count(*) FROM (SELECT 1 FROM %s GROUP BY %s))",
+		table, table, collapseKeyCols())).Scan(&physical, &collapsed)
+	return physical, collapsed, err
+}
+
 // blobList normalizes one LIST(BLOB) value — a fold UDF argument or a scanned
 // query row — into a [][]byte the folds consume.
 func blobList(v any) ([][]byte, error) {
