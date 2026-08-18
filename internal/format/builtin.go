@@ -171,6 +171,8 @@ var (
 		-159:                                    BuiltinMetricMetaDuckQuarantinedFiles,
 		-160:                                    BuiltinMetricMetaDuckQueryTime,
 		-161:                                    BuiltinMetricMetaDuckStoreSize,
+		-162:                                    BuiltinMetricMetaDuckBacklog,
+		-163:                                    BuiltinMetricMetaDuckMaintenanceAge,
 	}
 
 	// BuiltInGroupDefault can be overridden by journal, don't use directly

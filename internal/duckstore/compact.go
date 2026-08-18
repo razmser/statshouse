@@ -57,6 +57,7 @@ type CompactorConfig struct {
 type Compactor struct {
 	store *Store
 	cfg   CompactorConfig
+	clock maintenanceClock // liveness: time since the last successful pass
 
 	mu sync.Mutex // one pass at a time
 }
@@ -70,7 +71,7 @@ func NewCompactor(s *Store, cfg CompactorConfig) *Compactor {
 	if cfg.Logf == nil {
 		cfg.Logf = log.Printf
 	}
-	return &Compactor{store: s, cfg: cfg}
+	return &Compactor{store: s, cfg: cfg, clock: newMaintenanceClock()}
 }
 
 // Run compacts until ctx is done: one pass immediately (a restarted process
@@ -89,8 +90,18 @@ func (c *Compactor) Run(ctx context.Context) error {
 func (c *Compactor) CompactOnce(ctx context.Context) error {
 	start := time.Now()
 	err := c.compactOnce(ctx)
+	if err == nil {
+		c.clock.markSuccess()
+	}
 	recordMaintenancePass(c.cfg.Metrics, MaintenanceCompaction, start, err)
 	return err
+}
+
+// Liveness reports the compactor's liveness input: time since its last
+// successful pass, counted from its creation until the first one lands — so
+// a pass that never returns reads as a growing age, not as no data.
+func (c *Compactor) Liveness() MaintenanceLiveness {
+	return MaintenanceLiveness{Kind: MaintenanceCompaction, SinceLastPass: c.clock.since}
 }
 
 func (c *Compactor) compactOnce(ctx context.Context) error {

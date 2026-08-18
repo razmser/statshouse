@@ -104,6 +104,17 @@ type MetricsRecorder interface {
 	// which sees the free blocks file length cannot — per location, used
 	// and free summed over the location's files.
 	StoreSize(location SizeLocation, used, free int64)
+	// StoreBacklog reports one liveness sample of the ingestion backlog: how
+	// many rolled-off delta generations still hold rows consumption has not
+	// taken, and how long the oldest has waited. Emitted by the liveness
+	// sampler (RunLivenessSampler), which reads only in-memory state, so the
+	// sample keeps flowing while maintenance holds every lock it can hold.
+	StoreBacklog(generations int, oldestAge time.Duration)
+	// MaintenanceAge reports, per maintenance kind, the time since its last
+	// successful pass — or since the component's start, when none has
+	// completed yet — so a pass that never returns is visible as a growing
+	// age instead of reading as no data.
+	MaintenanceAge(kind MaintenanceKind, age time.Duration)
 }
 
 // recordMaintenancePass reports a finished maintenance pass to rec, if there
@@ -154,6 +165,69 @@ func RunSizeSampler(ctx context.Context, s *Store, rec MetricsRecorder, interval
 		case <-t.C:
 			s.SampleStoreSize(rec)
 		}
+	}
+}
+
+// MaintenanceLiveness is one maintenance component's liveness input: the kind
+// it reports as, and the time since its last successful pass — counted from
+// the component's creation until the first one lands. The Compactor, Sealer
+// and Retainer each expose theirs through a Liveness method.
+type MaintenanceLiveness struct {
+	Kind          MaintenanceKind
+	SinceLastPass func() time.Duration
+}
+
+// DefaultLivenessSamplerInterval is how often the liveness sampler re-reads
+// the store's in-memory backlog and the maintenance clocks. The read is a few
+// map lookups under the store's field mutex, so the cadence can match the
+// fastest maintenance (compaction): a stuck pass must show up on the next
+// tick, not minutes later.
+const DefaultLivenessSamplerInterval = DefaultCompactorInterval
+
+// RunLivenessSampler reports the store's ingestion backlog and each
+// maintenance's time-since-last-successful-pass (see SampleLiveness) once
+// immediately and then once per interval until ctx is done. It returns nil
+// when ctx is done; a rec of nil records nothing and still respects the
+// protocol, so callers need not special-case it. It is a loop separate from
+// RunSizeSampler on purpose: the size sample takes the store's archive
+// maintenance lock, so the sampler meant to reveal a stuck compaction would
+// itself hang on that compaction — liveness must read nothing a pass can
+// hold.
+func RunLivenessSampler(ctx context.Context, s *Store, maintenance []MaintenanceLiveness, rec MetricsRecorder, interval time.Duration) error {
+	if interval <= 0 {
+		interval = DefaultLivenessSamplerInterval
+	}
+	SampleLiveness(s, maintenance, rec)
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-t.C:
+			SampleLiveness(s, maintenance, rec)
+		}
+	}
+}
+
+// SampleLiveness reads the store's ingestion backlog (Store.DeltaBacklog) and
+// every maintenance's time-since-last-successful-pass, reporting one
+// StoreBacklog and one MaintenanceAge per maintenance kind to rec. The read
+// touches only in-memory state under the store's field mutex — never the
+// archive maintenance lock, never a file — which is its entire reason to
+// exist: it answers while compaction, sealing or retention holds everything
+// else.
+func SampleLiveness(s *Store, maintenance []MaintenanceLiveness, rec MetricsRecorder) {
+	if rec == nil {
+		return
+	}
+	generations, oldestAge := s.DeltaBacklog()
+	rec.StoreBacklog(generations, oldestAge)
+	for _, m := range maintenance {
+		if m.SinceLastPass == nil {
+			continue
+		}
+		rec.MaintenanceAge(m.Kind, m.SinceLastPass())
 	}
 }
 

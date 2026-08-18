@@ -97,6 +97,7 @@ type RetentionConfig struct {
 type Retainer struct {
 	store *Store
 	cfg   RetentionConfig
+	clock maintenanceClock // liveness: time since the last successful pass
 
 	mu sync.Mutex // one pass at a time
 }
@@ -116,7 +117,7 @@ func NewRetainer(s *Store, cfg RetentionConfig) *Retainer {
 	if cfg.Logf == nil {
 		cfg.Logf = log.Printf
 	}
-	return &Retainer{store: s, cfg: cfg}
+	return &Retainer{store: s, cfg: cfg, clock: newMaintenanceClock()}
 }
 
 // Run retains until ctx is done: one pass immediately (a restarted process
@@ -135,8 +136,17 @@ func (r *Retainer) Run(ctx context.Context) error {
 func (r *Retainer) RetainOnce(ctx context.Context) error {
 	start := time.Now()
 	err := r.retainOnce(ctx)
+	if err == nil {
+		r.clock.markSuccess()
+	}
 	recordMaintenancePass(r.cfg.Metrics, MaintenanceRetention, start, err)
 	return err
+}
+
+// Liveness reports the retainer's liveness input: time since its last
+// successful pass, counted from its creation until the first one lands.
+func (r *Retainer) Liveness() MaintenanceLiveness {
+	return MaintenanceLiveness{Kind: MaintenanceRetention, SinceLastPass: r.clock.since}
 }
 
 func (r *Retainer) retainOnce(ctx context.Context) error {

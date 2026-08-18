@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/duckdb/duckdb-go/v2"
 
@@ -105,11 +106,12 @@ type Store struct {
 	// mu guards the fields below. The files themselves are serialized by
 	// DuckDB; this only keeps the in-memory view coherent across the writer,
 	// the consumer and readers.
-	mu     sync.RWMutex
-	delta  *sql.DB // active delta generation, read-write
-	deltas []int64 // all valid delta generations present, ascending
-	gen    int64   // active delta generation
-	writer *Writer // the store's single writer, when one is attached
+	mu        sync.RWMutex
+	delta     *sql.DB             // active delta generation, read-write
+	deltas    []int64             // all valid delta generations present, ascending
+	gen       int64               // active delta generation
+	rolledOff map[int64]time.Time // per rolled-off generation, when it stopped accepting writes — the backlog's age axis
+	writer    *Writer             // the store's single writer, when one is attached
 
 	// archiveMu serializes read-write maintenance of archive window files:
 	// compaction's appends and the sealer's rewrite must never interleave on
@@ -146,7 +148,12 @@ func OpenStore(cfg StoreConfig) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("duck-store: %w", err)
 	}
-	s := &Store{cfg: cfg, storageVersion: storageVersion, consumed: map[windowKey]map[int64]struct{}{}}
+	s := &Store{
+		cfg:            cfg,
+		storageVersion: storageVersion,
+		consumed:       map[windowKey]map[int64]struct{}{},
+		rolledOff:      map[int64]time.Time{},
+	}
 
 	// The directory tree is the whole setup: an operator points duck-store at
 	// a directory and everything it needs appears.
@@ -219,6 +226,36 @@ func (s *Store) DeltaGenerations() []int64 {
 	return append([]int64(nil), s.deltas...)
 }
 
+// DeltaBacklog reports the store's ingestion backlog from in-memory state
+// alone: how many rolled-off delta generations still hold rows consumption
+// has not taken, and how long the oldest has waited since its roll. The
+// active generation never counts — holding recent rows is its job — and a
+// generation recovered from disk by an open reports the age since that open,
+// the earliest moment this process can vouch for. The read takes only mu,
+// held everywhere for in-memory map updates and nowhere across file work, so
+// it answers while maintenance holds the archive lock: that is what makes it
+// safe for the liveness sampler.
+func (s *Store) DeltaBacklog() (generations int, oldestAge time.Duration) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	now := time.Now()
+	for _, gen := range s.deltas {
+		if gen == s.gen {
+			continue // the active generation is the write target, not backlog
+		}
+		generations++
+		// Every rolled-off generation is stamped at its roll (or the open
+		// that found it); a missing stamp can only mean clock trouble, and
+		// reporting age zero understates rather than alarms.
+		if rolled, ok := s.rolledOff[gen]; ok {
+			if age := now.Sub(rolled); age > oldestAge {
+				oldestAge = age
+			}
+		}
+	}
+	return generations, oldestAge
+}
+
 // Windows returns the archive windows that passed the version check, ordered
 // by tier and window start.
 func (s *Store) Windows() []WindowFile {
@@ -278,12 +315,19 @@ func (s *Store) openDeltas() error {
 	// all wait for consumption, and a fresh generation takes over.
 	deltas := make([]int64, 0, len(valid))
 	resumed := false
+	opened := time.Now()
 	for _, gen := range valid {
 		if gen != maxSeen && s.unlinkDeltaIfConsumed(gen) {
 			continue
 		}
 		if gen == maxSeen {
 			resumed = true
+		} else {
+			// A survivor below the newest was sealed by a roll before this
+			// open; the exact moment died with the previous process, so the
+			// backlog's age for it counts from here — the earliest this
+			// process can vouch for.
+			s.rolledOff[gen] = opened
 		}
 		deltas = append(deltas, gen)
 	}

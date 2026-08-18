@@ -68,6 +68,7 @@ type SealerConfig struct {
 type Sealer struct {
 	store *Store
 	cfg   SealerConfig
+	clock maintenanceClock // liveness: time since the last successful pass
 
 	mu sync.Mutex // one pass at a time
 }
@@ -84,7 +85,7 @@ func NewSealer(s *Store, cfg SealerConfig) *Sealer {
 	if cfg.Logf == nil {
 		cfg.Logf = log.Printf
 	}
-	return &Sealer{store: s, cfg: cfg}
+	return &Sealer{store: s, cfg: cfg, clock: newMaintenanceClock()}
 }
 
 // Run seals until ctx is done: one pass immediately (a restarted process
@@ -101,8 +102,17 @@ func (sl *Sealer) Run(ctx context.Context) error {
 func (sl *Sealer) SealOnce(ctx context.Context) error {
 	start := time.Now()
 	err := sl.sealOnce(ctx)
+	if err == nil {
+		sl.clock.markSuccess()
+	}
 	recordMaintenancePass(sl.cfg.Metrics, MaintenanceSealing, start, err)
 	return err
+}
+
+// Liveness reports the sealer's liveness input: time since its last
+// successful pass, counted from its creation until the first one lands.
+func (sl *Sealer) Liveness() MaintenanceLiveness {
+	return MaintenanceLiveness{Kind: MaintenanceSealing, SinceLastPass: sl.clock.since}
 }
 
 func (sl *Sealer) sealOnce(ctx context.Context) error {

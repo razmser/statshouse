@@ -24,6 +24,8 @@ func TestDuckStoreMetricsAreRegistered(t *testing.T) {
 		-159: BuiltinMetricMetaDuckQuarantinedFiles,
 		-160: BuiltinMetricMetaDuckQueryTime,
 		-161: BuiltinMetricMetaDuckStoreSize,
+		-162: BuiltinMetricMetaDuckBacklog,
+		-163: BuiltinMetricMetaDuckMaintenanceAge,
 	}
 	for id, m := range metas {
 		require.Contains(t, BuiltinMetrics, id, "id %d must be in the builtin registry", id)
@@ -64,6 +66,15 @@ func TestDuckStoreMetricsAreRegistered(t *testing.T) {
 	require.Equal(t, "__duck_store_size", BuiltinMetricMetaDuckStoreSize.Name)
 	require.Equal(t, MetricKindValue, BuiltinMetricMetaDuckStoreSize.Kind)
 	require.Equal(t, MetricByte, BuiltinMetricMetaDuckStoreSize.MetricType)
+
+	require.Equal(t, "__duck_store_backlog", BuiltinMetricMetaDuckBacklog.Name)
+	require.Equal(t, MetricKindValue, BuiltinMetricMetaDuckBacklog.Kind)
+	require.Zero(t, BuiltinMetricMetaDuckBacklog.MetricType,
+		"the two backlog measures carry different units, so the meta names no single one")
+
+	require.Equal(t, "__duck_store_maintenance_age", BuiltinMetricMetaDuckMaintenanceAge.Name)
+	require.Equal(t, MetricKindValue, BuiltinMetricMetaDuckMaintenanceAge.Kind)
+	require.Equal(t, MetricSecond, BuiltinMetricMetaDuckMaintenanceAge.MetricType)
 }
 
 // TestDuckStoreMetricValueComments proves every duck-store tag-value constant
@@ -145,6 +156,25 @@ func TestDuckStoreMetricValueComments(t *testing.T) {
 			entries: map[int32]string{
 				TagValueIDDuckSizeUsed: "used",
 				TagValueIDDuckSizeFree: "free",
+			},
+		},
+		{
+			name: "backlog measure",
+			meta: BuiltinMetricMetaDuckBacklog,
+			tag:  0,
+			entries: map[int32]string{
+				TagValueIDDuckBacklogGenerations:      "generations",
+				TagValueIDDuckBacklogOldestAgeSeconds: "oldest_age_seconds",
+			},
+		},
+		{
+			name: "maintenance age",
+			meta: BuiltinMetricMetaDuckMaintenanceAge,
+			tag:  0,
+			entries: map[int32]string{
+				TagValueIDDuckMaintenanceCompaction: "compaction",
+				TagValueIDDuckMaintenanceSealing:    "sealing",
+				TagValueIDDuckMaintenanceRetention:  "retention",
 			},
 		},
 	} {

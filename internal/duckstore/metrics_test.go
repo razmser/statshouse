@@ -34,6 +34,8 @@ type recordingMetrics struct {
 	quarantine []recordedQuarantine
 	queries    []recordedQuery
 	sizes      []recordedSize
+	backlogs   []recordedBacklog
+	ages       []recordedAge
 }
 
 type recordedPass struct {
@@ -62,6 +64,16 @@ type recordedSize struct {
 	location SizeLocation
 	used     int64
 	free     int64
+}
+
+type recordedBacklog struct {
+	generations int
+	oldest      time.Duration
+}
+
+type recordedAge struct {
+	kind MaintenanceKind
+	age  time.Duration
 }
 
 func (m *recordingMetrics) MaintenancePass(kind MaintenanceKind, err error, dur time.Duration) {
@@ -94,6 +106,18 @@ func (m *recordingMetrics) StoreSize(location SizeLocation, used, free int64) {
 	m.sizes = append(m.sizes, recordedSize{location: location, used: used, free: free})
 }
 
+func (m *recordingMetrics) StoreBacklog(generations int, oldestAge time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.backlogs = append(m.backlogs, recordedBacklog{generations: generations, oldest: oldestAge})
+}
+
+func (m *recordingMetrics) MaintenanceAge(kind MaintenanceKind, age time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ages = append(m.ages, recordedAge{kind: kind, age: age})
+}
+
 // snapshotWindows returns a copy of the recorded window events, safe to read
 // while maintenance still runs.
 func (m *recordingMetrics) snapshotWindows() []recordedWindow {
@@ -108,6 +132,14 @@ func (m *recordingMetrics) snapshotSizes() []recordedSize {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return append([]recordedSize(nil), m.sizes...)
+}
+
+// snapshotBacklogs returns a copy of the recorded backlog samples, safe to
+// read while the liveness sampler still runs.
+func (m *recordingMetrics) snapshotBacklogs() []recordedBacklog {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]recordedBacklog(nil), m.backlogs...)
 }
 
 // requireOnePass asserts exactly one pass of one maintenance kind was
@@ -466,6 +498,130 @@ func TestRunSizeSamplerSamplesImmediatelyAndStops(t *testing.T) {
 	// nothing more arrives: wait out a fraction of the interval
 	time.Sleep(50 * time.Millisecond)
 	require.Len(t, m.snapshotSizes(), 2)
+}
+
+// TestLivenessSamplerEmitsWhileWindowLockHeld is the direct regression test
+// for the blind spot the load test hit: the size sampler hangs on the very
+// compaction it is meant to observe, because SampleStoreSize takes the store's
+// archive maintenance lock while it walks the windows. The liveness sampler
+// must keep emitting while that lock is held the way a stuck pass holds it —
+// its backlog read touches in-memory state only.
+func TestLivenessSamplerEmitsWhileWindowLockHeld(t *testing.T) {
+	s, _ := newTestWriter(t)
+	m := &recordingMetrics{}
+	liveness := []MaintenanceLiveness{{Kind: MaintenanceCompaction, SinceLastPass: func() time.Duration { return 0 }}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = RunLivenessSampler(ctx, s, liveness, m, 5*time.Millisecond) }()
+
+	// samples flow while nothing is held (the immediate one plus the ticker's)
+	require.Eventually(t, func() bool { return len(m.snapshotBacklogs()) > 0 }, 5*time.Second, 1*time.Millisecond)
+
+	// the store's whole archive maintenance lock, held the way a stuck
+	// compaction or sealing pass would hold it
+	s.archiveMu.Lock()
+	before := len(m.snapshotBacklogs())
+	require.Eventually(t, func() bool { return len(m.snapshotBacklogs()) > before+1 }, 5*time.Second, 1*time.Millisecond,
+		"the liveness sampler must keep emitting while the window lock is held")
+	s.archiveMu.Unlock()
+
+	// a canceled context ends the loop; nothing more arrives
+	cancel()
+	n := len(m.snapshotBacklogs())
+	time.Sleep(50 * time.Millisecond)
+	require.Len(t, m.snapshotBacklogs(), n)
+}
+
+// TestLivenessSamplerReportsBacklog proves the backlog is zero while only the
+// active generation exists, counts every rolled-off generation waiting for
+// consumption with the oldest's age growing while they wait, and returns to
+// zero once compaction drains them.
+func TestLivenessSamplerReportsBacklog(t *testing.T) {
+	s, w := newTestWriter(t)
+	m := &recordingMetrics{}
+	row := partialRow(t, testMetricID, uint32(writerNowUnix)-5)
+	row.Count, row.Sum = 1, 1
+	require.NoError(t, w.WriteRound(context.Background(), []Row{row}))
+
+	// only the active generation exists: it holds the rows, but it is the
+	// write target, not backlog
+	SampleLiveness(s, nil, m)
+	require.Len(t, m.backlogs, 1)
+	require.Zero(t, m.backlogs[0].generations)
+	require.Zero(t, m.backlogs[0].oldest)
+
+	// two rolls leave two generations consumption has not taken
+	require.NoError(t, s.RollGeneration())
+	require.NoError(t, s.RollGeneration())
+	SampleLiveness(s, nil, m)
+	require.Len(t, m.backlogs, 2)
+	require.Equal(t, 2, m.backlogs[1].generations, "every rolled-off unconsumed generation must count")
+	require.GreaterOrEqual(t, m.backlogs[1].oldest, time.Duration(0))
+
+	// the oldest waits longer with every sample
+	time.Sleep(20 * time.Millisecond)
+	SampleLiveness(s, nil, m)
+	require.Equal(t, 2, m.backlogs[2].generations)
+	require.Greater(t, m.backlogs[2].oldest, m.backlogs[1].oldest, "the oldest generation's age must grow while it waits")
+
+	// compaction drains every rolled generation: backlog back to zero
+	require.NoError(t, NewCompactor(s, CompactorConfig{}).CompactOnce(context.Background()))
+	SampleLiveness(s, nil, m)
+	require.Zero(t, m.backlogs[3].generations, "a drained store reports no backlog")
+	require.Zero(t, m.backlogs[3].oldest)
+}
+
+// TestMaintenanceAgeGrowsUntilSuccessfulPass proves the compaction clock the
+// liveness sampler reports counts only successful passes: the age grows while
+// no pass completes and through failed passes alike, and resets when one
+// lands. Every maintenance kind reports through the same sampler, and an
+// entry with no clock is skipped rather than panicked on.
+func TestMaintenanceAgeGrowsUntilSuccessfulPass(t *testing.T) {
+	s, w := newTestWriter(t)
+	m := &recordingMetrics{}
+	c := NewCompactor(s, CompactorConfig{})
+	compaction := []MaintenanceLiveness{c.Liveness()}
+
+	// no pass yet: the age counts from the compactor's creation and grows
+	SampleLiveness(s, compaction, m)
+	time.Sleep(20 * time.Millisecond)
+	SampleLiveness(s, compaction, m)
+	require.Len(t, m.ages, 2)
+	require.Equal(t, MaintenanceCompaction, m.ages[0].kind)
+	require.GreaterOrEqual(t, m.ages[0].age, time.Duration(0))
+	require.Greater(t, m.ages[1].age, m.ages[0].age, "the age must grow while no pass completes")
+
+	// a failed pass maintains nothing, so it must not reset the clock
+	row := partialRow(t, testMetricID, uint32(writerNowUnix)-5)
+	row.Count, row.Sum = 1, 1
+	require.NoError(t, w.WriteRound(context.Background(), []Row{row}))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.Error(t, c.CompactOnce(ctx))
+	SampleLiveness(s, compaction, m)
+	require.GreaterOrEqual(t, m.ages[2].age, m.ages[1].age, "a failed pass must not reset the clock")
+
+	// a successful pass resets it to near zero
+	require.NoError(t, c.CompactOnce(context.Background()))
+	SampleLiveness(s, compaction, m)
+	require.Less(t, m.ages[3].age, m.ages[2].age, "a successful pass must reset the clock")
+
+	// the full production set: one age per maintenance kind, and an entry
+	// with no clock contributes nothing instead of failing the sample
+	m.ages = nil
+	all := []MaintenanceLiveness{c.Liveness(), NewSealer(s, SealerConfig{}).Liveness(), NewRetainer(s, RetentionConfig{}).Liveness(), {}}
+	SampleLiveness(s, all, m)
+	kinds := map[MaintenanceKind]time.Duration{}
+	for _, a := range m.ages {
+		kinds[a.kind] = a.age
+	}
+	require.Len(t, m.ages, 3, "the clock-less entry must be skipped")
+	for _, kind := range []MaintenanceKind{MaintenanceCompaction, MaintenanceSealing, MaintenanceRetention} {
+		age, ok := kinds[kind]
+		require.True(t, ok, "%s must report its age", kind)
+		require.GreaterOrEqual(t, age, time.Duration(0))
+	}
 }
 
 // TestBuiltinMetricRowsFlowUnchanged proves builtin metrics — whose IDs are

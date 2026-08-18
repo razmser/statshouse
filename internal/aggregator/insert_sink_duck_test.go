@@ -381,6 +381,18 @@ func TestDuckMetricsForwardsEvents(t *testing.T) {
 		{format.BuiltinMetricMetaDuckStoreSize,
 			[]int32{0, format.TagValueIDDuckSizeArchive, format.TagValueIDDuckSizeFree}, 40, 1},
 	}, sink.valueCounters)
+
+	sink.valueCounters = nil
+	m.StoreBacklog(2, 90*time.Second)
+	m.MaintenanceAge(duckstore.MaintenanceSealing, 30*time.Second)
+	require.Equal(t, []duckValueCounterCall{
+		{format.BuiltinMetricMetaDuckBacklog,
+			[]int32{0, format.TagValueIDDuckBacklogGenerations}, 2, 1},
+		{format.BuiltinMetricMetaDuckBacklog,
+			[]int32{0, format.TagValueIDDuckBacklogOldestAgeSeconds}, 90, 1},
+		{format.BuiltinMetricMetaDuckMaintenanceAge,
+			[]int32{0, format.TagValueIDDuckMaintenanceSealing}, 30, 1},
+	}, sink.valueCounters)
 }
 
 // TestNewInsertSinkRoutesByBackend pins the write seam's routing: an

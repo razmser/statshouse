@@ -25,8 +25,8 @@ import (
 )
 
 // openDuckStore opens the shard's duck-store and starts its single writer and
-// its background maintenance — compaction, sealing, retention and the size
-// sampler — producing the handle the insert threads take their sinks from and
+// its background maintenance — compaction, sealing, retention, the size
+// sampler and the liveness sampler — producing the handle the insert threads take their sinks from and
 // the query listener takes its executor from. The DuckDB resource bounds from
 // the config ride into every store file the store opens, and sh2 (the
 // aggregator's builtin-metrics agent, may be nil in tests) receives the
@@ -65,13 +65,17 @@ func openDuckStore(config ConfigAggregator, sh2 *agent.Agent) (duckStoreHandle, 
 	sampler := func(ctx context.Context) error {
 		return duckstore.RunSizeSampler(ctx, s, rec, 0)
 	}
+	liveness := func(ctx context.Context) error {
+		return duckstore.RunLivenessSampler(ctx, s,
+			[]duckstore.MaintenanceLiveness{compactor.Liveness(), sealer.Liveness(), retainer.Liveness()}, rec, 0)
+	}
 
-	// The four maintenance loops share one lifecycle: cancel on Close, wait
+	// The five maintenance loops share one lifecycle: cancel on Close, wait
 	// for every goroutine, then the writer and the store shut down in order.
 	mntCtx, stopMaintenance := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
-	wg.Add(4)
-	for _, loop := range []func(context.Context) error{compactor.Run, sealer.Run, retainer.Run, sampler} {
+	wg.Add(5)
+	for _, loop := range []func(context.Context) error{compactor.Run, sealer.Run, retainer.Run, sampler, liveness} {
 		loop := loop
 		go func() {
 			defer wg.Done()
@@ -137,6 +141,19 @@ func (m *duckMetrics) StoreSize(location duckstore.SizeLocation, used, free int6
 		[]int32{0, duckSizeLocationTag(location), format.TagValueIDDuckSizeUsed}, float64(used), 1)
 	m.sh.AddValueCounter(t, format.BuiltinMetricMetaDuckStoreSize,
 		[]int32{0, duckSizeLocationTag(location), format.TagValueIDDuckSizeFree}, float64(free), 1)
+}
+
+func (m *duckMetrics) StoreBacklog(generations int, oldestAge time.Duration) {
+	t := m.now()
+	m.sh.AddValueCounter(t, format.BuiltinMetricMetaDuckBacklog,
+		[]int32{0, format.TagValueIDDuckBacklogGenerations}, float64(generations), 1)
+	m.sh.AddValueCounter(t, format.BuiltinMetricMetaDuckBacklog,
+		[]int32{0, format.TagValueIDDuckBacklogOldestAgeSeconds}, oldestAge.Seconds(), 1)
+}
+
+func (m *duckMetrics) MaintenanceAge(kind duckstore.MaintenanceKind, age time.Duration) {
+	m.sh.AddValueCounter(m.now(), format.BuiltinMetricMetaDuckMaintenanceAge,
+		[]int32{0, duckMaintenanceTag(kind)}, age.Seconds(), 1)
 }
 
 func (m *duckMetrics) now() uint32 { return uint32(time.Now().Unix()) }

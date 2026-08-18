@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
 // deltaSrcAlias is the name consume transactions attach the delta generation
@@ -162,6 +163,9 @@ func (s *Store) RollGeneration() error {
 			return fmt.Errorf("duck-store: roll onto generation %d: %w", next, err)
 		}
 	}
+	// The switch is the moment the rolled-off generation stops accepting
+	// writes; the backlog's age is counted from here.
+	s.rolledOff[s.gen] = time.Now()
 	old := s.delta
 	s.delta = db
 	s.gen = next
@@ -212,6 +216,7 @@ func (s *Store) ConsumeGeneration(ctx context.Context, gen int64, opts ConsumeOp
 	}
 	s.mu.Lock()
 	s.deltas = removeGeneration(s.deltas, gen)
+	delete(s.rolledOff, gen) // the backlog no longer knows this generation
 	s.mu.Unlock()
 	if !s.unlinkDelta(deltaPath, gen) {
 		return fmt.Errorf("duck-store: generation %d is consumed but %s could not be unlinked", gen, deltaPath)

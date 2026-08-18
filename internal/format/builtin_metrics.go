@@ -1629,6 +1629,16 @@ var duckSizeMeasureToValue = map[int32]string{
 	TagValueIDDuckSizeFree: "free",
 }
 
+const (
+	TagValueIDDuckBacklogGenerations      = 1
+	TagValueIDDuckBacklogOldestAgeSeconds = 2
+)
+
+var duckBacklogMeasureToValue = map[int32]string{
+	TagValueIDDuckBacklogGenerations:      "generations",
+	TagValueIDDuckBacklogOldestAgeSeconds: "oldest_age_seconds",
+}
+
 var BuiltinMetricMetaDuckMaintenanceTime = &MetricMetaValue{
 	Name: "__duck_store_maintenance_time",
 	Kind: MetricKindValue,
@@ -1722,6 +1732,37 @@ Set by aggregator.`,
 	}, {
 		Description:   "measure",
 		ValueComments: convertToValueComments(duckSizeMeasureToValue),
+	}},
+}
+
+var BuiltinMetricMetaDuckBacklog = &MetricMetaValue{
+	Name: "__duck_store_backlog",
+	Kind: MetricKindValue,
+	Description: `Ingestion backlog of the shard's duck-store, sampled from in-memory state only, so it keeps flowing while maintenance holds the store's file locks: generations is how many rolled delta generations still hold rows compaction has not taken, oldest_age_seconds is how long the oldest has waited (counted from process start for generations recovered from disk). Count is one per sample.
+Set by aggregator.`,
+	NoSampleAgent:           true, // generated on aggregators, must be delivered without losses
+	BuiltinAllowedToReceive: false,
+	WithAgentEnvRouteArch:   false,
+	WithAggregatorID:        true,
+	Tags: []MetricMetaTag{{
+		Description:   "measure",
+		ValueComments: convertToValueComments(duckBacklogMeasureToValue),
+	}},
+}
+
+var BuiltinMetricMetaDuckMaintenanceAge = &MetricMetaValue{
+	Name: "__duck_store_maintenance_age",
+	Kind: MetricKindValue,
+	Description: `Seconds since each duck-store background maintenance (compaction, sealing, retention) last completed a successful pass, counted from the component's start until its first success, so a pass that never returns reads as a growing age instead of as no data.
+Set by aggregator.`,
+	MetricType:              MetricSecond,
+	NoSampleAgent:           true, // generated on aggregators, must be delivered without losses
+	BuiltinAllowedToReceive: false,
+	WithAgentEnvRouteArch:   false,
+	WithAggregatorID:        true,
+	Tags: []MetricMetaTag{{
+		Description:   "maintenance",
+		ValueComments: convertToValueComments(duckMaintenanceToValue),
 	}},
 }
 
