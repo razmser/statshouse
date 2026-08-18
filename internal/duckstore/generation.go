@@ -334,7 +334,7 @@ func (s *Store) consumeWindow(ctx context.Context, gen int64, deltaPath string, 
 	if err := registerFoldUDFs(conn); err != nil {
 		return fmt.Errorf("duck-store: consume generation %d into %s: %w", gen, path, err)
 	}
-	if _, err := conn.ExecContext(ctx, fmt.Sprintf("ATTACH %s AS %s (READ_ONLY)", sqlString(deltaPath), deltaSrcAlias)); err != nil {
+	if err := attachReadOnly(ctx, conn, deltaPath, deltaSrcAlias); err != nil {
 		return fmt.Errorf("duck-store: attach %s to consume generation %d: %w", deltaPath, gen, err)
 	}
 	defer func() { _, _ = conn.ExecContext(context.Background(), "DETACH "+deltaSrcAlias) }()

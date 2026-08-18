@@ -182,6 +182,24 @@ func (s *Store) acquireQuerySnapshot(ctx context.Context, tier string, from, to 
 	return nil, lastErr
 }
 
+// detachSources drops every alias the query attached on the snapshot's
+// connection — the leased windows' first, then the rolled generations'. It
+// runs both as serveQuerySources' failure net and, after the window read
+// locks are taken, ahead of handing those locks back, so the maintenance
+// open the locks fence off never meets a still-held handle (DuckDB allows a
+// file one handle per process). Detaching an alias that never attached — or
+// one a previous run already dropped — is a harmless ignored error.
+func (q *querySnapshot) detachSources() {
+	for i := range q.windows {
+		if q.windows[i].src.alias != "" {
+			_, _ = q.conn.ExecContext(context.Background(), "DETACH "+q.windows[i].src.alias)
+		}
+	}
+	for i := range q.rolled {
+		_, _ = q.conn.ExecContext(context.Background(), "DETACH "+q.rolled[i].alias)
+	}
+}
+
 // release returns everything the snapshot holds: the windows' leases, every
 // generation's pin and the connection. After it, consumption may unlink a
 // generation's file and retention may unlink any window's.

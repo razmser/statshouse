@@ -682,24 +682,18 @@ func (s *Store) serveQuerySources(ctx context.Context, snap *querySnapshot, tier
 	// this pooled connection and make every later attach of the same file to
 	// it fail. Detaching an alias that never attached is a harmless ignored
 	// error; a window's alias stays empty until the boundary has settled
-	// which windows the read leases, so empty means not-yet-attached.
+	// which windows the read leases, so empty means not-yet-attached. The
+	// attaches themselves go through attachReadOnly, which waits out the
+	// other short-lived handles the same file carries (see attach.go).
 	seq := queryAliasSeq.Add(1)
 	for i := range snap.rolled {
 		snap.rolled[i].alias = fmt.Sprintf("q%d_g%d", seq, snap.rolled[i].gen)
 	}
-	defer func() {
-		for i := range snap.windows {
-			if snap.windows[i].src.alias != "" {
-				_, _ = snap.conn.ExecContext(context.Background(), "DETACH "+snap.windows[i].src.alias)
-			}
-		}
-		for i := range snap.rolled {
-			_, _ = snap.conn.ExecContext(context.Background(), "DETACH "+snap.rolled[i].alias)
-		}
-	}()
+	// The failure net: a give-up before the window locks still detaches
+	// every alias that made it onto the connection.
+	defer snap.detachSources()
 	for i := range snap.rolled {
-		if _, err := snap.conn.ExecContext(ctx, fmt.Sprintf("ATTACH %s AS %s (READ_ONLY)",
-			sqlString(snap.rolled[i].path), snap.rolled[i].alias)); err != nil {
+		if err := attachReadOnly(ctx, snap.conn, snap.rolled[i].path, snap.rolled[i].alias); err != nil {
 			return fmt.Errorf("duck-store: attach %s for store query: %w", snap.rolled[i].path, err)
 		}
 	}
@@ -737,7 +731,17 @@ func (s *Store) serveQuerySources(ctx context.Context, snap *querySnapshot, tier
 	}
 	if len(keys) > 0 {
 		releaseWindows := s.lockWindowsRead(keys)
-		defer releaseWindows()
+		// LIFO runs this before the failure net above, and it hands the
+		// aliases back before the read locks — the maintenance read-write
+		// open the locks fence off never meets a handle this query still
+		// holds (DuckDB refuses a second handle on one file outright, and
+		// the sealer's open would fail its pass on it). detachSources runs
+		// twice on this path; detaching an alias that already went, or one
+		// that never attached, is a harmless ignored error.
+		defer func() {
+			snap.detachSources()
+			releaseWindows()
+		}()
 	}
 
 	// Which windows each rolled generation serves — and whether the snapshot
@@ -754,8 +758,7 @@ func (s *Store) serveQuerySources(ctx context.Context, snap *querySnapshot, tier
 		snap.windows[i].src.alias = fmt.Sprintf("q%d_a%d", seq, i)
 	}
 	for i := range snap.windows {
-		if _, err := snap.conn.ExecContext(ctx, fmt.Sprintf("ATTACH %s AS %s (READ_ONLY)",
-			sqlString(snap.windows[i].path), snap.windows[i].src.alias)); err != nil {
+		if err := attachReadOnly(ctx, snap.conn, snap.windows[i].path, snap.windows[i].src.alias); err != nil {
 			return fmt.Errorf("duck-store: attach %s for store query: %w", snap.windows[i].path, err)
 		}
 	}

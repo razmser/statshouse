@@ -697,3 +697,108 @@ func TestCoarseTiersServeFrom1sOnlyDelta(t *testing.T) {
 	require.Equal(t, []int64{11, 12}, tv.Tag)
 	require.Equal(t, []float64{10, 4}, tv.Count)
 }
+
+// TestQueryAttachWaitsOutCohabitingFileHandles pins how a store query's
+// read-only attach behaves beside the other handles its files carry: the
+// read-only reopen (consumption planning, the size sampler) shares the
+// file's cache entry and must coexist with the query's attach, while the
+// pre-roll pool checkout a query holds across a roll conflicts with it —
+// and the attach waits that handle out (attach.go) instead of failing, so
+// the query still answers, exactly.
+func TestQueryAttachWaitsOutCohabitingFileHandles(t *testing.T) {
+	b1 := (writerNowUnix - 7200) / 60 * 60
+
+	// holdRO pins a read-only handle on the rolled generation the way the
+	// plan read and the size sampler do, then drops it partway through the
+	// attach's retry budget.
+	holdRO := func(s *Store, gen int64, d time.Duration) {
+		t.Helper()
+		db, err := openStoreFile(filepath.Join(s.cfg.Dir, deltaFileName(gen)), true, s.cfg.Resources)
+		require.NoError(t, err)
+		go func() {
+			time.Sleep(d)
+			_ = db.Close()
+		}()
+	}
+
+	t.Run("read-only reopen beside the query", func(t *testing.T) {
+		s, w := newTestWriter(t)
+		require.NoError(t, w.WriteRound(context.Background(), []Row{
+			{Metric: testMetricID, Time: uint32(b1 - 3600), Tags: tag0(11), Count: 2},
+			{Metric: testMetricID, Time: uint32(b1), Tags: tag0(11), Count: 3},
+			{Metric: testMetricID, Time: uint32(b1), Tags: tag0(12), Count: 5},
+		}))
+		gen := s.ActiveDeltaGeneration()
+		require.NoError(t, s.RollGeneration())
+		require.NoError(t, w.WriteRound(context.Background(), []Row{
+			{Metric: testMetricID, Time: uint32(b1 + 60), Tags: tag0(11), Count: 7},
+		}))
+		holdRO(s, gen, 300*time.Millisecond)
+		require.NoError(t, runSeriesQuery(context.Background(), s, testMetricID, b1-3600, b1+120, seriesCounts{
+			time:  []int64{b1 - 3600, b1, b1, b1 + 60},
+			tag0:  []int64{11, 11, 12, 11},
+			count: []float64{2, 3, 5, 7},
+		}))
+	})
+
+	t.Run("pre-roll pool checkout beside the query", func(t *testing.T) {
+		s, w := newTestWriter(t)
+		require.NoError(t, w.WriteRound(context.Background(), []Row{
+			{Metric: testMetricID, Time: uint32(b1 - 3600), Tags: tag0(11), Count: 2},
+			{Metric: testMetricID, Time: uint32(b1), Tags: tag0(11), Count: 3},
+			{Metric: testMetricID, Time: uint32(b1), Tags: tag0(12), Count: 5},
+		}))
+		// a query's checkout of the pre-roll pool: the roll closes the pool
+		// but cannot reap a checked-out connection, so the file's read-write
+		// instance outlives the roll until the checkout returns
+		conn, err := s.Delta().Conn(context.Background())
+		require.NoError(t, err)
+		require.NoError(t, s.RollGeneration())
+		require.NoError(t, w.WriteRound(context.Background(), []Row{
+			{Metric: testMetricID, Time: uint32(b1 + 60), Tags: tag0(11), Count: 7},
+		}))
+		go func() {
+			time.Sleep(300 * time.Millisecond)
+			_ = conn.Close()
+		}()
+		require.NoError(t, runSeriesQuery(context.Background(), s, testMetricID, b1-3600, b1+120, seriesCounts{
+			time:  []int64{b1 - 3600, b1, b1, b1 + 60},
+			tag0:  []int64{11, 11, 12, 11},
+			count: []float64{2, 3, 5, 7},
+		}))
+	})
+}
+
+// TestConsumeAttachWaitsOutCohabitingFileHandles is the consume-side twin:
+// the delta attach inside the window transaction runs beside a read-only
+// reopen of the same generation — the disk-size sampler's shape — which the
+// plan read shares its instance with; consumption must proceed through both
+// holds, and through any transient conflicting handle the attach waits out
+// (attach.go).
+func TestConsumeAttachWaitsOutCohabitingFileHandles(t *testing.T) {
+	b1 := (writerNowUnix - 7200) / 60 * 60
+	s, w := newTestWriter(t)
+	require.NoError(t, w.WriteRound(context.Background(), []Row{
+		{Metric: testMetricID, Time: uint32(b1 - 3600), Tags: tag0(11), Count: 2},
+		{Metric: testMetricID, Time: uint32(b1), Tags: tag0(11), Count: 3},
+		{Metric: testMetricID, Time: uint32(b1), Tags: tag0(12), Count: 5},
+	}))
+	gen := s.ActiveDeltaGeneration()
+	require.NoError(t, s.RollGeneration())
+	require.NoError(t, w.WriteRound(context.Background(), []Row{
+		{Metric: testMetricID, Time: uint32(b1 + 60), Tags: tag0(11), Count: 7},
+	}))
+	probe, err := openStoreFile(filepath.Join(s.cfg.Dir, deltaFileName(gen)), true, s.cfg.Resources)
+	require.NoError(t, err)
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		_ = probe.Close()
+	}()
+	require.NoError(t, s.ConsumeGeneration(context.Background(), gen, ConsumeOptions{}))
+	require.NoFileExists(t, filepath.Join(s.cfg.Dir, deltaFileName(gen)))
+	require.NoError(t, runSeriesQuery(context.Background(), s, testMetricID, b1-3600, b1+120, seriesCounts{
+		time:  []int64{b1 - 3600, b1, b1, b1 + 60},
+		tag0:  []int64{11, 11, 12, 11},
+		count: []float64{2, 3, 5, 7},
+	}))
+}
