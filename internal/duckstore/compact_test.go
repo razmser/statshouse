@@ -73,6 +73,11 @@ type rawRow struct {
 	uniq        []byte
 }
 
+// tierColumnCount is the number of columns in a tier table: metric and time,
+// 48 tag pairs, six numerics, three host triples and the two aggregate-state
+// columns.
+const tierColumnCount = 2 + 2*format.MaxTags + 6 + 9 + 2
+
 // scanTableRows reads every row of one tier table on one database.
 func scanTableRows(t *testing.T, db *sql.DB, table string) []rawRow {
 	t.Helper()
@@ -759,6 +764,138 @@ func TestCompactorCrashedCollapseResumesExactlyOnce(t *testing.T) {
 	}, readerTotals(t, s2))
 }
 
+// The retired Go collapse round-trip, kept verbatim as the byte-identity
+// reference for the one-statement SQL fold: the collapse SELECT emitted the
+// two state columns as LIST(BLOB)s, Go scanned the groups out and folded the
+// lists with foldPercentiles/foldUniques, and the folded rows went back
+// through a prepared-statement (then Appender) insert. Task 2 replaced the
+// whole pipeline with collapseInsert + the fold UDFs; these copies are what
+// its output is byte-compared against.
+
+// queryer is the query surface the retired round-trip's query needed,
+// satisfied by both a checked-out connection and a database/sql transaction.
+type queryer interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+// collapsedGroup is one key's folded contribution to an archive window: the
+// collapse query's output row with both blob lists already folded.
+type collapsedGroup struct {
+	metric int32
+	time   int64
+	tags   [format.MaxTags]int32
+	stags  [format.MaxTags]string
+
+	count, min, max, maxCount, sum, sumSquare float64
+
+	minHostID         int32
+	minHostS          string
+	minHostValue      float64
+	maxHostID         int32
+	maxHostS          string
+	maxHostValue      float64
+	maxCountHostID    int32
+	maxCountHostS     string
+	maxCountHostValue float64
+
+	percentiles []byte
+	uniq        []byte
+}
+
+// collapsedGroupScan builds the scan target for one collapse query row, in the
+// SELECT list's order. The blob lists land in *any and are normalized by
+// blobList afterwards.
+func collapsedGroupScan(g *collapsedGroup, pctList, uniqList *any) []any {
+	scan := make([]any, 0, tierColumnCount)
+	scan = append(scan, &g.metric, &g.time)
+	for i := range g.tags {
+		scan = append(scan, &g.tags[i], &g.stags[i])
+	}
+	scan = append(scan,
+		&g.count, &g.min, &g.max, &g.maxCount, &g.sum, &g.sumSquare,
+		&g.minHostID, &g.minHostS, &g.minHostValue,
+		&g.maxHostID, &g.maxHostS, &g.maxHostValue,
+		&g.maxCountHostID, &g.maxCountHostS, &g.maxCountHostValue,
+		pctList, uniqList)
+	return scan
+}
+
+// collapseQuery is the retired collapse SELECT, verbatim from compact.go
+// before the SQL-fold rewrite: every column but the two state columns folded
+// by SQL aggregates, the state columns as LIST(BLOB)s for Go to fold.
+func collapseQuery(src, table string) string {
+	var cols []string
+	cols = append(cols, "metric, time")
+	for i := 0; i < format.MaxTags; i++ {
+		cols = append(cols, fmt.Sprintf("tag%d, stag%d", i, i))
+	}
+	cols = append(cols,
+		"sum(count) AS count",
+		"min(min) AS min",
+		"max(max) AS max",
+		"max(max_count) AS max_count",
+		"sum(sum) AS sum",
+		"sum(sumsquare) AS sumsquare")
+	hostCols := []struct{ fn, id, s, val string }{
+		{"arg_min", "min_host", "min_shost", "min_host_value"},
+		{"arg_max", "max_host", "max_shost", "max_host_value"},
+		{"arg_max", "max_count_host", "max_count_shost", "max_count_host_value"},
+	}
+	for _, h := range hostCols {
+		agg := fmt.Sprintf("%s(%s, %s) FILTER (WHERE %s <> 0 OR %s <> '')",
+			h.fn, hostStruct(h.id, h.s, h.val), h.val, h.id, h.s)
+		cols = append(cols,
+			fmt.Sprintf("coalesce((%s).i, 0) AS %s", agg, h.id),
+			fmt.Sprintf("coalesce((%s).s, '') AS %s", agg, h.s),
+			fmt.Sprintf("coalesce((%s).v, 0) AS %s", agg, h.val))
+	}
+	cols = append(cols,
+		"list(percentiles) AS percentiles_list",
+		"list(uniq_state) AS uniq_state_list")
+	return fmt.Sprintf(
+		"SELECT %s FROM %s.%s WHERE time >= $1 AND time < $2 GROUP BY ALL ORDER BY metric, time",
+		strings.Join(cols, ", "), src, table)
+}
+
+// queryCollapsedGroups is the retired round-trip's query-and-fold step,
+// verbatim from compact.go: run the collapse SELECT and fold both state
+// columns in Go, one group at a time.
+func queryCollapsedGroups(ctx context.Context, q queryer, src, table string, windowStart, windowEnd int64) ([]collapsedGroup, error) {
+	rows, err := q.QueryContext(ctx, collapseQuery(src, table), windowStart, windowEnd)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var g collapsedGroup
+	var pctList, uniqList any
+	scan := collapsedGroupScan(&g, &pctList, &uniqList)
+	var groups []collapsedGroup
+	for rows.Next() {
+		if err := rows.Scan(scan...); err != nil {
+			return nil, err
+		}
+		pctBlobs, err := blobList(pctList)
+		if err != nil {
+			return nil, fmt.Errorf("percentiles of metric %d at %d: %w", g.metric, g.time, err)
+		}
+		g.percentiles, err = foldPercentiles(pctBlobs)
+		if err != nil {
+			return nil, fmt.Errorf("percentiles of metric %d at %d: %w", g.metric, g.time, err)
+		}
+		uniqBlobs, err := blobList(uniqList)
+		if err != nil {
+			return nil, fmt.Errorf("uniq_state of metric %d at %d: %w", g.metric, g.time, err)
+		}
+		g.uniq, err = foldUniques(uniqBlobs)
+		if err != nil {
+			return nil, fmt.Errorf("uniq_state of metric %d at %d: %w", g.metric, g.time, err)
+		}
+		groups = append(groups, g)
+	}
+	return groups, rows.Err()
+}
+
 // goldenReferenceInsert is the retired prepared-statement append, verbatim from
 // insertCollapsedGroups before the Appender rewrite: one INSERT per group
 // through a prepared 116-parameter statement.
@@ -851,28 +988,30 @@ func goldenReferenceConsume(t *testing.T, s *Store, gen int64) {
 	require.True(t, s.unlinkDelta(deltaPath, gen), "the reference consume must finish like the real one")
 }
 
-// TestCollapseAppenderMatchesPreparedStatementPath pins the Appender rewrite's
-// byte identity: the same golden generation consumed by the retired
-// prepared-statement protocol and by the Appender protocol produces window
-// files holding the same rows — every column, the two aggregate-state blobs
-// included — in the same physical order, with the same consumption records.
-// This golden set is the reference Tasks 2 and 9 keep comparing against.
-func TestCollapseAppenderMatchesPreparedStatementPath(t *testing.T) {
+// TestCollapseSQLMatchesGoFoldReference pins the SQL-fold rewrite's byte
+// identity: the same golden generation consumed by the retired Go round-trip —
+// collapse SELECT, fold in Go, prepared-statement insert — and by the
+// production one-statement SQL fold (collapseInsert plus the fold UDFs)
+// produces window files holding the same rows — every column, the two
+// aggregate-state blobs included — in the same physical order, with the same
+// consumption records. This golden set is the reference Task 9 keeps
+// comparing against.
+func TestCollapseSQLMatchesGoFoldReference(t *testing.T) {
 	refDir := t.TempDir()
 	seedGoldenGeneration(t, refDir)
-	appenderDir := t.TempDir()
-	copyTree(t, refDir, appenderDir)
+	sqlDir := t.TempDir()
+	copyTree(t, refDir, sqlDir)
 
 	ref, _ := openTestStore(t, refDir)
 	defer func() { _ = ref.Close() }()
 	goldenReferenceConsume(t, ref, 0)
 
-	prod, _ := openTestStore(t, appenderDir)
+	prod, _ := openTestStore(t, sqlDir)
 	defer func() { _ = prod.Close() }()
 	require.NoError(t, prod.ConsumeGeneration(context.Background(), 0, ConsumeOptions{AppendWindow: collapseWindowRows}))
 
 	require.Equal(t, []int64{1}, prod.DeltaGenerations())
-	require.NoFileExists(t, filepath.Join(appenderDir, deltaFileName(0)))
+	require.NoFileExists(t, filepath.Join(sqlDir, deltaFileName(0)))
 	require.NoFileExists(t, filepath.Join(refDir, deltaFileName(0)))
 
 	wins := prod.Windows()
@@ -908,7 +1047,7 @@ func TestCollapseAppenderMatchesPreparedStatementPath(t *testing.T) {
 		{Tier1m, testWindowStart(Tier1m, int64(now)-5), 4},
 		{Tier1h, testWindowStart(Tier1h, int64(now)-5), 4},
 	} {
-		db, err := openStoreFile(filepath.Join(appenderDir, archiveSubdir, archiveFileName(tc.tier, tc.start)), true, ResourcesConfig{})
+		db, err := openStoreFile(filepath.Join(sqlDir, archiveSubdir, archiveFileName(tc.tier, tc.start)), true, ResourcesConfig{})
 		require.NoError(t, err)
 		require.Len(t, scanTableRows(t, db, tierTables[tc.tier]), tc.rows,
 			"%s window %d", tc.tier, tc.start)
@@ -917,11 +1056,11 @@ func TestCollapseAppenderMatchesPreparedStatementPath(t *testing.T) {
 }
 
 // TestConsumeCancelledMidAppendHoldsNeitherRowsNorRecord cancels the consume's
-// context after a window's appender rows are flushed into the open
-// transaction — before the consumption record lands — and proves the rollback
-// leaves the window holding neither the rows nor the record: a flush that
-// escaped the transaction would survive its rollback and double-count on the
-// retry. The resumed consume must then land every value exactly once.
+// context after a window's collapse statement lands its rows in the open
+// transaction — before the consumption record — and proves the rollback leaves
+// the window holding neither the rows nor the record: rows that escaped the
+// transaction would survive its rollback and double-count on the retry. The
+// resumed consume must then land every value exactly once.
 func TestConsumeCancelledMidAppendHoldsNeitherRowsNorRecord(t *testing.T) {
 	crashDir := t.TempDir()
 	seedGoldenGeneration(t, crashDir)

@@ -214,13 +214,16 @@ func (s *Store) SealWindow(ctx context.Context, tier string, windowStart int64) 
 }
 
 // rewriteWindowRuns is the seal's transaction: collapse the window's rows —
-// reading the window's own table, the same statement compaction runs over the
-// delta — into a fresh table, swap it in under the original name, and plant
-// the sealed marker, all committing or rolling back together. The transaction
-// is the writer's protocol — explicit BEGIN TRANSACTION / COMMIT through the
-// connection — so the appender filling the fresh table flushes into the very
-// transaction the swap and the marker land in.
+// the same one-statement collapse compaction runs over the delta, reading the
+// window's own table — into a fresh table, swap it in under the original name,
+// and plant the sealed marker, all committing or rolling back together. The
+// transaction is the writer's protocol — explicit BEGIN TRANSACTION / COMMIT
+// through the connection — and the collapse's fold UDFs are registered on the
+// connection before it opens, since DuckDB UDFs live per-connection.
 func (s *Store) rewriteWindowRuns(ctx context.Context, conn *sql.Conn, tier, table string, windowStart int64) error {
+	if err := registerFoldUDFs(conn); err != nil {
+		return err
+	}
 	if _, err := conn.ExecContext(ctx, "BEGIN TRANSACTION"); err != nil {
 		return err
 	}
@@ -228,16 +231,13 @@ func (s *Store) rewriteWindowRuns(ctx context.Context, conn *sql.Conn, tier, tab
 		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
 		return err
 	}
-	groups, err := queryCollapsedGroups(ctx, conn, "main", table, windowStart, windowStart+tierWindowSecs[tier])
-	if err != nil {
-		return fail(fmt.Errorf("collapse %s: %w", table, err))
-	}
 	sealedTable := table + "_sealed"
 	if _, err := conn.ExecContext(ctx, tierTableDDL(sealedTable)); err != nil {
 		return fail(fmt.Errorf("create %s: %w", sealedTable, err))
 	}
-	if err := insertCollapsedGroups(ctx, conn, sealedTable, groups); err != nil {
-		return fail(fmt.Errorf("fill %s: %w", sealedTable, err))
+	if _, err := conn.ExecContext(ctx,
+		collapseInsert(sealedTable, "main", table), windowStart, windowStart+tierWindowSecs[tier]); err != nil {
+		return fail(fmt.Errorf("collapse %s into %s: %w", table, sealedTable, err))
 	}
 	if _, err := conn.ExecContext(ctx, "DROP TABLE "+table); err != nil {
 		return fail(fmt.Errorf("drop %s: %w", table, err))

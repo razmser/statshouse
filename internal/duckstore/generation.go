@@ -108,13 +108,12 @@ type ConsumeOptions struct {
 	// AppendWindow appends one window's share of the generation's rows to the
 	// tier table inside one open transaction on conn — driven by BEGIN
 	// TRANSACTION / COMMIT through conn.ExecContext, the writer's protocol —
-	// so an Appender built on the raw connection underneath conn.Raw
-	// participates in the same transaction as the consumption record:
-	// appender flushes join the connection's open transaction rather than
-	// auto-committing. conn is already bound to the window file's own
-	// database with the delta generation attached read-only as deltaSrcAlias.
-	// The default copies the window's rows verbatim; compaction passes its
-	// collapse query instead.
+	// so the append statement's rows land in the same transaction as the
+	// consumption record and commit with it or roll back with it. conn is
+	// already bound to the window file's own database with the delta
+	// generation attached read-only as deltaSrcAlias, and carries the fold
+	// UDFs registered for the collapse. The default copies the window's rows
+	// verbatim; compaction passes its collapse statement instead.
 	AppendWindow func(ctx context.Context, conn *sql.Conn, tier string, windowStart, windowEnd int64) error
 
 	// Fault, when set, is consulted at each CrashPoint; a non-nil error
@@ -300,6 +299,13 @@ func (s *Store) consumeWindow(ctx context.Context, gen int64, deltaPath string, 
 		return fmt.Errorf("duck-store: connection to %s: %w", path, err)
 	}
 	defer conn.Close()
+	// The collapse statement folds both aggregate-state columns through scalar
+	// UDFs, and DuckDB UDFs live on the connection: register them before this
+	// connection's first statement, so whichever AppendWindow runs — the
+	// collapsing one today — finds them in place.
+	if err := registerFoldUDFs(conn); err != nil {
+		return fmt.Errorf("duck-store: consume generation %d into %s: %w", gen, path, err)
+	}
 	if _, err := conn.ExecContext(ctx, fmt.Sprintf("ATTACH %s AS %s (READ_ONLY)", sqlString(deltaPath), deltaSrcAlias)); err != nil {
 		return fmt.Errorf("duck-store: attach %s to consume generation %d: %w", deltaPath, gen, err)
 	}
