@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -26,14 +27,22 @@ import (
 const testStatshouseVersion = "test-binary"
 
 // openTestStore opens a store with an injected StatsHouse version (so tests
-// never depend on build ldflags) and a captured log.
+// never depend on build ldflags) and a captured log. The capture is locked:
+// maintenance goroutines log concurrently — compaction and the seal barrier
+// each unlink generations — and the tests that read the slice do so after
+// joining those goroutines.
 func openTestStore(t *testing.T, dir string) (*Store, *[]string) {
 	t.Helper()
+	var mu sync.Mutex
 	var logs []string
 	s, err := OpenStore(StoreConfig{
 		Dir:               dir,
 		StatshouseVersion: testStatshouseVersion,
-		Logf:              func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) },
+		Logf: func(format string, args ...any) {
+			mu.Lock()
+			defer mu.Unlock()
+			logs = append(logs, fmt.Sprintf(format, args...))
+		},
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = s.Close() })

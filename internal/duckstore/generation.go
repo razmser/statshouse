@@ -275,11 +275,16 @@ func (s *Store) consumeWindow(ctx context.Context, gen int64, deltaPath string, 
 	// A sealed window is immutable: its rows were rewritten into one run past the
 	// historic window, so only a sender violating that window could land here
 	// — the writer's ingest guard drops such rows, and this is the backstop.
-	// The rows can never be appended, and failing here would wedge this
-	// generation and every later one on rows that are unplaceable by
-	// construction, so they are dropped loudly instead: an error log, a
-	// metric, and the consumption record in its own transaction, so the
-	// generation still completes and its other windows still land.
+	// The seal barrier (sealBarrier) makes that airtight: a pass drains every
+	// generation contributing to a window before sealing it, and the guard
+	// rejects rows for a window once due, so a row arriving here required a
+	// round whose guard ran before the seal — a sender whose clock is behind
+	// the boundary, violating the historic window. The rows can never be
+	// appended, and failing here would wedge this generation and every later
+	// one on rows that are unplaceable by construction, so they are dropped
+	// loudly instead: an error log, a metric, and the consumption record in
+	// its own transaction, so the generation still completes and its other
+	// windows still land.
 	sealed, err := readSealed(db)
 	if err != nil {
 		return fmt.Errorf("duck-store: read %s of %s: %w", SealedTable, path, err)
@@ -375,6 +380,17 @@ func (s *Store) consumeWindow(ctx context.Context, gen int64, deltaPath string, 
 	delete(s.evicted, k) // the window is served and holding again; any eviction tombstone is stale
 	s.mu.Unlock()
 	return nil
+}
+
+// deltaState returns the generation list and the active generation under one
+// lock, so a caller pairing the two cannot straddle a roll — the same
+// consistency the query snapshot (query_snapshot.go) gives reads. The seal
+// barrier takes it after its own roll, when every generation below the
+// active one is already immutable and none of them can be missed.
+func (s *Store) deltaState() (gens []int64, active int64) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return append([]int64(nil), s.deltas...), s.gen
 }
 
 // copyWindowRows is the default append: the window's rows verbatim, the way

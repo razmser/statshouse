@@ -36,6 +36,15 @@ import (
 // a crash mid-seal rolls back to the unsealed several-run state and the next
 // pass simply retries; a crash after the commit is indistinguishable from a
 // completed seal, because the marker rides along with the rewrite.
+//
+// Crossing the seal time is necessary but not sufficient: the writer's ingest
+// guard and the seal boundary meet exactly, so a row accepted in the last
+// conforming second can sit in a delta generation that consumption has not
+// taken when the window comes due. Sealing it then would doom that row —
+// consumeWindow's sealed branch can never place it. A pass therefore seals
+// only behind the barrier (sealBarrier): a coordinated roll-and-drain that
+// establishes, durably, that no generation — the active one included — can
+// still contribute a row to any window the pass is about to seal.
 
 // DefaultSealerInterval is how often the sealer wakes to look for windows past
 // their seal time. Sealing is rare — one rewrite per window lifetime, 48
@@ -56,15 +65,24 @@ type SealerConfig struct {
 	// MaintenanceWindow per window the pass sealed. Optional.
 	Metrics MetricsRecorder
 
+	// DrainFault, when set, is consulted at each crash point of every
+	// generation the seal barrier consumes — the ConsumeOptions.Fault
+	// protocol — so a non-nil error fails the barrier, and the pass with it,
+	// exactly where a compaction that cannot finish would stall. It exists
+	// for tests; production leaves it nil.
+	DrainFault func(CrashPoint) error
+
 	// Logf receives pass failures. Defaults to log.Printf.
 	Logf func(format string, args ...any)
 }
 
 // Sealer drives a store's sealing passes. It is one goroutine working one
-// window at a time at a relaxed cadence, and it never holds anything the
-// write path needs — the per-window maintenance lock it shares with
-// compaction's appends is never taken by ingestion — so sealing runs at
-// lowest priority and can never delay an insert round.
+// window at a time at a relaxed cadence, and it holds nothing the write path
+// needs — the per-window maintenance lock it shares with compaction's appends
+// is never taken by ingestion. The one coordination sealing now performs with
+// the writer is the barrier's roll: the generation switch waits for the round
+// already in flight and rounds submitted behind it wait for the switch, a
+// one-round pause a pass costs only while a window actually came due.
 type Sealer struct {
 	store *Store
 	cfg   SealerConfig
@@ -119,20 +137,37 @@ func (sl *Sealer) sealOnce(ctx context.Context) error {
 	sl.mu.Lock()
 	defer sl.mu.Unlock()
 	now := sl.cfg.NowFunc().Unix()
+	var due []windowKey
 	for _, wf := range sl.store.Windows() {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
 		if wf.Sealed || !windowSealDue(wf.Tier, wf.WindowStart, now) {
 			continue
 		}
-		if err := sl.store.SealWindow(ctx, wf.Tier, wf.WindowStart); err != nil {
+		if _, err := os.Stat(wf.Path); err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
 				continue // the window left before its seal; nothing to rewrite
 			}
 			return fmt.Errorf("duck-store: seal %s: %w", wf.Path, err)
 		}
-		recordMaintenanceWindow(sl.cfg.Metrics, WindowSealed, wf.Tier)
+		due = append(due, windowKey{tier: wf.Tier, start: wf.WindowStart})
+	}
+	if len(due) == 0 {
+		return nil
+	}
+	if err := sl.store.sealBarrier(ctx, due, sl.cfg.DrainFault); err != nil {
+		return err
+	}
+	for _, k := range due {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err := sl.store.SealWindow(ctx, k.tier, k.start); err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				continue // the window left between the barrier and the rewrite
+			}
+			return fmt.Errorf("duck-store: seal %s: %w",
+				filepath.Join(sl.store.cfg.Dir, archiveSubdir, archiveFileName(k.tier, k.start)), err)
+		}
+		recordMaintenanceWindow(sl.cfg.Metrics, WindowSealed, k.tier)
 	}
 	return nil
 }
@@ -144,12 +179,109 @@ func windowSealDue(tier string, windowStart, nowUnix int64) bool {
 	return nowUnix >= windowStart+tierWindowSecs[tier]+data_model.MaxHistoricWindow
 }
 
+// sealBarrier establishes the durable precondition for sealing the due
+// windows: by the time it returns, no delta generation — the active one
+// included — can still contribute a row to any of them, so the rewrites that
+// follow cannot strand a conformingly-accepted row in a generation whose
+// window is already frozen. Two things must hold, and the barrier delivers
+// both with one coordinated roll-and-drain:
+//
+// (a) No writer round accepted before the boundary can still commit a row
+// into a generation the drain cannot see. The roll below is the handshake:
+// the writer switches generations only between rounds, so every round already
+// accepted commits into the rolled generation before the roll returns, and
+// every later round runs its ingest guard at a time the pass already found
+// the windows due — where the guard rejects their rows outright.
+//
+// (b) Every rolled generation contributing to a due window has durably
+// recorded consumption. After the roll, each such generation is immutable
+// with its plan fixed, so its contribution is decidable exactly (its windows,
+// read under a pin so a concurrent consume cannot unlink it mid-read), and
+// consuming it lands its rows in the archive before any rewrite starts.
+//
+// The generation list the drain walks is resolved under one store lock
+// (deltaState — the same consistency the query snapshot gives reads), taken
+// after the roll: every generation below the then-active one was sealed by
+// some roll at or before the barrier's, so all of them are eligible and none
+// can be missed. A generation the compactor finishes under the barrier is
+// skipped — its rows are already durably recorded — while a genuine consume
+// failure fails the pass, leaving every due window unsealed for the retry.
+func (s *Store) sealBarrier(ctx context.Context, due []windowKey, fault func(CrashPoint) error) error {
+	// The roll costs one generation switch and makes the pending-row question
+	// decidable: everything that can ever land in a due window is now in a
+	// rolled, immutable generation.
+	if err := s.RollGeneration(); err != nil {
+		return fmt.Errorf("duck-store: seal barrier roll: %w", err)
+	}
+	dueSet := make(map[windowKey]struct{}, len(due))
+	for _, k := range due {
+		dueSet[k] = struct{}{}
+	}
+	opts := ConsumeOptions{AppendWindow: collapseWindowRows, Fault: fault}
+	gens, active := s.deltaState()
+	for _, gen := range gens {
+		if gen == active {
+			break // gens ascend; this one and anything after took no pre-boundary rows
+		}
+		contributes, err := s.generationContributesToDue(gen, dueSet)
+		if err != nil {
+			return err
+		}
+		if !contributes {
+			continue
+		}
+		if err := s.ConsumeGeneration(ctx, gen, opts); err != nil {
+			if deltaFileGone(filepath.Join(s.cfg.Dir, deltaFileName(gen))) {
+				continue // the compactor finished this generation under the barrier; its windows hold the rows
+			}
+			return fmt.Errorf("duck-store: seal barrier: %w", err)
+		}
+	}
+	return nil
+}
+
+// generationContributesToDue reports whether a rolled generation's archive
+// window plan intersects the set the barrier is about to seal. The plan is
+// read through a pin (lease.go), so the compactor cannot unlink the file
+// mid-read; the pin is back before the caller consumes the generation, since
+// consumption itself waits for pins to clear. A generation that vanished
+// before or during the check contributes nothing: its rows are already in the
+// archive.
+func (s *Store) generationContributesToDue(gen int64, due map[windowKey]struct{}) (bool, error) {
+	pin := s.AcquireDeltaPin(gen)
+	if pin == nil {
+		return false, nil // not present anymore: consumed or gone under the barrier
+	}
+	defer pin.Release()
+	path := filepath.Join(s.cfg.Dir, deltaFileName(gen))
+	windows, err := generationWindows(path, s.cfg.Resources)
+	if err != nil {
+		return false, fmt.Errorf("duck-store: seal barrier: plan generation %d: %w", gen, err)
+	}
+	for k := range windows {
+		if _, ok := due[k]; ok {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// deltaFileGone reports whether a delta generation's file left the disk — the
+// barrier's way to tell a generation the compactor finished under it from one
+// its own consume genuinely failed to land.
+func deltaFileGone(path string) bool {
+	_, err := os.Stat(path)
+	return errors.Is(err, fs.ErrNotExist)
+}
+
 // SealWindow rewrites one archive window's runs into a single collapsed run
 // and seals the file: the rewrite, the sealed marker and nothing else land
 // in one transaction, and the file is reopened read-only — the access mode
 // every open from the seal on uses. Sealing an already-sealed window is a
 // no-op, so a retried pass after a crash between the commit and the in-memory
-// bookkeeping completes quietly.
+// bookkeeping completes quietly. The window must have crossed its seal time
+// and cleared the barrier (sealBarrier) — a sealing pass establishes both; a
+// direct caller takes responsibility for them itself.
 func (s *Store) SealWindow(ctx context.Context, tier string, windowStart int64) error {
 	path := filepath.Join(s.cfg.Dir, archiveSubdir, archiveFileName(tier, windowStart))
 	table := tierTables[tier]

@@ -48,9 +48,11 @@ const (
 	// unlink to a later pass.
 	WindowLeaseDeferred WindowEventKind = "lease_deferred"
 	// WindowLateDropped: compaction found the window already sealed and
-	// dropped that generation's rows for it. The writer's ingest guard makes
-	// this unreachable for conforming senders, so any count is a sender
-	// violating the historic window.
+	// dropped that generation's rows for it. The writer's ingest guard and
+	// the seal barrier (seal.go) make this unreachable for conforming
+	// senders — a pass drains every generation contributing to a window
+	// before sealing it, and the guard rejects rows for a window once due —
+	// so any count is a sender violating the historic window.
 	WindowLateDropped WindowEventKind = "late_dropped"
 )
 

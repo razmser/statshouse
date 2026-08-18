@@ -10,9 +10,11 @@ package duckstore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -379,4 +381,262 @@ func TestNewSealerDefaults(t *testing.T) {
 	require.Equal(t, DefaultSealerInterval, sl.cfg.Interval)
 	require.NotNil(t, sl.cfg.NowFunc)
 	require.NotNil(t, sl.cfg.Logf)
+}
+
+// sealDueClock returns a clock parked far enough past a 1s window's seal time
+// that the window is due, on the same shape the boundary tests use.
+func sealDueClock(windowStart int64) time.Time {
+	return time.Unix(windowStart+tierWindowSecs[Tier1s]+data_model.MaxHistoricWindow, 0)
+}
+
+// windowMetricCount sums one metric's count over one archive window file.
+func windowMetricCount(t *testing.T, wf WindowFile, metric int32) float64 {
+	t.Helper()
+	db, err := openStoreFile(wf.Path, true, ResourcesConfig{})
+	require.NoError(t, err)
+	defer db.Close()
+	var c float64
+	require.NoError(t, db.QueryRow(
+		"SELECT coalesce(sum(count), 0) FROM "+TierTable(wf.Tier)+" WHERE metric = $1", metric).Scan(&c))
+	return c
+}
+
+// TestSealBarrierHoldsWindowWithPendingGeneration is the barrier's core
+// contract: a served window that has come due, but whose latest rows still
+// sit in an unconsumed generation, does not seal — a drain that cannot
+// complete fails the pass and leaves the rows exactly where they were — and
+// does seal, with the rows landed, once nothing holds the generation back.
+func TestSealBarrierHoldsWindowWithPendingGeneration(t *testing.T) {
+	s, w := newTestWriter(t)
+	now := uint32(writerNowUnix)
+	ctx := context.Background()
+
+	// The due window enters the served set through an ordinary compaction
+	// pass; its rows (count 3) are durably in the archive.
+	const oldAge = 47 * 3600
+	first := partialRow(t, testMetricID, now-oldAge)
+	first.Count, first.Sum = 3, 30
+	require.NoError(t, w.WriteRound(ctx, []Row{first}))
+	require.NoError(t, NewCompactor(s, CompactorConfig{}).CompactOnce(ctx))
+	oldWindow := testWindowStart(Tier1s, int64(now)-oldAge)
+	require.EqualValues(t, 3, windowMetricCount(t, findWindow(t, s, Tier1s, oldWindow), testMetricID))
+
+	// More rows for the same window — still inside the guard under the
+	// writer's frozen clock — land in a generation consumption has not taken:
+	// the exact shape the barrier exists for.
+	second := partialRow(t, testMetricID, now-oldAge)
+	second.Count, second.Sum = 4, 40
+	require.NoError(t, w.WriteRound(ctx, []Row{second}))
+	require.NoError(t, s.RollGeneration())
+
+	// The drain fails: the pass must refuse to seal, the pending generation
+	// must survive with its rows, and the window must stay as it was.
+	stalled := errors.New("drain stalled")
+	blocked := NewSealer(s, SealerConfig{
+		NowFunc:    func() time.Time { return sealDueClock(oldWindow) },
+		DrainFault: func(CrashPoint) error { return stalled },
+	})
+	require.ErrorIs(t, blocked.SealOnce(ctx), stalled)
+	require.False(t, findWindow(t, s, Tier1s, oldWindow).Sealed,
+		"a window with a pending generation must not seal")
+	require.Equal(t, []int64{1, 2, 3}, s.DeltaGenerations(),
+		"the failed drain must leave the pending generation holding its rows")
+	require.EqualValues(t, 3, windowMetricCount(t, findWindow(t, s, Tier1s, oldWindow), testMetricID),
+		"the refused seal must not change the window")
+
+	// With the drain healthy the same pass lands the rows and seals: the
+	// barrier consumes the contributor itself instead of trusting a separate
+	// compactor to have done it.
+	require.NoError(t, NewSealer(s, SealerConfig{NowFunc: func() time.Time { return sealDueClock(oldWindow) }}).
+		SealOnce(ctx))
+	wf := findWindow(t, s, Tier1s, oldWindow)
+	require.True(t, wf.Sealed, "the window must seal once its generation is consumed")
+	require.Equal(t, []int64{2, 3, 4}, s.DeltaGenerations(),
+		"the barrier must drain the contributing generation; non-contributors wait for the compactor")
+	require.EqualValues(t, 7, windowMetricCount(t, wf, testMetricID),
+		"the pending rows must land in the window, not drop")
+}
+
+// TestSealBarrierLandsBoundaryRowInsteadOfLosingIt reproduces the loss the
+// barrier closes. Pre-fix, a row accepted in the last conforming second sat
+// in a pending generation when its window came due; the pass sealed on
+// wall-clock age alone, and the later consume dropped the row through the
+// sealed branch with only a WindowLateDropped to show. With the barrier the
+// pass drains first, so the row lands and the window seals holding it — and
+// the sealed branch keeps firing only for a sender whose clock genuinely
+// violates the boundary.
+func TestSealBarrierLandsBoundaryRowInsteadOfLosingIt(t *testing.T) {
+	rec := &recordingMetrics{}
+	var logs []string
+	s, err := OpenStore(StoreConfig{
+		Dir:               t.TempDir(),
+		StatshouseVersion: testStatshouseVersion,
+		Logf:              func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) },
+		Metrics:           rec,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+	w, err := NewWriter(s, WriterConfig{NowFunc: func() time.Time { return writerNow }})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+	now := uint32(writerNowUnix)
+	ctx := context.Background()
+
+	// The boundary row's window enters the served set first...
+	const oldAge = 47 * 3600
+	first := partialRow(t, testMetricID, now-oldAge)
+	first.Count, first.Sum = 3, 30
+	require.NoError(t, w.WriteRound(ctx, []Row{first}))
+	require.NoError(t, NewCompactor(s, CompactorConfig{}).CompactOnce(ctx))
+	oldWindow := testWindowStart(Tier1s, int64(now)-oldAge)
+
+	// ...then the boundary row itself: accepted by the guard under the
+	// writer's clock, pending in a rolled generation when the window comes
+	// due. Pre-fix this is the loss; with the barrier it is a drain.
+	second := partialRow(t, testMetricID, now-oldAge)
+	second.Count, second.Sum = 4, 40
+	require.NoError(t, w.WriteRound(ctx, []Row{second}))
+	require.NoError(t, s.RollGeneration())
+
+	require.NoError(t, NewSealer(s, SealerConfig{
+		NowFunc: func() time.Time { return sealDueClock(oldWindow) },
+		Metrics: rec,
+	}).SealOnce(ctx))
+
+	wf := findWindow(t, s, Tier1s, oldWindow)
+	require.True(t, wf.Sealed)
+	require.EqualValues(t, 7, windowMetricCount(t, wf, testMetricID),
+		"the row accepted at the boundary must land in the sealed window")
+	require.Zero(t, countWindowEvents(rec, WindowLateDropped),
+		"a conformingly accepted row must never take the late-drop path")
+
+	// The backstop: the same row written after the seal — possible only for a
+	// sender whose clock still sits before the boundary — is dropped loudly,
+	// with the metric that now means exactly that.
+	violating := partialRow(t, testMetricID, now-oldAge)
+	violating.Count, violating.Sum = 5, 50
+	require.NoError(t, w.WriteRound(ctx, []Row{violating}))
+	require.NoError(t, NewCompactor(s, CompactorConfig{}).CompactOnce(ctx))
+	require.Equal(t, []int64{s.ActiveDeltaGeneration()}, s.DeltaGenerations(),
+		"the generation holding the violating row must still complete")
+	require.Equal(t, 1, countWindowEvents(rec, WindowLateDropped),
+		"the violating sender alone must take the late-drop path")
+	require.EqualValues(t, 7, windowMetricCount(t, wf, testMetricID),
+		"the dropped append must not change the sealed window")
+	droppedLog := fmt.Sprintf(
+		"[error] duck-store: %s is sealed: dropping generation",
+		filepath.Join(s.cfg.Dir, archiveSubdir, archiveFileName(Tier1s, oldWindow)))
+	var logged bool
+	for _, l := range logs {
+		logged = logged || strings.Contains(l, droppedLog)
+	}
+	require.True(t, logged, "the loud drop must reach the operator log: want %q in %v", droppedLog, logs)
+}
+
+// TestSealBarrierProgressesAgainstBlockedCompactor pins the barrier's
+// liveness against a compaction pass that is itself stuck: work parked on one
+// window's lock neither stops the sealer draining other generations and
+// sealing unrelated windows, nor deadlocks the sealer when the park is on the
+// very window due for sealing — the barrier waits the park out and still
+// completes, tolerating the parked pass finishing the same generation under
+// it.
+func TestSealBarrierProgressesAgainstBlockedCompactor(t *testing.T) {
+	s, w := newTestWriter(t)
+	now := uint32(writerNowUnix)
+	ctx := context.Background()
+
+	// parkFault builds a consume fault that signals the moment it holds its
+	// first window's write lock, then blocks until released — the exact state
+	// of a compaction pass stuck mid-consume.
+	parkFault := func(entered chan<- struct{}, release <-chan struct{}) func(CrashPoint) error {
+		var once sync.Once
+		return func(p CrashPoint) error {
+			if p == CrashBeforeAppend {
+				once.Do(func() { close(entered) })
+				<-release
+			}
+			return nil
+		}
+	}
+	consumeParked := func(gen int64, fault func(CrashPoint) error) chan error {
+		done := make(chan error, 1)
+		go func() {
+			done <- s.ConsumeGeneration(ctx, gen, ConsumeOptions{AppendWindow: collapseWindowRows, Fault: fault})
+		}()
+		return done
+	}
+	// writeRolled writes one row and leaves it pending in a rolled
+	// generation, returning that generation.
+	writeRolled := func(row Row) int64 {
+		require.NoError(t, w.WriteRound(ctx, []Row{row}))
+		gen := s.ActiveDeltaGeneration()
+		require.NoError(t, s.RollGeneration())
+		return gen
+	}
+
+	// A due window, served by an ordinary compaction pass, and a pending
+	// generation whose rows aim only at a fresh window.
+	const oldAge = 47 * 3600
+	first := partialRow(t, testMetricID, now-oldAge)
+	first.Count, first.Sum = 3, 30
+	require.NoError(t, w.WriteRound(ctx, []Row{first}))
+	require.NoError(t, NewCompactor(s, CompactorConfig{}).CompactOnce(ctx))
+	dueWindow := testWindowStart(Tier1s, int64(now)-oldAge)
+	fresh := partialRow(t, testMetricID2, now-5)
+	fresh.Count, fresh.Sum = 1, 2
+	freshGen := writeRolled(fresh)
+	sealer := NewSealer(s, SealerConfig{NowFunc: func() time.Time { return sealDueClock(dueWindow) }})
+
+	// The stuck pass holds the fresh window's lock while the sealer seals the
+	// due one: the barrier walks the pending generation, sees it contributes
+	// to no due window, and leaves it alone — sealing progresses regardless
+	// of the compactor's fate.
+	entered, release := make(chan struct{}), make(chan struct{})
+	parked := consumeParked(freshGen, parkFault(entered, release))
+	<-entered
+	require.NoError(t, sealer.SealOnce(ctx),
+		"a stuck pass on another window must not stop sealing")
+	require.True(t, findWindow(t, s, Tier1s, dueWindow).Sealed,
+		"the due window must seal while the compactor is blocked elsewhere")
+	close(release)
+	require.NoError(t, <-parked)
+
+	// Now the stuck pass sits on the very window due for sealing, consuming a
+	// pending generation that contributes to it. The barrier must wait it
+	// out — no seal while the park holds — and complete once the pass lets
+	// go, even though the parked pass finished the same generation under the
+	// barrier mid-wait.
+	laterTs := now - oldAge - 3600
+	laterFirst := partialRow(t, testMetricID, laterTs)
+	laterFirst.Count, laterFirst.Sum = 5, 50
+	require.NoError(t, w.WriteRound(ctx, []Row{laterFirst}))
+	require.NoError(t, NewCompactor(s, CompactorConfig{}).CompactOnce(ctx))
+	laterWindow := testWindowStart(Tier1s, int64(laterTs))
+	laterSecond := partialRow(t, testMetricID, laterTs)
+	laterSecond.Count, laterSecond.Sum = 2, 20
+	laterGen := writeRolled(laterSecond)
+
+	entered2, release2 := make(chan struct{}), make(chan struct{})
+	parked2 := consumeParked(laterGen, parkFault(entered2, release2))
+	<-entered2
+
+	sealDone := make(chan error, 1)
+	go func() { sealDone <- sealer.SealOnce(ctx) }()
+	select {
+	case err := <-sealDone:
+		t.Fatalf("the sealer finished (%v) while the stuck pass still holds the window", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(release2)
+	require.NoError(t, <-parked2)
+	select {
+	case err := <-sealDone:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("the barrier must finish once the stuck pass lets go — no deadlock")
+	}
+	wf := findWindow(t, s, Tier1s, laterWindow)
+	require.True(t, wf.Sealed)
+	require.EqualValues(t, 7, windowMetricCount(t, wf, testMetricID),
+		"the row must land exactly once whatever side of the race consumed it")
 }
