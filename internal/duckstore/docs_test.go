@@ -77,8 +77,10 @@ func TestDuckStoreDocDefaultsMatchCode(t *testing.T) {
 		fmt.Sprintf("%d hours", int(duckstore.DefaultRetention1s.Hours())),
 		fmt.Sprintf("%d days", int(duckstore.DefaultRetention1m.Hours()/24)),
 		fmt.Sprintf("%d MB", duckstore.DefaultMemoryLimitBytes>>20),
-		fmt.Sprintf("%d concurrent", aggregator.DefaultQueryConcurrency),
-		fmt.Sprintf("%d seconds", int(aggregator.DefaultQueryQueueWait.Seconds())),
+		// The concurrency default is computed from the machine's
+		// GOMAXPROCS, so the doc states the formula, not a number.
+		"`max(2, GOMAXPROCS)`",
+		fmt.Sprintf("%d-second ceiling", int(aggregator.DefaultQueryQueueWait.Seconds())),
 	} {
 		if !strings.Contains(doc, want) {
 			t.Errorf("docs/duck-store.md does not state the code default %q", want)

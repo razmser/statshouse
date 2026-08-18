@@ -92,7 +92,8 @@ type ConfigAggregator struct {
 	DuckQueryAddr string
 
 	// DuckQueryConcurrency is how many store queries may execute at once per
-	// shard; concurrent queries beyond it wait briefly for a slot and are
+	// shard; queries beyond it wait for a slot — toward the request's own
+	// clamped timeout, never past the DefaultQueryQueueWait ceiling — and are
 	// then refused as overloaded, so a burst of heavy queries cannot eat the
 	// machine ingestion needs.
 	DuckQueryConcurrency int

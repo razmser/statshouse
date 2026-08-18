@@ -33,8 +33,10 @@ import (
 // store's observability events as __duck_store_* builtin metrics.
 func openDuckStore(config ConfigAggregator, sh2 *agent.Agent) (duckStoreHandle, error) {
 	var rec duckstore.MetricsRecorder
+	var queryMetrics storeQueryMetrics
 	if sh2 != nil {
-		rec = &duckMetrics{sh: sh2}
+		dm := &duckMetrics{sh: sh2}
+		rec, queryMetrics = dm, dm
 	}
 	s, err := duckstore.OpenStore(duckstore.StoreConfig{
 		Dir:     config.DuckStoreDir,
@@ -90,6 +92,7 @@ func openDuckStore(config ConfigAggregator, sh2 *agent.Agent) (duckStoreHandle, 
 	return &duckStore{
 		store:           s,
 		writer:          w,
+		queryMetrics:    queryMetrics,
 		stopMaintenance: stopMaintenance,
 		maintenanceDone: maintenanceDone,
 	}, nil
@@ -133,6 +136,29 @@ func (m *duckMetrics) QuarantinedFiles(axis duckstore.QuarantineAxis, count int)
 func (m *duckMetrics) StoreQuery(verb duckstore.QueryVerb, err error, dur time.Duration) {
 	m.sh.AddValueCounter(m.now(), format.BuiltinMetricMetaDuckQueryTime,
 		[]int32{0, duckQueryVerbTag(verb), duckStatusTag(err)}, dur.Seconds(), 1)
+}
+
+// StoreQueryAdmission reports one admission outcome of the query listener:
+// how long a query waited for its slot before executing (storeQueryQueued),
+// or that it was shed and how long it waited before the refusal
+// (storeQueryRefused). The listener records these itself because a query that
+// never executes never reaches the renderers' own StoreQuery point — without
+// this, overload is invisible in __duck_store_query_time, which is exactly
+// when it matters.
+func (m *duckMetrics) StoreQueryAdmission(verb storeQueryVerb, outcome storeQueryAdmission, wait time.Duration) {
+	// The listener's verb vocabulary mirrors duckstore's ("series",
+	// "tag_values") but is a distinct type — the listener is built without
+	// the duckdb tag — so it maps to the same tag values through its own
+	// switch.
+	var verbTag int32
+	switch verb {
+	case storeQuerySeries:
+		verbTag = format.TagValueIDDuckQuerySeries
+	case storeQueryTagValues:
+		verbTag = format.TagValueIDDuckQueryTagValues
+	}
+	m.sh.AddValueCounter(m.now(), format.BuiltinMetricMetaDuckQueryTime,
+		[]int32{0, verbTag, duckQueryAdmissionTag(outcome)}, wait.Seconds(), 1)
 }
 
 func (m *duckMetrics) StoreSize(location duckstore.SizeLocation, used, free int64) {
@@ -237,6 +263,19 @@ func duckQueryVerbTag(verb duckstore.QueryVerb) int32 {
 	return 0
 }
 
+// duckQueryAdmissionTag maps the listener's admission outcomes onto the same
+// status tag the executions' ok/error live on, so one metric carries the
+// whole query load.
+func duckQueryAdmissionTag(outcome storeQueryAdmission) int32 {
+	switch outcome {
+	case storeQueryQueued:
+		return format.TagValueIDDuckQueryQueued
+	case storeQueryRefused:
+		return format.TagValueIDDuckQueryRefused
+	}
+	return 0
+}
+
 func duckSizeLocationTag(location duckstore.SizeLocation) int32 {
 	switch location {
 	case duckstore.SizeDelta:
@@ -252,11 +291,17 @@ func duckSizeLocationTag(location duckstore.SizeLocation) int32 {
 type duckStore struct {
 	store           *duckstore.Store
 	writer          *duckstore.Writer
+	queryMetrics    storeQueryMetrics // the forwarder's admission arm; nil without a metrics agent
 	stopMaintenance context.CancelFunc
 	maintenanceDone chan struct{}
 }
 
 func (d *duckStore) NewSink() InsertSink { return newDuckSink(d.writer) }
+
+// QueryMetrics hands the query listener the recorder for its admission
+// outcomes (waits and refusals) — the same forwarder the store's own events
+// flow through, nil when the aggregator runs without its metrics agent.
+func (d *duckStore) QueryMetrics() storeQueryMetrics { return d.queryMetrics }
 
 // QueryExecutor serves the two structured store-query verbs: journal
 // validation first (unknown_metric, metadata_mismatch), then the renderer.

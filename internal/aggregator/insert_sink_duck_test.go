@@ -299,6 +299,10 @@ func TestDuckMetricsTagMappings(t *testing.T) {
 	require.Equal(t, int32(format.TagValueIDDuckQueryTagValues), duckQueryVerbTag(duckstore.QueryTagValues))
 	require.Zero(t, duckQueryVerbTag(duckstore.QueryVerb("other")))
 
+	require.Equal(t, int32(format.TagValueIDDuckQueryQueued), duckQueryAdmissionTag(storeQueryQueued))
+	require.Equal(t, int32(format.TagValueIDDuckQueryRefused), duckQueryAdmissionTag(storeQueryRefused))
+	require.Zero(t, duckQueryAdmissionTag(storeQueryAdmission("other")))
+
 	require.Equal(t, int32(format.TagValueIDDuckSizeDelta), duckSizeLocationTag(duckstore.SizeDelta))
 	require.Equal(t, int32(format.TagValueIDDuckSizeArchive), duckSizeLocationTag(duckstore.SizeArchive))
 	require.Zero(t, duckSizeLocationTag(duckstore.SizeLocation("other")))
@@ -371,6 +375,19 @@ func TestDuckMetricsForwardsEvents(t *testing.T) {
 			[]int32{0, format.TagValueIDDuckQueryTagValues, format.TagValueIDStatusError}, 0.5, 1},
 	}, sink.valueCounters)
 
+	// The admission arm lands in the same metric as the executions, on the
+	// queued/refused status values — the only place a query shed at admission
+	// is ever visible, since it never reaches the renderer's own StoreQuery.
+	sink.valueCounters = nil
+	m.StoreQueryAdmission(storeQuerySeries, storeQueryQueued, 1500*time.Millisecond)
+	m.StoreQueryAdmission(storeQueryTagValues, storeQueryRefused, 250*time.Millisecond)
+	require.Equal(t, []duckValueCounterCall{
+		{format.BuiltinMetricMetaDuckQueryTime,
+			[]int32{0, format.TagValueIDDuckQuerySeries, format.TagValueIDDuckQueryQueued}, 1.5, 1},
+		{format.BuiltinMetricMetaDuckQueryTime,
+			[]int32{0, format.TagValueIDDuckQueryTagValues, format.TagValueIDDuckQueryRefused}, 0.25, 1},
+	}, sink.valueCounters)
+
 	sink.valueCounters = nil
 	m.StoreSize(duckstore.SizeArchive, 100, 40)
 	require.Equal(t, []duckValueCounterCall{
@@ -423,4 +440,5 @@ func (h stubDuckHandle) NewSink() InsertSink { return h.sink }
 func (stubDuckHandle) QueryExecutor(*metajournal.MetricsStorage, int32) storeQueryExecutor {
 	return nil
 }
-func (stubDuckHandle) Close() error { return nil }
+func (stubDuckHandle) QueryMetrics() storeQueryMetrics { return nil }
+func (stubDuckHandle) Close() error                    { return nil }

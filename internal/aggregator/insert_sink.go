@@ -80,6 +80,10 @@ type duckStoreHandle interface {
 	// validating requests against the metrics journal and answering with this
 	// shard's number.
 	QueryExecutor(storage *metajournal.MetricsStorage, shardNum int32) storeQueryExecutor
+	// QueryMetrics returns the recorder the query listener reports its
+	// admission outcomes through — waits and refusals, the query-load events
+	// that never reach the executor. May be nil.
+	QueryMetrics() storeQueryMetrics
 	Close() error
 }
 

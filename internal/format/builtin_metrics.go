@@ -1613,6 +1613,19 @@ var duckQueryVerbToValue = map[int32]string{
 	TagValueIDDuckQueryTagValues: "tag_values",
 }
 
+// The two admission outcomes the query listener records without executing
+// anything; ok and error (the executions) come from the shared status
+// constants.
+const (
+	TagValueIDDuckQueryQueued  = 3
+	TagValueIDDuckQueryRefused = 4
+)
+
+var duckQueryAdmissionToValue = map[int32]string{
+	TagValueIDDuckQueryQueued:  "queued",
+	TagValueIDDuckQueryRefused: "refused",
+}
+
 const (
 	TagValueIDDuckSizeDelta   = 1
 	TagValueIDDuckSizeArchive = 2
@@ -1701,7 +1714,7 @@ Count is the number of files. Set by aggregator.`,
 var BuiltinMetricMetaDuckQueryTime = &MetricMetaValue{
 	Name: "__duck_store_query_time",
 	Kind: MetricKindValue,
-	Description: `Time one structured store query served by the aggregator's query listener took, by verb and outcome. Count is the query load.
+	Description: `Time one structured store query took, by verb and outcome. ok and error are executions measured by the store; queued is the wait a query endured before being admitted (value = the wait); refused is a query shed at admission (value = how long it waited before the refusal). Count is the query load.
 Set by aggregator.`,
 	MetricType:              MetricSecond,
 	NoSampleAgent:           true, // generated on aggregators, must be delivered without losses
@@ -1714,8 +1727,10 @@ Set by aggregator.`,
 	}, {
 		Description: "status",
 		ValueComments: convertToValueComments(map[int32]string{
-			TagValueIDStatusOK:    "ok",
-			TagValueIDStatusError: "error",
+			TagValueIDStatusOK:         "ok",
+			TagValueIDStatusError:      "error",
+			TagValueIDDuckQueryQueued:  "queued",
+			TagValueIDDuckQueryRefused: "refused",
 		}),
 	}},
 }

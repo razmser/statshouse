@@ -171,10 +171,17 @@ Defaults target the smallest viable node, not the available envelope:
 
 - `--duck-memory-limit` — DuckDB memory limit per store file, default 256 MB
   (the temp directory spill bound matches it).
-- `--duck-query-concurrency` — 2 concurrent queries per shard by default; a
-  query finding every slot busy waits up to 5 seconds for one (so a dashboard's
-  tiles all firing at once drain through the slots instead of failing) and is
-  then refused as overloaded rather than queued indefinitely.
+- `--duck-query-concurrency` — how many store queries execute at once per
+  shard, default `max(2, GOMAXPROCS)` — the process's own parallelism, floored
+  at two. A query finding every slot busy waits for one toward the request's
+  own timeout, never past a 30-second ceiling (so a dashboard's tiles all
+  firing at once drain through the slots instead of failing), and the wait
+  always ends a full execution-budget second short of the request's deadline,
+  so a query is never admitted with no useful time left to run in — a query
+  that would only get a slot inside that reserved window is refused as
+  overloaded instead. Beyond 4 queries waiting or executing per admission
+  slot (the waiter bound), the shard refuses at once rather than growing
+  goroutine and longpoll memory under overload.
 
 DuckDB runs single-threaded, compaction and sealing run at lowest priority,
 and ingestion never yields to queries — a dashboard cannot starve the insert
@@ -221,7 +228,11 @@ diagnosed from StatsHouse:
   sealed and dropped that generation's rows for it), per tier.
 - `__duck_store_quarantined_files` — quarantined file count per reason axis.
 - `__duck_store_query_time` — store-query latency and errors per verb
-  (series, tag values) — the query load.
+  (series, tag values) — the query load. The same metric's status tag also
+  carries the admission outcomes: `queued` counts queries that waited for a
+  slot (value = the wait), `refused` counts queries shed at admission (value =
+  how long they waited first) — the only place an overload shed is visible,
+  because a shed query never reaches the renderer that reports executions.
 - `__duck_store_size` — store size measured with DuckDB's database-size
   pragma (used and free), which sees the free blocks DuckDB reuses and file
   length does not.

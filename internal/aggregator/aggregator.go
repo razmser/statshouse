@@ -417,6 +417,7 @@ func MakeAggregator(fj *os.File, fjCompact *os.File, mappingsCache *pcache.Mappi
 			a.queryServer = newStoreQueryServer(storeQueryServerConfig{
 				Address:     a.config.DuckQueryAddr,
 				Concurrency: a.config.DuckQueryConcurrency,
+				Metrics:     duck.QueryMetrics(),
 				CryptoKeys:  []string{aesPwd},
 				Logf:        log.Printf,
 			}, duck.QueryExecutor(a.metricStorage, a.shardKey))

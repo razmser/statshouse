@@ -20,8 +20,9 @@ func TestValidateConfigAggregatorStorageBackend(t *testing.T) {
 	require.Equal(t, duckstore.BackendClickHouse, c.StorageBackend, "clickhouse must be the default backend")
 	require.NoError(t, ValidateConfigAggregator(&c))
 
-	// The query listener's defaults: two admission slots and the smallest
-	// viable DuckDB memory limit.
+	// The query listener's defaults: one admission slot per unit of the
+	// machine's parallelism (floored at two) and the smallest viable DuckDB
+	// memory limit.
 	require.Equal(t, DefaultQueryConcurrency, c.DuckQueryConcurrency)
 	require.Equal(t, int64(duckstore.DefaultMemoryLimitBytes), c.DuckMemoryLimit)
 

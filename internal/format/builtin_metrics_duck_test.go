@@ -201,4 +201,14 @@ func TestDuckStoreMetricValueComments(t *testing.T) {
 		require.Equal(t, "ok", comments[CodeTagValue(TagValueIDStatusOK)], m.Name)
 		require.Equal(t, "error", comments[CodeTagValue(TagValueIDStatusError)], m.Name)
 	}
+
+	// the query metric's status tag carries two more values than maintenance
+	// time's: the admission outcomes the listener records for queries that
+	// never execute
+	queryComments := BuiltinMetricMetaDuckQueryTime.Tags[2].ValueComments
+	require.Equal(t, "queued", queryComments[CodeTagValue(TagValueIDDuckQueryQueued)])
+	require.Equal(t, "refused", queryComments[CodeTagValue(TagValueIDDuckQueryRefused)])
+	require.Len(t, queryComments, 4, "executions' ok/error plus the two admission outcomes, nothing else")
+	require.Len(t, BuiltinMetricMetaDuckMaintenanceTime.Tags[2].ValueComments, 2,
+		"maintenance time knows only its own executions")
 }

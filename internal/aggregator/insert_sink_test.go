@@ -442,7 +442,8 @@ func TestRowBinarySizeMatchesEncoding(t *testing.T) {
 // fakeDuckHandle drives the sink selection without any DuckDB.
 type fakeDuckHandle struct{ sink InsertSink }
 
-func (f *fakeDuckHandle) NewSink() InsertSink { return f.sink }
+func (f *fakeDuckHandle) NewSink() InsertSink             { return f.sink }
+func (f *fakeDuckHandle) QueryMetrics() storeQueryMetrics { return nil }
 func (f *fakeDuckHandle) QueryExecutor(_ *metajournal.MetricsStorage, _ int32) storeQueryExecutor {
 	return nil // the sink tests never serve queries
 }

@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -95,11 +96,21 @@ func (f *gatedQueryExecutor) openGate() { close(f.release) }
 // loopback listener and returns a client dialed at it.
 func startTestQueryServer(t *testing.T, executor storeQueryExecutor, concurrency int) *tlstatshouse.Client {
 	t.Helper()
+	_, cl := startTestQueryServerWithMetrics(t, executor, concurrency, nil)
+	return cl
+}
+
+// startTestQueryServerWithMetrics is startTestQueryServer plus the admission
+// recorder and the server handle, for the tests that steer or inspect the
+// admission path itself.
+func startTestQueryServerWithMetrics(t *testing.T, executor storeQueryExecutor, concurrency int, metrics storeQueryMetrics) (*storeQueryServer, *tlstatshouse.Client) {
+	t.Helper()
 	ln, err := net.Listen("tcp4", "127.0.0.1:0")
 	require.NoError(t, err)
 	srv := newStoreQueryServer(storeQueryServerConfig{
 		Address:     ln.Addr().String(),
 		Concurrency: concurrency,
+		Metrics:     metrics,
 	}, executor)
 	go func() { _ = srv.Serve(ln) }()
 	t.Cleanup(func() {
@@ -108,7 +119,7 @@ func startTestQueryServer(t *testing.T, executor storeQueryExecutor, concurrency
 		defer cancel()
 		_ = srv.CloseWait(ctx)
 	})
-	return &tlstatshouse.Client{
+	return srv, &tlstatshouse.Client{
 		Client:  rpc.NewClient(rpc.ClientWithProtocolVersion(rpc.LatestProtocolVersion)),
 		Network: "tcp4",
 		Address: ln.Addr().String(),
@@ -137,13 +148,24 @@ func requireErrorCode(t *testing.T, err error, code int32, what string) {
 	require.Equal(t, code, got, "%s: wrong store error code (%s)", what, name)
 }
 
-// shrinkQueryQueueWait shortens the admission wait so the refusal tests see
-// their overloaded answer promptly instead of after the production 5 s.
+// shrinkQueryQueueWait shortens the admission-wait ceiling so the refusal
+// tests see their overloaded answer promptly instead of after the production
+// 30 s.
 func shrinkQueryQueueWait(t *testing.T, d time.Duration) {
 	t.Helper()
 	old := storeQueryQueueWait
 	storeQueryQueueWait = d
 	t.Cleanup(func() { storeQueryQueueWait = old })
+}
+
+// shrinkQueryExecutionBudget shrinks the reserved execution budget the
+// admission wait must leave the query, so tests with sub-second timeouts can
+// still exercise waiting instead of being refused at once.
+func shrinkQueryExecutionBudget(t *testing.T, d time.Duration) {
+	t.Helper()
+	old := storeQueryExecutionBudget
+	storeQueryExecutionBudget = d
+	t.Cleanup(func() { storeQueryExecutionBudget = old })
 }
 
 // The admission contract: two concurrent queries execute, the third waits for
@@ -282,6 +304,10 @@ func TestStoreQueryServerBurstQueuesAndDrainsThroughSlots(t *testing.T) {
 // by the time the gate opens (after that time) the waiter is provably gone
 // and cannot take the slot the running query releases.
 func TestStoreQueryServerCancelledWaiterTakesNoSlot(t *testing.T) {
+	// The waiter's 300 ms body timeout must exceed the reserved execution
+	// budget for the wait to run at all: shrink the budget so the waiter
+	// parks instead of being refused at once.
+	shrinkQueryExecutionBudget(t, 50*time.Millisecond)
 	f := newGatedQueryExecutor()
 	cl := startTestQueryServer(t, f, 1)
 
@@ -496,14 +522,26 @@ func TestClampQueryTimeout(t *testing.T) {
 // listener's unlimited workers and absent timeouts.
 func TestStoreQueryServerSettings(t *testing.T) {
 	srv := newStoreQueryServer(storeQueryServerConfig{Address: "127.0.0.1:0"}, nil)
-	require.Equal(t, DefaultQueryConcurrency, cap(srv.sema), "default admission is two slots")
+	require.Equal(t, DefaultQueryConcurrency, cap(srv.sema), "default admission tracks the machine's parallelism")
+	require.Equal(t, queryWaiterFactor*DefaultQueryConcurrency, cap(srv.waiterSema), "the waiter bound is a factor of the admission slots")
 	require.Positive(t, srv.workerLimit, "workers must be bounded, unlike the ingest listener's unlimited ones")
 	require.Less(t, srv.workerLimit, 1<<20, "the worker bound must stay small, not wrap into unlimited")
 	require.Equal(t, DefaultQueryTimeout, srv.defaultResponseTimeout, "the default response timeout must be nonzero")
+	require.Equal(t, 30*time.Second, DefaultQueryQueueWait, "the raised wait ceiling: six times the old fixed 5 s wait")
+	require.Equal(t, time.Second, DefaultQueryExecutionBudget, "one second of execution time is reserved after a wait")
 
 	srv = newStoreQueryServer(storeQueryServerConfig{Address: "127.0.0.1:0", Concurrency: 5}, nil)
 	require.Equal(t, 5, cap(srv.sema))
+	require.Equal(t, queryWaiterFactor*5, cap(srv.waiterSema), "the waiter bound follows a reconfigured concurrency too")
 	require.Equal(t, 13, srv.workerLimit, "the worker pool tracks the admission slots")
+}
+
+// The concurrency default is computed, not a constant: the machine's
+// parallelism with a floor of two, so the smallest node still serves a
+// dashboard's tiles in parallel while a bigger one follows its cores.
+func TestDefaultQueryConcurrencyTracksGOMAXPROCS(t *testing.T) {
+	require.GreaterOrEqual(t, DefaultQueryConcurrency, 2, "the floor of two survives any GOMAXPROCS")
+	require.Equal(t, max(2, runtime.GOMAXPROCS(0)), DefaultQueryConcurrency, "the default is the machine's parallelism, floored at two")
 }
 
 // TestStoreQueryServerMalformedRequestIsBadRequest drives the parse-failure
@@ -517,4 +555,377 @@ func TestStoreQueryServerMalformedRequestIsBadRequest(t *testing.T) {
 	requireErrorCode(t, err, duckstore.ErrCodeBadRequest, "garbage series request")
 	err = s.handleQueryTagValues(context.Background(), &rpc.HandlerContext{Request: []byte{0x01, 0x02, 0x03}})
 	requireErrorCode(t, err, duckstore.ErrCodeBadRequest, "garbage tag-values request")
+}
+
+// The admission wait runs toward the request's own clamped timeout but never
+// past the absolute ceiling: with the (here shrunk) ceiling at 600 ms, a
+// default-timeout query is refused at the ceiling — not instantly and not at
+// its own 60 s — a short-timeout query's wait is cut by its own deadline
+// instead, and a query whose slot frees inside the wait is still waiting and
+// takes it.
+func TestStoreQueryServerQueueWaitRunsTowardRequestTimeoutUnderCeiling(t *testing.T) {
+	startRunning := func(t *testing.T, cl *tlstatshouse.Client, f *gatedQueryExecutor) chan error {
+		t.Helper()
+		done := make(chan error, 1)
+		go func() {
+			var ret tlstatshouse.StoreSeriesResponse
+			done <- cl.StoreQuerySeries(context.Background(), tlstatshouse.StoreQuerySeries{}, nil, &ret)
+		}()
+		waitStarted(t, f, 1)
+		return done
+	}
+
+	t.Run("ceiling refuses a default-timeout query", func(t *testing.T) {
+		shrinkQueryQueueWait(t, 600*time.Millisecond)
+		f := newGatedQueryExecutor()
+		cl := startTestQueryServer(t, f, 1)
+		done := startRunning(t, cl, f)
+
+		start := time.Now()
+		var ret tlstatshouse.StoreSeriesResponse
+		err := cl.StoreQuerySeries(context.Background(), tlstatshouse.StoreQuerySeries{}, nil, &ret)
+		requireErrorCode(t, err, duckstore.ErrCodeOverloaded, "query beyond the ceiling")
+		waited := time.Since(start)
+		require.GreaterOrEqual(t, waited, 500*time.Millisecond, "the refusal must follow the ceiling, not arrive at once")
+		require.Less(t, waited, 3*time.Second, "the refusal must not wait for the running query, let alone the 60 s default timeout")
+
+		f.openGate()
+		select {
+		case err := <-done:
+			require.NoError(t, err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("the running query never answered after the gate opened")
+		}
+	})
+
+	t.Run("request's own timeout cuts the wait below the ceiling", func(t *testing.T) {
+		shrinkQueryQueueWait(t, 600*time.Millisecond)
+		shrinkQueryExecutionBudget(t, 100*time.Millisecond)
+		f := newGatedQueryExecutor()
+		cl := startTestQueryServer(t, f, 1)
+		done := startRunning(t, cl, f)
+
+		// A 400 ms timeout leaves 300 ms of wait after its budget is
+		// reserved: the refusal must arrive there — not at once, and not at
+		// the 600 ms ceiling the default-timeout query of the arm above
+		// waits out.
+		args := tlstatshouse.StoreQuerySeries{}
+		args.Base.TimeoutMs = 400
+		start := time.Now()
+		var ret tlstatshouse.StoreSeriesResponse
+		err := cl.StoreQuerySeries(context.Background(), args, nil, &ret)
+		requireErrorCode(t, err, duckstore.ErrCodeOverloaded, "the short-timeout query, refused a budget ahead of its deadline")
+		waited := time.Since(start)
+		require.GreaterOrEqual(t, waited, 250*time.Millisecond, "the wait must run toward the request's timeout, not refuse at once")
+		require.Less(t, waited, 450*time.Millisecond, "the wait must end a budget short of the request's timeout, well under the ceiling")
+
+		f.openGate()
+		select {
+		case err := <-done:
+			require.NoError(t, err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("the running query never answered after the gate opened")
+		}
+	})
+
+	t.Run("slot freed inside the wait is taken", func(t *testing.T) {
+		shrinkQueryQueueWait(t, 600*time.Millisecond)
+		f := newGatedQueryExecutor()
+		rec := &recordingAdmissions{}
+		_, cl := startTestQueryServerWithMetrics(t, f, 1, rec)
+		done := startRunning(t, cl, f)
+
+		queued := make(chan error, 1)
+		go func() {
+			var ret tlstatshouse.StoreSeriesResponse
+			queued <- cl.StoreQuerySeries(context.Background(), tlstatshouse.StoreQuerySeries{}, nil, &ret)
+		}()
+		// The waiter is parked in the admission wait well inside both its 60 s
+		// timeout and the 600 ms ceiling when the slot frees.
+		time.Sleep(250 * time.Millisecond)
+		f.openGate()
+		select {
+		case err := <-queued:
+			require.NoError(t, err, "the waiter was still waiting and must take the freed slot")
+		case <-time.After(5 * time.Second):
+			t.Fatal("the queued query never answered")
+		}
+		select {
+		case err := <-done:
+			require.NoError(t, err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("the running query never answered after the gate opened")
+		}
+		events := rec.snapshot()
+		require.Len(t, events, 1, "the waiter's wait is the one admission outcome")
+		require.Equal(t, storeQueryQueued, events[0].outcome)
+		require.GreaterOrEqual(t, events[0].wait, 150*time.Millisecond, "it provably waited inside the wait window")
+		require.Equal(t, 2, f.startedTotal(), "both queries must have reached the executor")
+	})
+}
+
+// The execution-budget reservation: the admission wait ends a full budget
+// short of the query's own deadline, so a query whose slot would only free
+// inside that reserved window is refused as overloaded — never admitted with
+// no useful time left to execute in — while the same slot freeing comfortably
+// early is taken and the query runs.
+func TestStoreQueryServerDeclinesSlotWithoutExecutionBudget(t *testing.T) {
+	attempt := func(t *testing.T, openGateAfter time.Duration, timeoutMs int32) (*gatedQueryExecutor, *tlstatshouse.Client, error) {
+		t.Helper()
+		f := newGatedQueryExecutor()
+		cl := startTestQueryServer(t, f, 1)
+		done := make(chan error, 1)
+		go func() {
+			var ret tlstatshouse.StoreSeriesResponse
+			done <- cl.StoreQuerySeries(context.Background(), tlstatshouse.StoreQuerySeries{}, nil, &ret)
+		}()
+		waitStarted(t, f, 1)
+
+		waiter := make(chan error, 1)
+		args := tlstatshouse.StoreQuerySeries{}
+		args.Base.TimeoutMs = timeoutMs
+		go func() {
+			var ret tlstatshouse.StoreSeriesResponse
+			waiter <- cl.StoreQuerySeries(context.Background(), args, nil, &ret)
+		}()
+		time.Sleep(openGateAfter)
+		f.openGate()
+		select {
+		case err := <-waiter:
+			select {
+			case err := <-done:
+				require.NoError(t, err)
+			case <-time.After(5 * time.Second):
+				t.Fatal("the running query never answered after the gate opened")
+			}
+			return f, cl, err
+		case <-time.After(5 * time.Second):
+			t.Fatal("the waiter never answered")
+			return nil, nil, nil
+		}
+	}
+
+	// A 2 s query whose slot only frees at ~1.3 s: the wait ended at 2 s minus
+	// the 1 s budget, so the query was already refused — never admitted into
+	// its reserved window, never executed.
+	f, _, err := attempt(t, 1300*time.Millisecond, 2000)
+	requireErrorCode(t, err, duckstore.ErrCodeOverloaded, "a slot that only frees inside the execution budget")
+	require.Equal(t, 1, f.startedTotal(), "the refused query must never reach the executor")
+
+	// The same shape with the slot freeing at ~0.3 s: 1.7 s still to live,
+	// over the budget — taken and executed.
+	_, _, err = attempt(t, 300*time.Millisecond, 2000)
+	require.NoError(t, err, "a slot freed with budget to spare must be taken")
+}
+
+// The waiter bound: the shard holds at most queryWaiterFactor queries per
+// admission slot, waiting or executing; the query beyond the bound is refused
+// at once — without waiting — and the held queries still drain through the
+// slot once the gate opens. This is what keeps the longer admission wait from
+// turning sustained overload into unbounded goroutines and longpoll entries.
+func TestStoreQueryServerWaiterBoundShedsImmediately(t *testing.T) {
+	shrinkQueryQueueWait(t, 2*time.Second)
+	f := newGatedQueryExecutor()
+	srv, cl := startTestQueryServerWithMetrics(t, f, 1, nil)
+
+	done := make(chan error, 1)
+	go func() {
+		var ret tlstatshouse.StoreSeriesResponse
+		done <- cl.StoreQuerySeries(context.Background(), tlstatshouse.StoreQuerySeries{}, nil, &ret)
+	}()
+	waitStarted(t, f, 1)
+
+	// The running query holds a waiter token too, so one short of the bound
+	// fits beside it.
+	const waiting = queryWaiterFactor - 1
+	errs := make(chan error, waiting)
+	for i := 0; i < waiting; i++ {
+		go func() {
+			var ret tlstatshouse.StoreSeriesResponse
+			errs <- cl.StoreQuerySeries(context.Background(), tlstatshouse.StoreQuerySeries{}, nil, &ret)
+		}()
+	}
+	// Every waiter slot (the running one holds one too) is taken before the
+	// query beyond the bound arrives, so what it meets is the bound, not a
+	// race with a slow waiter.
+	require.Eventually(t, func() bool { return len(srv.waiterSema) == cap(srv.waiterSema) },
+		5*time.Second, 5*time.Millisecond, "the waiters must park in the bound first")
+
+	start := time.Now()
+	var ret tlstatshouse.StoreSeriesResponse
+	err := cl.StoreQuerySeries(context.Background(), tlstatshouse.StoreQuerySeries{}, nil, &ret)
+	requireErrorCode(t, err, duckstore.ErrCodeOverloaded, "query beyond the waiter bound")
+	require.Less(t, time.Since(start), time.Second, "the bound's refusal is immediate, not the 2 s queue wait")
+
+	f.openGate()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the running query never answered after the gate opened")
+	}
+	for i := 0; i < waiting; i++ {
+		select {
+		case err := <-errs:
+			require.NoError(t, err, "every held query must drain through the slot")
+		case <-time.After(5 * time.Second):
+			t.Fatalf("held query %d of %d never answered", i+1, waiting)
+		}
+	}
+	require.Equal(t, 1+waiting, f.startedTotal(), "every query the bound admitted must have executed")
+}
+
+// recordingAdmissions captures the admission outcomes the listener records,
+// so the tests assert exactly which query-load events the listener itself
+// reports: the executor only ever sees admitted queries, so refusals and
+// waits are invisible without this recorder.
+type recordingAdmissions struct {
+	mu     sync.Mutex
+	events []recordedAdmission
+}
+
+type recordedAdmission struct {
+	verb    storeQueryVerb
+	outcome storeQueryAdmission
+	wait    time.Duration
+}
+
+func (r *recordingAdmissions) StoreQueryAdmission(verb storeQueryVerb, outcome storeQueryAdmission, wait time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.events = append(r.events, recordedAdmission{verb, outcome, wait})
+}
+
+func (r *recordingAdmissions) snapshot() []recordedAdmission {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]recordedAdmission(nil), r.events...)
+}
+
+// The admission outcomes reach the recorder: a query shed at admission is
+// reported as refused with its waited time, a query that waited and then ran
+// as queued with its wait, a query its client cancelled while waiting is not
+// reported at all (it was not shed), and a query shed by the waiter bound is
+// refused with a zero wait.
+func TestStoreQueryServerAdmissionOutcomesRecorded(t *testing.T) {
+	t.Run("refused after the ceiling", func(t *testing.T) {
+		shrinkQueryQueueWait(t, 20*time.Millisecond)
+		f := newGatedQueryExecutor()
+		rec := &recordingAdmissions{}
+		_, cl := startTestQueryServerWithMetrics(t, f, 1, rec)
+		done := make(chan error, 1)
+		go func() {
+			var ret tlstatshouse.StoreSeriesResponse
+			done <- cl.StoreQuerySeries(context.Background(), tlstatshouse.StoreQuerySeries{}, nil, &ret)
+		}()
+		waitStarted(t, f, 1)
+
+		var ret tlstatshouse.StoreSeriesResponse
+		err := cl.StoreQuerySeries(context.Background(), tlstatshouse.StoreQuerySeries{}, nil, &ret)
+		requireErrorCode(t, err, duckstore.ErrCodeOverloaded, "the shed query")
+		events := rec.snapshot()
+		require.Len(t, events, 1, "the refusal is the one admission outcome")
+		require.Equal(t, storeQuerySeries, events[0].verb)
+		require.Equal(t, storeQueryRefused, events[0].outcome)
+		require.Positive(t, events[0].wait, "the refused query reports how long it waited")
+	})
+
+	t.Run("queued then executed, both verbs", func(t *testing.T) {
+		shrinkQueryQueueWait(t, 500*time.Millisecond)
+		f := newGatedQueryExecutor()
+		rec := &recordingAdmissions{}
+		_, cl := startTestQueryServerWithMetrics(t, f, 1, rec)
+		done := make(chan error, 1)
+		go func() {
+			var ret tlstatshouse.StoreSeriesResponse
+			done <- cl.StoreQuerySeries(context.Background(), tlstatshouse.StoreQuerySeries{}, nil, &ret)
+		}()
+		waitStarted(t, f, 1)
+
+		queued := make(chan error, 1)
+		go func() {
+			var ret tlstatshouse.StoreTagValuesResponse
+			queued <- cl.StoreQueryTagValues(context.Background(), tlstatshouse.StoreQueryTagValues{}, nil, &ret)
+		}()
+		time.Sleep(80 * time.Millisecond)
+		f.openGate()
+		select {
+		case err := <-queued:
+			require.NoError(t, err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("the queued tag-values query never answered")
+		}
+		select {
+		case err := <-done:
+			require.NoError(t, err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("the running query never answered after the gate opened")
+		}
+		events := rec.snapshot()
+		require.Len(t, events, 1, "the wait is the one admission outcome")
+		require.Equal(t, storeQueryTagValues, events[0].verb)
+		require.Equal(t, storeQueryQueued, events[0].outcome)
+		require.Positive(t, events[0].wait, "the queued query reports how long it waited")
+	})
+
+	t.Run("client cancel while waiting is not a refusal", func(t *testing.T) {
+		shrinkQueryQueueWait(t, 2*time.Second)
+		f := newGatedQueryExecutor()
+		rec := &recordingAdmissions{}
+		_, cl := startTestQueryServerWithMetrics(t, f, 1, rec)
+		done := make(chan error, 1)
+		go func() {
+			var ret tlstatshouse.StoreSeriesResponse
+			done <- cl.StoreQuerySeries(context.Background(), tlstatshouse.StoreQuerySeries{}, nil, &ret)
+		}()
+		waitStarted(t, f, 1)
+
+		// The waiter parks in the admission wait; its client cancels mid-wait.
+		// A cancelled query was not shed by admission — it must not count as
+		// a refusal.
+		waiterCtx, cancelWaiter := context.WithCancel(context.Background())
+		waiterDone := make(chan error, 1)
+		go func() {
+			var ret tlstatshouse.StoreSeriesResponse
+			waiterDone <- cl.StoreQuerySeries(waiterCtx, tlstatshouse.StoreQuerySeries{}, nil, &ret)
+		}()
+		time.Sleep(80 * time.Millisecond)
+		cancelWaiter()
+		select {
+		case err := <-waiterDone:
+			require.ErrorIs(t, err, context.Canceled, "the cancelled waiter must observe its own cancellation")
+		case <-time.After(5 * time.Second):
+			t.Fatal("the cancelled waiter call never returned")
+		}
+		require.Empty(t, rec.snapshot(), "a query its client cancelled was not shed and must not count as a refusal")
+	})
+
+	t.Run("waiter-bound refusal is refused with zero wait", func(t *testing.T) {
+		shrinkQueryQueueWait(t, 2*time.Second)
+		f := newGatedQueryExecutor()
+		rec := &recordingAdmissions{}
+		srv, cl := startTestQueryServerWithMetrics(t, f, 1, rec)
+		done := make(chan error, 1)
+		go func() {
+			var ret tlstatshouse.StoreSeriesResponse
+			done <- cl.StoreQuerySeries(context.Background(), tlstatshouse.StoreQuerySeries{}, nil, &ret)
+		}()
+		waitStarted(t, f, 1)
+		for i := 0; i < queryWaiterFactor-1; i++ { // the running query holds a waiter token too
+			go func() {
+				var ret tlstatshouse.StoreSeriesResponse
+				_ = cl.StoreQuerySeries(context.Background(), tlstatshouse.StoreQuerySeries{}, nil, &ret)
+			}()
+		}
+		require.Eventually(t, func() bool { return len(srv.waiterSema) == cap(srv.waiterSema) },
+			5*time.Second, 5*time.Millisecond, "the waiters must park in the bound first")
+
+		var ret tlstatshouse.StoreSeriesResponse
+		err := cl.StoreQuerySeries(context.Background(), tlstatshouse.StoreQuerySeries{}, nil, &ret)
+		requireErrorCode(t, err, duckstore.ErrCodeOverloaded, "query beyond the waiter bound")
+		events := rec.snapshot()
+		require.Len(t, events, 1)
+		require.Equal(t, storeQueryRefused, events[0].outcome)
+		require.Zero(t, events[0].wait, "a query shed at once reports a zero wait")
+	})
 }

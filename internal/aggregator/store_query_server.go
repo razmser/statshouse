@@ -11,6 +11,7 @@ import (
 	"errors"
 	"log"
 	"net"
+	"runtime"
 	"time"
 
 	"github.com/VKCOM/tl/pkg/rpc"
@@ -27,19 +28,6 @@ import (
 // no default response timeout — settings that must not leak onto query
 // traffic, which is why queries get their own listener with their own numbers.
 const (
-	// DefaultQueryConcurrency is how many store queries may execute at once
-	// per shard; the next one waits for a free slot and is refused as
-	// overloaded only once DefaultQueryQueueWait elapses without one.
-	DefaultQueryConcurrency = 2
-
-	// DefaultQueryQueueWait is how long a store query that found every slot
-	// busy waits for one before being refused as overloaded. It exists so a
-	// burst — a dashboard's tiles all firing at once — drains through the
-	// slots instead of failing on collision; it is never longer than the
-	// query's own timeout, which aborts the wait. Sustained overload still
-	// refuses, so queries cannot pile up behind a permanently busy shard.
-	DefaultQueryQueueWait = 5 * time.Second
-
 	// DefaultQueryTimeout bounds a store query that did not ask for a
 	// timeout. It is applied both as the body timeout (when timeout_ms is
 	// absent) and as the listener's default response timeout.
@@ -48,7 +36,39 @@ const (
 	// MaxQueryTimeout is the ceiling timeout_ms is clamped to, so a
 	// misbehaving client cannot pin query slots for hours.
 	MaxQueryTimeout = 5 * time.Minute
+
+	// DefaultQueryExecutionBudget is the lifetime the admission wait must
+	// leave a query: the wait ends a full budget short of the query's own
+	// deadline, so a query is never admitted — and never refused as a
+	// deadline race — with less than this to execute in. A query that finds
+	// a slot without waiting is admitted whatever its deadline: a
+	// short-timeout client that finds capacity runs.
+	DefaultQueryExecutionBudget = time.Second
+
+	// queryWaiterFactor bounds how many queries the shard holds at once —
+	// waiting or executing — per admission slot. Beyond the bound a query is
+	// refused at once, so sustained overload sheds instead of piling up
+	// goroutines and longpoll entries without limit.
+	queryWaiterFactor = 4
 )
+
+// DefaultQueryConcurrency is how many store queries may execute at once per
+// shard: the process's parallelism, floored at two. The old fixed two was
+// chosen when a slot could be pinned through a store-global lock wait (see
+// ADR-0004); the per-window locks removed that coupling, so the default now
+// follows the machine — a slot costs its executor's Go-side work only, while
+// DuckDB itself still runs single-threaded per store file. It is a variable,
+// not a constant, because it reads GOMAXPROCS.
+var DefaultQueryConcurrency = max(2, runtime.GOMAXPROCS(0))
+
+// DefaultQueryQueueWait is the absolute ceiling on how long a store query
+// that found every slot busy waits for one before being refused as
+// overloaded. The wait runs toward the request's own clamped timeout — a
+// client that asked for thirty seconds of patience may spend them queued, so
+// a burst drains instead of colliding — but never past this ceiling, which no
+// request can raise, so sustained overload still sheds inside a bounded time
+// and queries cannot pile up behind a permanently busy shard.
+const DefaultQueryQueueWait = 30 * time.Second
 
 // storeQueryExecutor runs the two structured store-query verbs against the
 // shard's store. The DuckDB renderers (series and tag values) implement it
@@ -67,10 +87,16 @@ type storeQueryExecutor interface {
 // leaves it alone.
 var storeQueryJournalWait = 5 * time.Second
 
-// storeQueryQueueWait is how long a query finding every admission slot busy
-// waits for one before the overloaded refusal. It is a variable only so tests
-// can shrink it; production leaves it at DefaultQueryQueueWait.
+// storeQueryQueueWait is the absolute ceiling on how long a query finding
+// every admission slot busy waits for one before the overloaded refusal. It is
+// a variable only so tests can shrink it; production leaves it at
+// DefaultQueryQueueWait.
 var storeQueryQueueWait = DefaultQueryQueueWait
+
+// storeQueryExecutionBudget is the lifetime a query must have left when it
+// takes a slot after waiting (see DefaultQueryExecutionBudget). A variable
+// only so tests can steer it; production leaves it alone.
+var storeQueryExecutionBudget = DefaultQueryExecutionBudget
 
 // validateStoreQueryMetadata checks a store query against the aggregator's
 // own journal before any row is read: every metric the query addresses must
@@ -149,6 +175,44 @@ func addressedMetricIDs(base tlstatshouse.StoreQueryBase) []int32 {
 	return ids
 }
 
+// storeQueryVerb names which of the two structured store-query verbs a query
+// is, for the admission outcomes the listener records itself. duckstore's own
+// QueryVerb lives behind the duckdb build tag; the listener is built without
+// it, so the vocabulary lives here.
+type storeQueryVerb string
+
+const (
+	storeQuerySeries    storeQueryVerb = "series"
+	storeQueryTagValues storeQueryVerb = "tag_values"
+)
+
+// storeQueryAdmission labels how a query left the listener's admission path —
+// outcomes the store's renderers cannot record, because a query that is shed,
+// or still waiting for its slot, never reaches them.
+type storeQueryAdmission string
+
+const (
+	// storeQueryQueued: the query waited for an admission slot and was then
+	// admitted.
+	storeQueryQueued storeQueryAdmission = "queued"
+	// storeQueryRefused: the query was shed at admission.
+	storeQueryRefused storeQueryAdmission = "refused"
+)
+
+// storeQueryMetrics receives the query listener's admission outcomes — the
+// query-load events that never reach the executor (a shed or queued query
+// never runs) and therefore cannot be recorded by the store's renderers. The
+// duck __duck_store_* forwarder satisfies it.
+type storeQueryMetrics interface {
+	// StoreQueryAdmission reports one admission outcome: a query that waited
+	// for its slot and was then admitted (storeQueryQueued, wait = how long
+	// it waited), or one that was shed (storeQueryRefused, wait = how long it
+	// waited before the refusal, zero when shed at once). A query that found
+	// a slot without waiting is not reported — its load is the executor's own
+	// point.
+	StoreQueryAdmission(verb storeQueryVerb, outcome storeQueryAdmission, wait time.Duration)
+}
+
 // storeQueryServerConfig configures the query listener.
 type storeQueryServerConfig struct {
 	// Address the listener serves store queries on ("host:port"). The caller
@@ -157,9 +221,14 @@ type storeQueryServerConfig struct {
 	Address string
 
 	// Concurrency is how many queries execute at once; queries beyond it
-	// wait DefaultQueryQueueWait for a slot and are then refused as
+	// wait — toward the request's own clamped timeout, never past
+	// DefaultQueryQueueWait — for a slot and are then refused as
 	// overloaded. Defaults to DefaultQueryConcurrency.
 	Concurrency int
+
+	// Metrics receives admission outcomes (waits and refusals) for the
+	// __duck_store_query_time builtin metric. May be nil.
+	Metrics storeQueryMetrics
 
 	// CryptoKeys and TrustedSubnetGroups configure the RPC transport the same
 	// way the ingest listener's are configured.
@@ -184,9 +253,15 @@ var (
 // handler context, and the default response timeout is nonzero — and it holds
 // the admission control that keeps a burst of heavy queries from eating the
 // machine ingestion needs. Admission bounds how many queries execute at once;
-// queries beyond the bound wait briefly for a slot (a dashboard's tiles all
-// firing at once must drain, not collide) and are refused as overloaded once
-// the wait expires, so sustained overload never piles queries up.
+// queries beyond the bound wait for a slot — toward the request's own clamped
+// timeout, never past DefaultQueryQueueWait (a dashboard's tiles all firing at
+// once must drain, not collide) — and are refused as overloaded once the wait
+// expires, so sustained overload never piles queries up. Two further bounds
+// keep the longer wait safe: the wait always ends a full
+// DefaultQueryExecutionBudget short of the query's own deadline, so a query is
+// never admitted with no useful time left to execute in, and the shard holds
+// at most queryWaiterFactor queries per slot (waiting or executing), shedding
+// anything beyond that at once.
 //
 // Each admitted query is registered as an RPC longpoll, which is the
 // transport's cancellation registry: a client that cancels the call or drops
@@ -197,8 +272,12 @@ type storeQueryServer struct {
 	cfg      storeQueryServerConfig
 	executor storeQueryExecutor
 	sema     chan struct{} // admission slots; capacity Concurrency, non-blocking acquire
-	h        tlstatshouse.Handler
-	server   *rpc.Server
+	// waiterSema bounds the queries the shard holds at once, waiting or
+	// executing, so the longer admission wait cannot turn sustained overload
+	// into unbounded goroutines and longpoll entries.
+	waiterSema chan struct{}
+	h          tlstatshouse.Handler
+	server     *rpc.Server
 
 	// The two transport settings that most visibly differ from the ingest
 	// listener's, recorded for the settings test.
@@ -217,6 +296,7 @@ func newStoreQueryServer(cfg storeQueryServerConfig, executor storeQueryExecutor
 		cfg:                    cfg,
 		executor:               executor,
 		sema:                   make(chan struct{}, cfg.Concurrency),
+		waiterSema:             make(chan struct{}, queryWaiterFactor*cfg.Concurrency),
 		workerLimit:            cfg.Concurrency + 8,
 		defaultResponseTimeout: DefaultQueryTimeout,
 	}
@@ -310,7 +390,7 @@ func (s *storeQueryServer) handleQuerySeries(ctx context.Context, hctx *rpc.Hand
 	if _, err := args.ReadTL1(hctx.Request); err != nil {
 		return badStoreQueryRequest("storeQuerySeries", err)
 	}
-	return executeQuery(s, ctx, hctx, args.Base,
+	return executeQuery(s, ctx, hctx, args.Base, storeQuerySeries,
 		func(qctx context.Context) (tlstatshouse.StoreSeriesResponse, error) {
 			return s.executor.QuerySeries(qctx, args)
 		},
@@ -326,7 +406,7 @@ func (s *storeQueryServer) handleQueryTagValues(ctx context.Context, hctx *rpc.H
 	if _, err := args.ReadTL1(hctx.Request); err != nil {
 		return badStoreQueryRequest("storeQueryTagValues", err)
 	}
-	return executeQuery(s, ctx, hctx, args.Base,
+	return executeQuery(s, ctx, hctx, args.Base, storeQueryTagValues,
 		func(qctx context.Context) (tlstatshouse.StoreTagValuesResponse, error) {
 			return s.executor.QueryTagValues(qctx, args)
 		},
@@ -343,12 +423,13 @@ func badStoreQueryRequest(verb string, err error) error {
 
 // executeQuery runs one store query. It returns nil once the query —
 // admission included — is handed to its own goroutine; every outcome,
-// refusals included, then travels the longpoll. run executes the verb with
-// the query's context; write serializes its result into the response context
-// — which FinishLongpoll hands out only afterwards, a fresh context rather
-// than the handler's own (the transport reuses that one the moment the
+// refusals included, then travels the longpoll. verb names the store verb for
+// the admission outcomes the listener records itself. run executes the verb
+// with the query's context; write serializes its result into the response
+// context — which FinishLongpoll hands out only afterwards, a fresh context
+// rather than the handler's own (the transport reuses that one the moment the
 // handler returns).
-func executeQuery[R any](s *storeQueryServer, ctx context.Context, hctx *rpc.HandlerContext, base tlstatshouse.StoreQueryBase,
+func executeQuery[R any](s *storeQueryServer, ctx context.Context, hctx *rpc.HandlerContext, base tlstatshouse.StoreQueryBase, verb storeQueryVerb,
 	run func(qctx context.Context) (R, error), write func(respCtx *rpc.HandlerContext, resp R) error) error {
 	// Two cancel layers: the cause-carrying cancel lets the longpoll
 	// canceller record WHY the query died, and the timeout layer bounds it by
@@ -374,13 +455,41 @@ func executeQuery[R any](s *storeQueryServer, ctx context.Context, hctx *rpc.Han
 	go func() {
 		defer timeoutCancel()
 		defer func() { cancel(nil) }() // plain cleanup once the query is done
-		if err := admitQuery(qctx, s.sema); err != nil {
+		// The waiter bound first: a query beyond it is shed at once, before
+		// any waiting, so the longer admission wait cannot turn sustained
+		// overload into an unbounded pile of goroutines and longpoll entries.
+		// The slot is held for the query's whole lifetime — waiting and
+		// executing — which is what the bound counts.
+		select {
+		case s.waiterSema <- struct{}{}:
+		default:
+			err := duckstore.NewError(duckstore.ErrCodeOverloaded,
+				"the shard already holds %d queries (waiting and executing), retry later", cap(s.waiterSema))
+			s.recordAdmission(verb, storeQueryRefused, 0)
+			if respCtx, ok := lh.FinishLongpoll(); ok {
+				respCtx.SendLongpollResponse(err)
+			}
+			return
+		}
+		defer func() { <-s.waiterSema }()
+		waited, err := admitQuery(qctx, s.sema)
+		if err != nil {
 			// Refused, or the query itself died while waiting: the error is
-			// the answer, exactly as an executor failure is below.
+			// the answer, exactly as an executor failure is below. Only a
+			// refusal is an admission outcome worth recording — a query that
+			// died of its own deadline or cancel was not shed.
+			if code, ok := duckstore.ErrorCode(err); ok && code == duckstore.ErrCodeOverloaded {
+				s.recordAdmission(verb, storeQueryRefused, waited)
+			}
 			if respCtx, ok := lh.FinishLongpoll(); ok {
 				respCtx.SendLongpollResponse(mapStoreQueryError(qctx, err))
 			}
 			return
+		}
+		if waited > 0 {
+			// The executor's own point reports the execution; this one
+			// reports the wait it endured to get the slot.
+			s.recordAdmission(verb, storeQueryQueued, waited)
 		}
 		defer func() { <-s.sema }()
 		resp, err := run(qctx)
@@ -401,37 +510,72 @@ func executeQuery[R any](s *storeQueryServer, ctx context.Context, hctx *rpc.Han
 	return nil
 }
 
-// admitQuery acquires an admission slot, waiting at most storeQueryQueueWait
-// (and never past the query's own context) for one to free up: the wait is
-// what lets a burst of dashboard queries drain through the slots instead of
-// failing on collision. It returns nil once the slot is held — released by
-// the caller — the context's cause when the query died while waiting, or the
-// overloaded refusal when no slot freed in time. Parked senders on the
+// recordAdmission reports one admission outcome to the configured recorder,
+// if there is one.
+func (s *storeQueryServer) recordAdmission(verb storeQueryVerb, outcome storeQueryAdmission, wait time.Duration) {
+	if s.cfg.Metrics != nil {
+		s.cfg.Metrics.StoreQueryAdmission(verb, outcome, wait)
+	}
+}
+
+// admitQuery acquires an admission slot, returning how long the query waited
+// for it (zero when a slot was free at once) and the error, if any. The wait
+// runs toward the query's own clamped timeout — a client that asked for
+// thirty seconds of patience may spend them queued — under two bounds:
+//
+//   - the absolute ceiling storeQueryQueueWait, which no request can raise,
+//     so sustained overload still sheds inside a bounded time; and
+//   - the execution budget storeQueryExecutionBudget, which the wait may
+//     never eat into: it stops a full budget short of the query's deadline,
+//     so a slot taken at the end of the wait still leaves the query useful
+//     time to run in, and the refusal that follows is classified — a whole
+//     budget ahead of the deadline, deterministically — as overloaded
+//     rather than racing the timeout.
+//
+// A query whose remaining lifetime is already inside its budget (or a zero
+// test ceiling) does not wait at all: one last look, then the refusal. A
+// query that finds a slot without waiting is admitted whatever its deadline:
+// a short-timeout client that finds capacity runs. Parked senders on the
 // semaphore free up roughly in arrival order, so the queue is roughly FIFO.
-func admitQuery(ctx context.Context, sema chan struct{}) error {
-	if wait := storeQueryQueueWait; wait > 0 {
+func admitQuery(ctx context.Context, sema chan struct{}) (waited time.Duration, err error) {
+	start := time.Now()
+	// Fast path: a free slot is taken without waiting, whatever the query's
+	// deadline.
+	select {
+	case sema <- struct{}{}:
+		return 0, nil
+	default:
+	}
+	wait := storeQueryQueueWait
+	if deadline, ok := ctx.Deadline(); ok {
+		if reserved := time.Until(deadline) - storeQueryExecutionBudget; reserved < wait {
+			wait = reserved
+		}
+	}
+	if wait > 0 {
 		timer := time.NewTimer(wait)
 		defer timer.Stop()
 		select {
 		case sema <- struct{}{}:
-			return nil
+			return time.Since(start), nil
 		case <-ctx.Done():
-			return context.Cause(ctx)
+			return time.Since(start), context.Cause(ctx)
 		case <-timer.C:
+			// fall through to the last look
 		}
 	}
-	// The wait is over: one last look, so a slot freed as the timer fired is
-	// still taken, then the refusal. The slot is held for as long as the
-	// query executes and released only after its answer is built, so the
-	// semaphore counts executing queries, not waiting ones.
+	// The wait is over (or never started): one last look, so a slot freed as
+	// the timer fired is still taken, then the refusal. The slot is held for
+	// as long as the query executes and released only after its answer is
+	// built, so the semaphore counts executing queries, not waiting ones.
 	select {
 	case sema <- struct{}{}:
-		return nil
+		return time.Since(start), nil
 	case <-ctx.Done():
-		return context.Cause(ctx)
+		return time.Since(start), context.Cause(ctx)
 	default:
-		return duckstore.NewError(duckstore.ErrCodeOverloaded,
-			"all %d query slots stayed busy for %v, retry later", cap(sema), storeQueryQueueWait)
+		return time.Since(start), duckstore.NewError(duckstore.ErrCodeOverloaded,
+			"all %d query slots stayed busy for %v, retry later", cap(sema), time.Since(start))
 	}
 }
 
