@@ -22,9 +22,12 @@ import (
 // The DuckDB tag-values renderer: one structured storeQueryTagValues against
 // this shard's store, answering the distinct values of one tag with the
 // counts of the rows that carry them. It is the same read shape as the
-// series renderer — a UNION ALL over the active delta and every served
-// archive window of the tier, parameterized throughout — with the outer
-// GROUP BY folding partial rows into one (value, count) pair per distinct
+// series renderer — a UNION ALL over the active delta, every
+// rolled-but-unconsumed generation and every served archive window of the
+// tier, parameterized throughout — riding the same query-source snapshot and
+// serving boundary (render_series.go, query_snapshot.go), so a series answer
+// and a tag-values answer over one range see the same rows. The outer
+// GROUP BY folds partial rows into one (value, count) pair per distinct
 // value, so the answer is the same whether or not compaction has collapsed
 // the rows it reads.
 //

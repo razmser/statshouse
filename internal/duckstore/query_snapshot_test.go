@@ -205,20 +205,24 @@ func TestQuerySnapshotSurvivesConcurrentRolls(t *testing.T) {
 	wg.Wait()
 }
 
-// TestWithQuerySourcesServesActiveDeltaAndWindows pins the descriptor set a
-// query is served from: the active delta generation first — addressed as the
-// connection's own database, carrying the query's own range — then every
-// served archive window of the tier overlapping the range, in served order,
-// each under its own unique alias. A rolled-off generation is absent whether
-// it was consumed and unlinked or is still waiting for consumption.
-func TestWithQuerySourcesServesActiveDeltaAndWindows(t *testing.T) {
+// TestWithQuerySourcesServesActiveDeltaRolledAndWindows pins the descriptor
+// set a query is served from: the active delta generation first — addressed
+// as the connection's own database, carrying the query's own range — then
+// every rolled-but-unconsumed generation below it, one descriptor per
+// not-yet-consumed window bounded by that window's own range cut to the
+// query's, under the generation's one attach alias — then every served
+// archive window of the tier overlapping the range, in served order, each
+// under its own unique alias.
+func TestWithQuerySourcesServesActiveDeltaRolledAndWindows(t *testing.T) {
 	dir := t.TempDir()
 	writeConsumeFixture(t, dir) // generation 0 rolled off with rows, generation 1 active
 	s, _ := openTestStore(t, dir)
 	require.NoError(t, s.ConsumeGeneration(context.Background(), 0, ConsumeOptions{}))
 
-	// one more rolled-off generation, left unconsumed: it must not become a
-	// source either, until later work makes it one
+	// one more rolled-off generation, left unconsumed: its one row sits in
+	// the current 1s-tier window, which no consumption has taken from it, so
+	// it serves exactly that window — bounded by the window's range, not the
+	// query's whole span
 	w, err := NewWriter(s, WriterConfig{NowFunc: func() time.Time { return writerNow }})
 	require.NoError(t, err)
 	require.NoError(t, w.WriteRound(context.Background(), []Row{testRow(testMetricID2, uint32(writerNowUnix))}))
@@ -226,6 +230,7 @@ func TestWithQuerySourcesServesActiveDeltaAndWindows(t *testing.T) {
 	require.NoError(t, w.Close())
 
 	now := writerNowUnix
+	cur := testWindowStart(Tier1s, now)
 	var got []querySource
 	var aliases []string
 	require.NoError(t, s.withQuerySources(context.Background(), Tier1s, now-7200, now+60,
@@ -240,25 +245,28 @@ func TestWithQuerySourcesServesActiveDeltaAndWindows(t *testing.T) {
 
 	require.Equal(t, []querySource{
 		{kind: fileKindDelta, gen: 2, table: tierTables[Tier1s], from: now - 7200, to: now + 60},
+		{kind: fileKindDelta, gen: 1, key: windowKey{tier: Tier1s, start: cur},
+			table: tierTables[Tier1s], from: cur, to: now + 60},
 		{kind: fileKindArchive, key: windowKey{tier: Tier1s, start: testWindowStart(Tier1s, now-3700)},
 			table: tierTables[Tier1s], from: now - 7200, to: now + 60},
-		{kind: fileKindArchive, key: windowKey{tier: Tier1s, start: testWindowStart(Tier1s, now)},
+		{kind: fileKindArchive, key: windowKey{tier: Tier1s, start: cur},
 			table: tierTables[Tier1s], from: now - 7200, to: now + 60},
 	}, got)
-	// the delta is its own database; each window gets its own alias under one
-	// per-query sequence number, unique across every query in the process
-	require.Len(t, aliases, 3)
+	// the delta is its own database; the rolled generation and each window
+	// get their own alias under one per-query sequence number, unique across
+	// every query in the process
+	require.Len(t, aliases, 4)
 	require.Empty(t, aliases[0])
-	seq := regexp.MustCompile(`^q(\d+)_a([0-2])$`)
-	var querySeq string
-	for _, a := range aliases[1:] {
-		m := seq.FindStringSubmatch(a)
+	genSeq := regexp.MustCompile(`^q(\d+)_g1$`)
+	winSeq := regexp.MustCompile(`^q(\d+)_a([0-2])$`)
+	m := genSeq.FindStringSubmatch(aliases[1])
+	require.NotNil(t, m, "alias %q is not a rolled-generation alias", aliases[1])
+	querySeq := m[1]
+	for _, a := range aliases[2:] {
+		m := winSeq.FindStringSubmatch(a)
 		require.NotNil(t, m, "alias %q is not a query alias", a)
-		if querySeq == "" {
-			querySeq = m[1]
-		}
 		require.Equal(t, querySeq, m[1], "one sequence number per query")
 	}
-	require.Equal(t, "0", seq.FindStringSubmatch(aliases[1])[2])
-	require.Equal(t, "1", seq.FindStringSubmatch(aliases[2])[2])
+	require.Equal(t, "0", winSeq.FindStringSubmatch(aliases[2])[2])
+	require.Equal(t, "1", winSeq.FindStringSubmatch(aliases[3])[2])
 }

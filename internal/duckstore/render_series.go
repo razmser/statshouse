@@ -11,6 +11,7 @@ package duckstore
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"sync/atomic"
@@ -24,16 +25,18 @@ import (
 // The DuckDB series renderer: one structured storeQuerySeries against this
 // shard's store, answered as the columnar storeSeriesResponse.
 //
-// The read is a UNION ALL over the active delta generation and every served
-// archive window of the tier overlapping the range — one source descriptor
-// per file, resolved into a single atomic snapshot (query_snapshot.go) with
-// the windows attached read-only on demand, leased against retention, and
-// the generation pinned against consumption's unlink — followed by the outer
-// GROUP BY that is the correctness mechanism: the answer is the same whether
-// or not compaction has collapsed the rows it reads. Aggregate states
-// (percentiles, uniques) come out of the GROUP BY as lists of blobs and are
-// folded in Go before the reply, because DuckDB can neither merge nor
-// re-import ClickHouse's states.
+// The read is a UNION ALL over the active delta generation, every
+// rolled-but-unconsumed generation below it (one descriptor per archive
+// window consumption has not yet taken from it, bounded by that window's own
+// range) and every served archive window of the tier overlapping the range —
+// one source descriptor per contribution, resolved into a single atomic
+// snapshot (query_snapshot.go) with the files attached read-only on demand,
+// the windows leased against retention and every generation pinned against
+// consumption's unlink — followed by the outer GROUP BY that is the
+// correctness mechanism: the answer is the same whether or not compaction has
+// collapsed the rows it reads. Aggregate states (percentiles, uniques) come
+// out of the GROUP BY as lists of blobs and are folded in Go before the
+// reply, because DuckDB can neither merge nor re-import ClickHouse's states.
 //
 // Every request value — including RE2 patterns and unmapped string values —
 // binds as a prepared-statement parameter and is never interpolated into the
@@ -598,56 +601,142 @@ func (s *Store) renderSeries(ctx context.Context, shardNum int32, args tlstatsho
 // withQuerySources gathers everything one store query reads — one atomic
 // snapshot of the store's query-relevant state (see querySnapshot) — and runs
 // read against it on the snapshot's own connection, with one source
-// descriptor per file: the active delta generation, addressed as the
-// connection's own database, plus every served archive window of the tier
-// overlapping the range, each attached read-only under a unique alias. The
-// snapshot leases every window and pins the generation, so neither retention
-// nor consumption can remove a file underneath the read; the windows are
-// attached on demand and detached again after it — keeping them attached buys
-// latency that is not needed and costs resident memory that is.
+// descriptor per contribution: the active delta generation, addressed as the
+// connection's own database; every rolled-but-unconsumed generation below
+// it, attached read-only once and contributing one descriptor per archive
+// window consumption has not yet taken from it, bounded by that window's own
+// range; and every served archive window of the tier overlapping the range,
+// each attached read-only under a unique alias. The snapshot pins every
+// generation and leases every window, so neither consumption nor retention
+// can remove a file underneath the read; the files are attached on demand
+// and detached again after it — keeping them attached buys latency that is
+// not needed and costs resident memory that is.
+//
+// Which candidate windows each rolled generation serves is decided inside,
+// by serveQuerySources under the read locks of every window involved — after
+// the snapshot, so a consumption committing in that gap is absorbed rather
+// than answered wrong. The one interleaving that cannot be absorbed is the
+// snapshot's own active generation being consumed into a window the query
+// reads (a roll happened in between); the boundary reports it and this loop
+// retries on a fresh snapshot, where the generation is rolled like any
+// other.
 func (s *Store) withQuerySources(ctx context.Context, tier string, from, to int64, read func(ctx context.Context, conn *sql.Conn, sources []querySource) error) error {
-	snap, err := s.acquireQuerySnapshot(ctx, tier, from, to)
-	if err != nil {
+	// A consumption of the snapshot's own generation is rare and each retry
+	// reads the new state, so a handful covers any realistic interleaving;
+	// more means something else is wrong and the query fails loudly rather
+	// than spin.
+	const attempts = 5
+	var lastErr error
+	for attempt := 0; attempt < attempts; attempt++ {
+		snap, err := s.acquireQuerySnapshot(ctx, tier, from, to)
+		if err != nil {
+			return err
+		}
+		err = s.serveQuerySources(ctx, snap, tier, from, to, read)
+		snap.release()
+		if !errors.Is(err, errQuerySnapshotInvalidated) {
+			return err
+		}
+		lastErr = err
+	}
+	return fmt.Errorf("duck-store: store query could not settle on a consistent view: %w", lastErr)
+}
+
+// serveQuerySources runs one read against a snapshot. The rolled generations
+// are attached to the snapshot's connection read-only first — the same
+// attachments the read itself addresses — and their window candidates are
+// read through them; a generation is never opened as a second DuckDB handle
+// for that (see resolveRolledWindows for why the instance cache forbids it).
+// Then the read locks of every window involved — the snapshot's windows plus
+// the candidates, deduplicated — are held for the serving boundary
+// (resolveServingBoundary) and the read itself, so no consumption of any of
+// those windows can commit while the query's source set stands: every row is
+// served exactly once, from its generation or from the window that durably
+// recorded it. LIFO with the defers below: detach the aliases, then hand the
+// windows' read locks back; withQuerySources releases the snapshot — the
+// leases, the pins and the connection go last, after nothing else addresses
+// the files.
+func (s *Store) serveQuerySources(ctx context.Context, snap *querySnapshot, tier string, from, to int64, read func(ctx context.Context, conn *sql.Conn, sources []querySource) error) error {
+	// The alias is unique to this query, so two concurrent queries attaching
+	// files to the shared delta instance never collide on a name. The rolled
+	// generations' aliases come first — the plan read below addresses them —
+	// and every alias is assigned with the DETACH defer registered before the
+	// first ATTACH runs, so a failed or cancelled attach still detaches the
+	// ones that made it — a leftover attachment would hold the file open on
+	// this pooled connection and make every later attach of the same file to
+	// it fail. Detaching an alias that never attached is a harmless ignored
+	// error; a window's alias stays empty until the boundary has settled
+	// which windows the read leases, so empty means not-yet-attached.
+	seq := queryAliasSeq.Add(1)
+	for i := range snap.rolled {
+		snap.rolled[i].alias = fmt.Sprintf("q%d_g%d", seq, snap.rolled[i].gen)
+	}
+	defer func() {
+		for i := range snap.windows {
+			if snap.windows[i].src.alias != "" {
+				_, _ = snap.conn.ExecContext(context.Background(), "DETACH "+snap.windows[i].src.alias)
+			}
+		}
+		for i := range snap.rolled {
+			_, _ = snap.conn.ExecContext(context.Background(), "DETACH "+snap.rolled[i].alias)
+		}
+	}()
+	for i := range snap.rolled {
+		if _, err := snap.conn.ExecContext(ctx, fmt.Sprintf("ATTACH %s AS %s (READ_ONLY)",
+			sqlString(snap.rolled[i].path), snap.rolled[i].alias)); err != nil {
+			return fmt.Errorf("duck-store: attach %s for store query: %w", snap.rolled[i].path, err)
+		}
+	}
+	if err := snap.resolveRolledWindows(ctx, tier, from, to); err != nil {
 		return err
 	}
-	// LIFO with the defers below: detach the aliases, then hand the windows'
-	// read locks back, then release the snapshot — the leases, the pin and
-	// the connection go last, after nothing else addresses the files.
-	defer snap.release()
 
-	if len(snap.windows) > 0 {
-		// The read lock of each window this query reads — one per file
-		// (window_locks.go), not the store-global archive lock this replaced:
-		// DuckDB allows a file one handle per process, so the read-only
-		// attach must never overlap a maintenance open of the same file, but
-		// a maintenance pass on any *other* window no longer fences this
-		// query. lockWindowsRead nests them in the canonical sorted order;
-		// queries still run concurrently with each other.
-		keys := make([]windowKey, len(snap.windows))
-		for i := range snap.windows {
-			keys[i] = snap.windows[i].src.key
+	// The read lock of each window this query touches — one per file
+	// (window_locks.go), not the store-global archive lock this replaced:
+	// DuckDB allows a file one handle per process, so the read-only attach
+	// must never overlap a maintenance open of the same file, but a
+	// maintenance pass on any *other* window no longer fences this query.
+	// lockWindowsRead nests them in the canonical sorted order; queries
+	// still run concurrently with each other. The keys are deduplicated
+	// first: a candidate window can already be one of the snapshot's served
+	// windows, and one goroutine taking the same file's read lock twice —
+	// legal in itself — can park its second taker behind a writer queued
+	// between the two and deadlock the pair.
+	keys := make([]windowKey, 0, len(snap.windows))
+	seen := make(map[windowKey]struct{}, len(snap.windows))
+	for i := range snap.windows {
+		if _, ok := seen[snap.windows[i].src.key]; !ok {
+			seen[snap.windows[i].src.key] = struct{}{}
+			keys = append(keys, snap.windows[i].src.key)
 		}
+	}
+	for i := range snap.rolled {
+		for _, start := range snap.rolled[i].windows {
+			k := windowKey{tier: tier, start: start}
+			if _, ok := seen[k]; !ok {
+				seen[k] = struct{}{}
+				keys = append(keys, k)
+			}
+		}
+	}
+	if len(keys) > 0 {
 		releaseWindows := s.lockWindowsRead(keys)
 		defer releaseWindows()
 	}
 
-	// The alias is unique to this query, so two concurrent queries attaching
-	// windows to the shared delta instance never collide on a name. Every
-	// alias is assigned and the DETACH defer registered before the first
-	// ATTACH runs, so a failed or cancelled attach still detaches the ones
-	// that made it — a leftover attachment would hold the window's file open
-	// on this pooled connection and make every later attach of the same file
-	// to it fail. Detaching an alias that never attached is a harmless
-	// ignored error.
-	seq := queryAliasSeq.Add(1)
+	// Which windows each rolled generation serves — and whether the snapshot
+	// still describes a consistent view at all — is decided here, under the
+	// locks above: a consumption of any window involved would need that
+	// window's write lock first, so the decision stands for the whole read.
+	// A generation none of whose windows survive stays attached — the
+	// detachment is one ignored error away — but contributes no sources.
+	if !s.resolveServingBoundary(snap, tier, from, to) {
+		return errQuerySnapshotInvalidated
+	}
+
 	for i := range snap.windows {
 		snap.windows[i].src.alias = fmt.Sprintf("q%d_a%d", seq, i)
 	}
-	defer func() {
-		for i := range snap.windows {
-			_, _ = snap.conn.ExecContext(context.Background(), "DETACH "+snap.windows[i].src.alias)
-		}
-	}()
 	for i := range snap.windows {
 		if _, err := snap.conn.ExecContext(ctx, fmt.Sprintf("ATTACH %s AS %s (READ_ONLY)",
 			sqlString(snap.windows[i].path), snap.windows[i].src.alias)); err != nil {
@@ -663,6 +752,7 @@ func (s *Store) withQuerySources(ctx context.Context, tier string, from, to int6
 		from:  from,
 		to:    to,
 	})
+	sources = append(sources, snap.rolledSources(tier, from, to)...)
 	for i := range snap.windows {
 		sources = append(sources, snap.windows[i].src)
 	}

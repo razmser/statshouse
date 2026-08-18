@@ -191,10 +191,14 @@ func (s *Store) RollGeneration() error {
 // anything again. The unlink itself waits for the last reader pin on the
 // generation (lease.go) rather than remove a file a running read addresses.
 //
-// Until its consumption completes, a sealed generation is input to this
-// protocol rather than a query source: its rows re-enter queries from the
-// archive windows as they commit, which is what keeps a query that unions the
-// active delta with the windows from counting a row in both places.
+// Until its consumption completes, a rolled generation also serves queries:
+// the query snapshot (query_snapshot.go) pins it and contributes, per archive
+// window it spans, only the windows that have not yet recorded it. The record
+// is exactly the handoff — it commits inside the window's write lock, the
+// same lock a query's serving decision holds as a read lock — so a query
+// that unions the active delta, the rolled generations and the windows counts
+// every row exactly once, from its generation or from the window that
+// durably recorded it.
 func (s *Store) ConsumeGeneration(ctx context.Context, gen int64, opts ConsumeOptions) error {
 	s.mu.RLock()
 	active := s.gen
