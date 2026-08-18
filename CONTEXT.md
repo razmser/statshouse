@@ -29,28 +29,52 @@ The resolution tier of stored data — 1s, 1m, or 1h — kept in separate tables
 _Avoid_: resolution table, downsample tier
 
 **Rollup**:
-Producing the 1m and 1h tiers. In ClickHouse this is *not* a cascade: `statshouse_v3_incoming` is `ENGINE = Null`, and three materialized views each read the same incoming rows and write them to `v6_1s`/`1m`/`1h` with only the timestamp truncated — `AggregatingMergeTree` then collapses same-key rows in the background. For duck-store the agg does this itself at insert time, emitting partial 1m/1h rows on its normal conveyor cadence.
+Producing the 1m and 1h tiers. In ClickHouse this is *not* a cascade: `statshouse_v3_incoming` is `ENGINE = Null`, and three materialized views each read the same incoming rows and write them to `v6_1s`/`1m`/`1h` with only the timestamp truncated — `AggregatingMergeTree` then collapses same-key rows in the background. For duck-store the agg does this itself when it drains the **delta file**: the writer appends only the 1s tier, and the drain derives the 1m/1h rows by truncating the 1s timestamps — the matviews' shape without the insert-time fan-out.
 _Avoid_: compaction, aggregation (overloaded), downsampling cascade
 
 **Row collapse**:
 Folding rows that share a key into one. ClickHouse gets this free from `AggregatingMergeTree`'s background merges. duck-store does it during **compaction** — but queries still always `GROUP BY` the key, so correctness never depends on compaction having run; collapse is a row-count optimization (42× measured on the 1m tier), not the correctness mechanism.
 _Avoid_: merge, dedup
 
+**Fold UDFs**:
+The scalar functions `sh_fold_percentiles` and `sh_fold_uniq` (`LIST(BLOB) -> BLOB`), registered on every duck-store connection that runs a **row collapse**. They delegate to the same Go codecs that always folded the two **aggregate state** columns, so the whole collapse is one SQL `INSERT .. SELECT` with no per-row round trip through Go.
+_Avoid_: SQL aggregate (DuckDB exposes no aggregate-UDF API), native fold
+
 **Delta file**:
-`delta-<generation>.duckdb` — the one file per aggregator shard that receives *all* writes, holding a table per LOD. Append-only, unsorted, deliberately small; every query full-scans it, so its size is bounded by how often **compaction** drains it. Compaction rolls it to a new generation rather than deleting rows in place. Chosen on-disk rather than in-memory so that acking a contributor keeps meaning "durable", as it does today when ClickHouse returns 200.
+`delta-<generation>.duckdb` — the one file per aggregator shard that receives *all* writes, holding only the 1s tier's table; the coarser tiers are derived when the file is drained. Append-only, unsorted, deliberately small; every query full-scans it, so its size is bounded by how often **compaction** drains it. Compaction rolls it to a new generation rather than deleting rows in place. Chosen on-disk rather than in-memory so that acking a contributor keeps meaning "durable", as it does today when ClickHouse returns 200.
 _Avoid_: WAL, L0, buffer table, staging table
 
 **Archive window file**:
 `archive/<tier>-<window_start>.duckdb` — a read-optimized file holding one LOD tier's rows for one time window, sorted `(metric, time)`. Rows are routed by their own timestamp, so a file's time span is capped by the window width however late a row arrives. Retention is unlinking whole files, because DuckDB's `DELETE` does not reclaim disk.
 _Avoid_: partition, segment, shard (already means something else)
 
+**Window lock registry**:
+duck-store's per-**archive window file** locks (`internal/duckstore/window_locks.go`), reference-counted with a retiring state. The invariant is per file — DuckDB allows a file one handle per process — so a compaction, sealing or re-collapse pass on one window fences only the reads of that window, never the whole store. An entry is retired, not removed, while any holder or waiter still references it, so a window dropped and republished can never end up with two live locks.
+_Avoid_: archive mutex, store-global lock, file-lock cache
+
 **Compaction**:
-Moving rows from the **delta file** into the **archive window files** their timestamps belong to, collapsing them by the full key and sorting by `(metric, time)` on the way. Runs on the order of seconds. Everything but `percentiles`/`uniq_state` collapses in SQL; those two are folded in Go, since DuckDB can neither merge nor re-import those **aggregate states**.
+Moving rows from the **delta file** into the **archive window files** their timestamps belong to, collapsing them by the full key, deriving the 1m/1h tiers by timestamp truncation, and sorting by `(metric, time)` on the way. Runs on the order of seconds, holding one window's write lock at a time. The whole collapse is one SQL `INSERT .. SELECT`; the two **aggregate state** columns fold through the **fold UDFs**, since DuckDB can neither merge nor re-import those states natively.
 _Avoid_: merge, flush, rollup (already means something else)
 
+**Generation pin**:
+A hold on a rolled-off **delta file** generation that defers its final unlink until released. A query pins every generation it might read for the read's lifetime; the **seal barrier** pins one to read its window plan. The archive-window counterpart is the lease.
+_Avoid_: lease (that names the archive-window mechanism), refcount
+
+**Source descriptor**:
+One store file's contribution to a duck-store query: its kind (delta generation or archive window), the tier table it contributes, its attach alias, and the exact time range it may contribute. A query's snapshot resolves the active delta, the served windows and every rolled-but-unconsumed generation into descriptors under one consistent view, bounding each rolled generation by the windows consumption has not yet taken from it — so rows are counted exactly once however a consume interleaves the read.
+_Avoid_: qualifier list, source set
+
+**Seal barrier**:
+The durable precondition for **sealing**: a window may seal only once no generation — including the active one — can still contribute a row to it, established per sealing pass by a coordinated roll-and-drain. Without it, a row accepted exactly at the ingest-guard boundary could still sit in an unconsumed generation when its window sealed, and be dropped instead of landed.
+_Avoid_: seal gate, drain lock
+
 **Sealing**:
-The once-per-window rewrite of an **archive window file**'s several sorted runs into one, after which the file is reopened `READ_ONLY`. Happens at `window_end + 48h` — past `MaxHistoricWindow`, so no late row can ever invalidate a sealed collapse.
+The once-per-window rewrite of an **archive window file**'s several sorted runs into one, after which the file is reopened `READ_ONLY`. Happens at `window_end + 48h`, behind the **seal barrier** — past `MaxHistoricWindow` no accepted row can still arrive for the window, and the barrier makes that durable by draining every generation first.
 _Avoid_: freezing, finalizing, closing
+
+**Re-collapse pass**:
+The in-place rewrite of an unsealed **archive window file** with the same collapse statement sealing would use, minus the marker, triggered when the physical row count exceeds a factor of the collapsed count (4 by default). The collapse is associative, so repeating it is safe; it keeps a long-lived 1h window from accumulating hundreds of partial rows per (key, hour) across its whole unsealed life.
+_Avoid_: pre-seal merge, background compaction
 
 **Retention**:
 The bound on how long a shard keeps a tier's data. Enforced by unlinking whole **archive window
@@ -60,9 +84,11 @@ by the sampling budget.
 _Avoid_: TTL, expiry, cleanup
 
 **Quarantined file**:
-A delta or **archive window file** whose version stamp does not match the running binary. The agg
-refuses to open it, excludes it from queries, and leaves it on disk untouched — duck-store never
-upgrades a file in place, in either direction.
+A delta or **archive window file** whose schema-version stamp does not match the running binary on
+that file kind's axis — delta and archive files version independently, so a delta-layout change
+strands only undrained delta, not archive history. The agg refuses to open it, excludes it from
+queries, and leaves it on disk untouched — duck-store never upgrades a file in place, in either
+direction.
 _Avoid_: corrupt file, incompatible file, stale file
 
 **Differential conformance run**:

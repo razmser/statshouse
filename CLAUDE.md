@@ -28,19 +28,32 @@ read-comparison mode.
   in-memory row set plus a `Send(ctx)` returning status/exception/elapsed, so
   insert budgeting, sampling and ingestion-status machinery are shared and
   untouched. ClickHouse sink: `aggregator_insert.go` (RowBinary bytes);
-  duck sink: `internal/duckstore/writer.go`.
+  duck sink: `internal/duckstore/writer.go` — the delta is single-tier: the
+  writer appends only `rows_1s`, and compaction derives the 1m/1h tiers by
+  timestamp truncation.
 - **Read seam — `QuerySource`** (`internal/api/query_source.go`): series and
   tag-values methods taking a semantic request plus an LOD. ClickHouse:
   `query_source_ch.go` (today's SQL builder through `doSelect`). Duck:
   `query_source_duck.go` + `fanout.go` — the request is serialized over the
   structured store-query RPC to every relevant aggregator shard
   (`internal/aggregator/store_query_server.go`) and merged in Go through the
-  existing cross-LOD state merge.
+  existing cross-LOD state merge. Inside duckstore the read runs over a
+  query-source snapshot (`internal/duckstore/query_snapshot.go`):
+  per-source descriptors carrying each file's kind, tier table and exact
+  time range — the active delta, rolled-but-unconsumed generations and
+  archive windows — so a concurrent roll or consume can neither lose nor
+  double-count a generation.
 
 Ground rules when touching either seam:
 
 - The ClickHouse paths must stay behaviourally identical; the insert refactor
   is verified byte-identical.
+- duck-store's compaction and sealing transact through the writer's
+  connection-level protocol — explicit `BEGIN`/`COMMIT` via
+  `conn.ExecContext`, never `sql.Tx`, which a live `duckdb.Appender` cannot
+  participate in — so `ConsumeOptions.AppendWindow` carries the `*sql.Conn`
+  and the appended rows plus the consumption record commit, or roll back, as
+  one.
 - The API never links DuckDB — everything crosses the RPC. The aggregator
   gates duck on `duckstore.Available` (false in untagged builds); the API
   accepts `duck` in any build.
