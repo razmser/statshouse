@@ -380,8 +380,11 @@ func (s *Store) rewriteWindowRuns(ctx context.Context, conn *sql.Conn, tier, tab
 	if _, err := conn.ExecContext(ctx, tierTableDDL(sealedTable)); err != nil {
 		return fail(fmt.Errorf("create %s: %w", sealedTable, err))
 	}
+	// The window's rows are already tier-truncated, so the collapse reads
+	// the plain time column — the statement stays the one the tier's own
+	// table always produced.
 	if _, err := conn.ExecContext(ctx,
-		collapseInsert(sealedTable, "main", table), windowStart, windowStart+tierWindowSecs[tier]); err != nil {
+		collapseInsert(sealedTable, "main", table, "time"), windowStart, windowStart+tierWindowSecs[tier]); err != nil {
 		return fail(fmt.Errorf("collapse %s into %s: %w", table, sealedTable, err))
 	}
 	if _, err := conn.ExecContext(ctx, "DROP TABLE "+table); err != nil {

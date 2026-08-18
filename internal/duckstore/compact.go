@@ -136,16 +136,15 @@ func (c *Compactor) compactOnce(ctx context.Context) error {
 }
 
 // deltaHasRows reports whether a delta generation holds any row; a store that
-// cannot answer counts as non-empty, so the compactor errs on sealing.
+// cannot answer counts as non-empty, so the compactor errs on sealing. The
+// delta holds 1s rows alone, so the 1s table answers for every tier.
 func deltaHasRows(db *sql.DB) bool {
 	if db == nil {
 		return false
 	}
-	for _, tier := range tiers {
-		var n int
-		if err := db.QueryRow("SELECT count(*) FROM " + tierTables[tier]).Scan(&n); err != nil || n > 0 {
-			return true
-		}
+	var n int
+	if err := db.QueryRow("SELECT count(*) FROM " + tierTables[Tier1s]).Scan(&n); err != nil || n > 0 {
+		return true
 	}
 	return false
 }
@@ -166,7 +165,11 @@ func deltaHasRows(db *sql.DB) bool {
 // all collapses to the empty host rather than to an arbitrary row's.
 func collapseWindowRows(ctx context.Context, conn *sql.Conn, tier string, windowStart, windowEnd int64) error {
 	table := tierTables[tier]
-	_, err := conn.ExecContext(ctx, collapseInsert(table, deltaSrcAlias, table), windowStart, windowEnd)
+	// The collapse reads the generation's 1s rows and derives the tier's
+	// bucket through the truncation — the coarse window is folded straight
+	// out of the raw seconds.
+	_, err := conn.ExecContext(ctx,
+		collapseInsert(table, deltaSrcAlias, tierTables[Tier1s], tierTimeExpr(tier)), windowStart, windowEnd)
 	return err
 }
 
@@ -189,9 +192,9 @@ func hostStruct(idCol, sCol, valCol string) string {
 // aggregate-state columns fold in SQL through the UDFs fold_udf.go registers
 // on the connection running the statement; a lone blob bypasses the UDF
 // entirely, passing through byte-identical instead of re-encoded.
-func collapseInsert(dst, src, table string) string {
+func collapseInsert(dst, src, table, timeExpr string) string {
 	var cols []string
-	cols = append(cols, "metric, time")
+	cols = append(cols, "metric, "+collapseTimeCol(timeExpr))
 	for i := 0; i < format.MaxTags; i++ {
 		cols = append(cols, fmt.Sprintf("tag%d, stag%d", i, i))
 	}
@@ -219,8 +222,20 @@ func collapseInsert(dst, src, table string) string {
 		collapseStateCol("percentiles", foldPercentilesUDF),
 		collapseStateCol("uniq_state", foldUniqUDF))
 	return fmt.Sprintf(
-		"INSERT INTO %s SELECT %s FROM %s.%s WHERE time >= $1 AND time < $2 GROUP BY ALL ORDER BY metric, time",
-		dst, strings.Join(cols, ", "), src, table)
+		"INSERT INTO %s SELECT %s FROM %s.%s WHERE %s >= $1 AND %s < $2 GROUP BY ALL ORDER BY metric, time",
+		dst, strings.Join(cols, ", "), src, table, timeExpr, timeExpr)
+}
+
+// collapseTimeCol projects the collapse's time key through the tier's
+// truncation: the plain column for 1s — keeping that statement byte-identical
+// to the retired per-tier read — and the expression aliased AS time for the
+// derived tiers, so GROUP BY ALL keys on the truncated bucket and ORDER BY
+// time binds the projected column, not the source's raw seconds.
+func collapseTimeCol(timeExpr string) string {
+	if timeExpr == "time" {
+		return "time"
+	}
+	return timeExpr + " AS time"
 }
 
 // collapseStateCol folds one aggregate-state column inside the collapse

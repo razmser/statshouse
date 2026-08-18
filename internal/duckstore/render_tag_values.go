@@ -111,8 +111,7 @@ func buildTagValuesSQL(p *tagValuesPlan, sources []querySource) (*seriesQuerySQL
 
 	var arms []string
 	for _, src := range sources {
-		arms = append(arms, "SELECT * FROM "+src.tableRef()+
-			" WHERE time >= "+qp.rangeParam(src.from)+" AND time < "+qp.rangeParam(src.to))
+		arms = append(arms, qp.sourceArm(src))
 	}
 
 	where, err := p.where(param)

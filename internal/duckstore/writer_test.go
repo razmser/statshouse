@@ -105,30 +105,29 @@ func tierCount(t *testing.T, s *Store, tier string, metric int32) int {
 	return n
 }
 
-// TestWriterRoundLandsInAllTiersTruncated writes one round and proves the row
-// reached all three tiers with time truncated to each tier, that it is
+// TestWriterRoundLandsIn1sTier writes one round and proves the row reached
+// the delta's one table — the 1s tier, at its raw second — that it is
 // committed (visible to a connection other than the writer's) as soon as
-// WriteRound returns, and that the tag, host and aggregate-state columns survived the
+// WriteRound returns, that the coarser tiers' tables are gone from the delta
+// entirely, and that the tag, host and aggregate-state columns survived the
 // mapping.
-func TestWriterRoundLandsInAllTiersTruncated(t *testing.T) {
+func TestWriterRoundLandsIn1sTier(t *testing.T) {
 	s, w := newTestWriter(t)
 	ts := uint32(writerNow.Unix()) - 37 // inside the guard, second 63 of its minute
 	row := testRow(testMetricID, ts)
 	require.NoError(t, w.WriteRound(context.Background(), []Row{row}))
 
-	// the row is in all three tiers, each with its own time truncation
-	for _, tc := range []struct {
-		tier   string
-		wantTS int64
-	}{
-		{Tier1s, int64(ts)},
-		{Tier1m, int64(ts) / 60 * 60},
-		{Tier1h, int64(ts) / 3600 * 3600},
-	} {
-		gotTS := tierRow(t, s, tc.tier, testMetricID, tc.wantTS)
-		require.EqualValues(t, tc.wantTS, gotTS, "%s time must be truncated to the tier", tc.tier)
-		require.Equal(t, 1, tierCount(t, s, tc.tier, testMetricID), "%s must hold exactly one row", tc.tier)
-	}
+	// the row sits in the 1s table at its raw second, exactly once
+	gotTS := tierRow(t, s, Tier1s, testMetricID, int64(ts))
+	require.EqualValues(t, ts, gotTS, "1s time is the row's own second")
+	require.Equal(t, 1, tierCount(t, s, Tier1s, testMetricID))
+
+	// the delta carries no coarser-tier table to append to: those tiers
+	// derive from the 1s rows at compaction and read time
+	var coarse int
+	require.NoError(t, s.Delta().QueryRow(
+		`SELECT count(*) FROM duckdb_tables() WHERE table_name IN ('s1m', 's1h')`).Scan(&coarse))
+	require.Zero(t, coarse, "the delta must hold the 1s table alone")
 
 	// tag mapping: id tags landed in tagN, raw strings in stagN, the string
 	// top in slot 47, and an id with a string kept only its id half
@@ -182,14 +181,12 @@ func TestWriterDropsRowsOutsideIngestGuard(t *testing.T) {
 	}
 	require.NoError(t, w.WriteRound(context.Background(), rows))
 
-	// the two survivors are in every tier; the three dropped rows in none
-	for _, tier := range tiers {
-		require.Equal(t, 1, tierCount(t, s, tier, testMetricID), "%s: boundary-old row", tier)
-		require.Equal(t, 0, tierCount(t, s, tier, testMetricID+1), "%s: one-second-too-old row", tier)
-		require.Equal(t, 0, tierCount(t, s, tier, testMetricID+2), "%s: far-past row", tier)
-		require.Equal(t, 1, tierCount(t, s, tier, testMetricID+3), "%s: boundary-future row", tier)
-		require.Equal(t, 0, tierCount(t, s, tier, testMetricID+4), "%s: too-future row", tier)
-	}
+	// the two survivors are stored; the three dropped rows are not
+	require.Equal(t, 1, tierCount(t, s, Tier1s, testMetricID), "boundary-old row")
+	require.Equal(t, 0, tierCount(t, s, Tier1s, testMetricID+1), "one-second-too-old row")
+	require.Equal(t, 0, tierCount(t, s, Tier1s, testMetricID+2), "far-past row")
+	require.Equal(t, 1, tierCount(t, s, Tier1s, testMetricID+3), "boundary-future row")
+	require.Equal(t, 0, tierCount(t, s, Tier1s, testMetricID+4), "too-future row")
 }
 
 // TestWriterFailedRoundSurfacesError proves a forced write failure fails the
@@ -217,9 +214,7 @@ func TestWriterFailedRoundSurfacesError(t *testing.T) {
 	// the failed round left nothing behind, and the writer still takes rounds
 	require.Equal(t, 0, tierCount(t, s, Tier1s, testMetricID2), "the failed round must not land")
 	require.NoError(t, w.WriteRound(context.Background(), []Row{testRow(testMetricID2, now)}))
-	for _, tier := range tiers {
-		require.Equal(t, 1, tierCount(t, s, tier, testMetricID2), "%s must hold the recovered round", tier)
-	}
+	require.Equal(t, 1, tierCount(t, s, Tier1s, testMetricID2), "the recovered round must land")
 }
 
 // TestWriterFlushJoinsRoundTransaction pins the duckdb-go behaviour the whole
@@ -252,15 +247,16 @@ func TestWriterFlushJoinsRoundTransaction(t *testing.T) {
 	require.Zero(t, n, "ROLLBACK must discard rows the appender flushed — round atomicity depends on it")
 }
 
-// TestWriterFailedMidRoundCommitsNothing fails a round BETWEEN the tiers'
-// flushes — the shape a real storage error takes — and proves the failed round
-// is absent from every tier (not just the unflushed ones), so the conveyor's
-// resend cannot double-count, and that the writer takes the next round.
+// TestWriterFailedMidRoundCommitsNothing fails a round BETWEEN the append
+// and the flush — the shape a real storage error takes — and proves the
+// failed round is absent from the delta even though its rows were already
+// appended, so the conveyor's resend cannot double-count, and that the writer
+// takes the next round.
 func TestWriterFailedMidRoundCommitsNothing(t *testing.T) {
 	s, w := newTestWriterCfg(t, WriterConfig{
 		NowFunc: func() time.Time { return writerNow },
 		FlushTierFault: func(round int64, tier string) error {
-			if round == 1 && tier == Tier1m { // 1s already flushed when this fires
+			if round == 1 && tier == Tier1s { // the round's rows are already appended when this fires
 				return fmt.Errorf("round %d: simulated %s flush failure", round, tier)
 			}
 			return nil
@@ -270,19 +266,15 @@ func TestWriterFailedMidRoundCommitsNothing(t *testing.T) {
 
 	err := w.WriteRound(context.Background(), []Row{testRow(testMetricID, now)})
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "simulated 1m flush failure")
+	require.Contains(t, err.Error(), "simulated 1s flush failure")
 
-	// the failed round must be absent from ALL three tiers: 1s flushed fine,
-	// but the round rolled back with it
-	for _, tier := range tiers {
-		require.Zero(t, tierCount(t, s, tier, testMetricID), "%s must not hold any of the failed round", tier)
-	}
+	// the failed round must be absent: its rows were appended, but the
+	// rollback discarded the flush and the buffered leftovers with it
+	require.Zero(t, tierCount(t, s, Tier1s, testMetricID), "the failed round must not land")
 
 	// the writer recovers and the resent round lands exactly once
 	require.NoError(t, w.WriteRound(context.Background(), []Row{testRow(testMetricID, now)}))
-	for _, tier := range tiers {
-		require.Equal(t, 1, tierCount(t, s, tier, testMetricID), "%s must hold the recovered round once", tier)
-	}
+	require.Equal(t, 1, tierCount(t, s, Tier1s, testMetricID), "the recovered round must land once")
 }
 
 // TestWriterClosedRefusesRounds checks the closed-writer path.
@@ -299,7 +291,7 @@ func TestWriterClosedRefusesRounds(t *testing.T) {
 
 // TestWriterDataSurvivesReopen closes the store with everything it wrote only
 // in the write-ahead log, reopens it and proves the acknowledged round is
-// still there in every tier — acknowledgement meant durable.
+// still there — acknowledgement meant durable.
 func TestWriterDataSurvivesReopen(t *testing.T) {
 	dir := t.TempDir()
 	s, _ := openTestStore(t, dir)
@@ -314,16 +306,7 @@ func TestWriterDataSurvivesReopen(t *testing.T) {
 
 	s2, _ := openTestStore(t, dir)
 	defer func() { _ = s2.Close() }()
-	for _, tc := range []struct {
-		tier   string
-		wantTS int64
-	}{
-		{Tier1s, int64(now - 5)},
-		{Tier1m, int64(now-5) / 60 * 60},
-		{Tier1h, int64(now-5) / 3600 * 3600},
-	} {
-		tierRow(t, s2, tc.tier, testMetricID, tc.wantTS)
-	}
+	tierRow(t, s2, Tier1s, testMetricID, int64(now-5))
 }
 
 // TestWriterCancelledContextFailsRound proves a caller that gives up gets an
@@ -448,7 +431,5 @@ func TestIngestGuardHorizon(t *testing.T) {
 func TestWriterEmptyRoundIsNoop(t *testing.T) {
 	s, w := newTestWriter(t)
 	require.NoError(t, w.WriteRound(context.Background(), nil))
-	for _, tier := range tiers {
-		require.Equal(t, 0, tierCount(t, s, tier, testMetricID))
-	}
+	require.Equal(t, 0, tierCount(t, s, Tier1s, testMetricID))
 }

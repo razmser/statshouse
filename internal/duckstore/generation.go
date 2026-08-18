@@ -150,7 +150,7 @@ func (s *Store) RollGeneration() error {
 	path := filepath.Join(s.cfg.Dir, deltaFileName(next))
 	// A file left by a failed earlier roll is complete (createFile is
 	// all-or-nothing) and stamped by this binary, so it is reused as-is.
-	if err := createFile(path, allTierTables(), s.currentStamp(fileKindDelta), s.cfg.Resources); err != nil {
+	if err := createFile(path, deltaTables(), s.currentStamp(fileKindDelta), s.cfg.Resources); err != nil {
 		return fmt.Errorf("duck-store: roll: %w", err)
 	}
 	db, err := openStoreFile(path, false, s.cfg.Resources)
@@ -398,23 +398,27 @@ func (s *Store) deltaState() (gens []int64, active int64) {
 }
 
 // copyWindowRows is the default append: the window's rows verbatim, the way
-// they sit in the delta. Compaction passes its collapsing AppendWindow
-// instead; correctness never depends on the collapse, because read-time
-// GROUP BY folds whatever rows it finds.
+// they sit in the delta — the tier's bucket derived out of the 1s rows
+// through the tier's truncation. Compaction passes its collapsing
+// AppendWindow instead; correctness never depends on the collapse, because
+// read-time GROUP BY folds whatever rows it finds.
 func copyWindowRows(ctx context.Context, conn *sql.Conn, tier string, windowStart, windowEnd int64) error {
-	table := tierTables[tier]
+	// The window bounds are tier-aligned, so filtering on the truncated
+	// expression and on the raw seconds keep the same rows.
+	expr := tierTimeExpr(tier)
 	_, err := conn.ExecContext(ctx,
-		fmt.Sprintf("INSERT INTO %s SELECT * FROM %s.%s WHERE time >= $1 AND time < $2", table, deltaSrcAlias, table),
+		fmt.Sprintf("INSERT INTO %s SELECT %s FROM %s.%s WHERE %s >= $1 AND %s < $2",
+			tierTables[tier], derivedTierSelect(expr), deltaSrcAlias, tierTables[Tier1s], expr, expr),
 		windowStart, windowEnd)
 	return err
 }
 
 // generationWindows derives, from the generation's own rows, the archive
-// windows it must be consumed into: per tier, every distinct (already
-// tier-truncated) time mapped through the tier's window length. The plan is a
-// function of the generation's immutable contents, so a crashed consumption
-// and its resume always agree on it. A generation with no rows plans no
-// windows and is consumed by the unlink alone.
+// windows it must be consumed into: per tier, every distinct 1s time mapped
+// through the tier's window length. The plan is a function of the
+// generation's immutable contents, so a crashed consumption and its resume
+// always agree on it. A generation with no rows plans no windows and is
+// consumed by the unlink alone.
 func generationWindows(deltaPath string, res ResourcesConfig) (map[windowKey]struct{}, error) {
 	db, err := openStoreFile(deltaPath, true, res)
 	if err != nil {
@@ -424,28 +428,33 @@ func generationWindows(deltaPath string, res ResourcesConfig) (map[windowKey]str
 	return deltaWindows(db)
 }
 
-// deltaWindows is generationWindows over an open handle.
+// deltaWindows is generationWindows over an open handle. The delta holds 1s
+// rows alone, so every tier's plan derives from those raw seconds. A window
+// length is a whole multiple of each tier's seconds, so flooring straight to
+// the window — skipping the tier truncation the retired per-tier tables
+// applied — lands the very window the truncated time landed, and the plan
+// equals the one the three-table delta produced.
 func deltaWindows(db *sql.DB) (map[windowKey]struct{}, error) {
 	windows := map[windowKey]struct{}{}
-	for _, tier := range tiers {
-		rows, err := db.Query("SELECT DISTINCT time FROM " + tierTables[tier])
-		if err != nil {
-			return nil, err
-		}
-		for rows.Next() {
-			var t int64
-			if err := rows.Scan(&t); err != nil {
-				rows.Close()
-				return nil, err
-			}
-			windows[windowKey{tier: tier, start: t - t%tierWindowSecs[tier]}] = struct{}{}
-		}
-		if err := rows.Err(); err != nil {
+	rows, err := db.Query("SELECT DISTINCT time FROM " + tierTables[Tier1s])
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var t int64
+		if err := rows.Scan(&t); err != nil {
 			rows.Close()
 			return nil, err
 		}
-		rows.Close()
+		for _, tier := range tiers {
+			windows[windowKey{tier: tier, start: t - t%tierWindowSecs[tier]}] = struct{}{}
+		}
 	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
 	return windows, nil
 }
 

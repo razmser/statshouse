@@ -39,13 +39,14 @@ import (
 // contributes one descriptor per archive window consumption has not yet
 // taken from it, bounded by that window's own range.
 type querySource struct {
-	kind  fileKind  // fileKindDelta for a delta generation, fileKindArchive for a window
-	gen   int64     // delta: the generation identity; archive: zero
-	key   windowKey // archive: the window identity; a rolled delta: the window whose range it contributes; the active delta: zero
-	table string    // the tier table this source contributes
-	alias string    // SQL qualifier on the query's connection: "" is the delta — the connection's own database — else the ATTACH alias
-	from  int64     // first second the source may contribute
-	to    int64     // one past the last second the source may contribute
+	kind     fileKind  // fileKindDelta for a delta generation, fileKindArchive for a window
+	gen      int64     // delta: the generation identity; archive: zero
+	key      windowKey // archive: the window identity; a rolled delta: the window whose range it contributes; the active delta: zero
+	table    string    // the table this source contributes: the tier's own for an archive window, the 1s table for a delta
+	timeExpr string    // empty when the stored time is already the tier's own bucket — every 1s-tier and archive source; else the truncation reading the coarser tier's buckets out of the delta's 1s rows
+	alias    string    // SQL qualifier on the query's connection: "" is the delta — the connection's own database — else the ATTACH alias
+	from     int64     // first second the source may contribute
+	to       int64     // one past the last second the source may contribute
 }
 
 // tableRef is the source's table as addressed on the query's connection: the
@@ -217,17 +218,28 @@ func (q *querySnapshot) resolveRolledWindows(ctx context.Context, tier string, f
 	win := tierWindowSecs[tier]
 	for i := range q.rolled {
 		rg := &q.rolled[i]
+		// The generation holds 1s rows alone, so the plan reads the tier's
+		// bucket starts out of them through the truncation — the same plan
+		// the retired per-tier tables carried. DISTINCT cannot collapse to
+		// window starts here, so the ascending reads are floored in Go and
+		// consecutive duplicates dropped before the overlap test.
 		rows, err := q.conn.QueryContext(ctx, fmt.Sprintf(
-			"SELECT DISTINCT time - time %% %d FROM %s.%s ORDER BY 1", win, rg.alias, tierTables[tier]))
+			"SELECT DISTINCT %s FROM %s.%s ORDER BY 1", tierTimeExpr(tier), rg.alias, tierTables[Tier1s]))
 		if err != nil {
 			return fmt.Errorf("duck-store: read generation %d for store query: %w", rg.gen, err)
 		}
+		haveLast, last := false, int64(0)
 		for rows.Next() {
-			var start int64
-			if err := rows.Scan(&start); err != nil {
+			var t int64
+			if err := rows.Scan(&t); err != nil {
 				rows.Close()
 				return fmt.Errorf("duck-store: read generation %d for store query: %w", rg.gen, err)
 			}
+			start := t - t%win
+			if haveLast && start == last {
+				continue
+			}
+			haveLast, last = true, start
 			if start < to && start+win > from {
 				rg.windows = append(rg.windows, start)
 			}
@@ -339,15 +351,19 @@ func (q *querySnapshot) rolledSources(tier string, from, to int64) []querySource
 		}
 		sort.Slice(rg.windows, func(a, b int) bool { return rg.windows[a] < rg.windows[b] })
 		for _, start := range rg.windows {
-			srcs = append(srcs, querySource{
+			src := querySource{
 				kind:  fileKindDelta,
 				gen:   rg.gen,
 				key:   windowKey{tier: tier, start: start},
-				table: TierTable(tier),
+				table: tierTables[Tier1s],
 				alias: rg.alias,
 				from:  max(from, start),
 				to:    min(to, start+win),
-			})
+			}
+			if tier != Tier1s {
+				src.timeExpr = tierTimeExpr(tier)
+			}
+			srcs = append(srcs, src)
 		}
 	}
 	return srcs

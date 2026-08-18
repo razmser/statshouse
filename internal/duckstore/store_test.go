@@ -21,6 +21,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/VKCOM/statshouse/internal/data_model"
 	"github.com/VKCOM/statshouse/internal/format"
 )
 
@@ -156,45 +157,65 @@ func TestOpenStoreBootstrapsFreshDirectory(t *testing.T) {
 	require.EqualValues(t, 3, count, "data written before the reopen must survive it")
 }
 
+// requireTierTableResolvedSchema asserts one tier table's resolved schema is
+// the DDL's transliteration, on any store file that carries it.
+func requireTierTableResolvedSchema(t *testing.T, db *sql.DB, table string) {
+	t.Helper()
+	rows, err := db.Query(
+		`SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_name = $1 ORDER BY ordinal_position`, table)
+	require.NoError(t, err)
+	got := map[string][2]string{}
+	for rows.Next() {
+		var name, dataType, nullable string
+		require.NoError(t, rows.Scan(&name, &dataType, &nullable))
+		got[name] = [2]string{dataType, nullable}
+	}
+	require.NoError(t, rows.Err())
+	rows.Close()
+
+	wantColumns := 2 + 2*format.MaxTags + 6 + 9 + 2
+	require.Len(t, got, wantColumns, "%s column count", table)
+
+	// every column NOT NULL with a zero-value default, so NULL
+	// three-valued logic can never silently drop a row
+	for name, col := range got {
+		require.Equal(t, "NO", col[1], "%s.%s must be NOT NULL", table, name)
+	}
+	require.Equal(t, [2]string{"INTEGER", "NO"}, got["metric"])
+	require.Equal(t, [2]string{"BIGINT", "NO"}, got["time"])
+	require.Equal(t, [2]string{"INTEGER", "NO"}, got["tag47"])
+	require.Equal(t, [2]string{"VARCHAR", "NO"}, got["stag47"])
+	require.Equal(t, [2]string{"DOUBLE", "NO"}, got["count"])
+	require.Equal(t, [2]string{"INTEGER", "NO"}, got["min_host"])
+	require.Equal(t, [2]string{"VARCHAR", "NO"}, got["min_shost"])
+	require.Equal(t, [2]string{"DOUBLE", "NO"}, got["min_host_value"])
+	require.Equal(t, [2]string{"DOUBLE", "NO"}, got["max_host_value"])
+	require.Equal(t, [2]string{"DOUBLE", "NO"}, got["max_count_host_value"])
+	require.Equal(t, [2]string{"INTEGER", "NO"}, got["max_count_host"])
+	// aggregate states stay opaque ClickHouse bytes
+	require.Equal(t, [2]string{"BLOB", "NO"}, got["percentiles"])
+	require.Equal(t, [2]string{"BLOB", "NO"}, got["uniq_state"])
+}
+
 func TestOpenStoreSchemaIsTransliteratedDDL(t *testing.T) {
 	s, _ := openTestStore(t, t.TempDir())
 	db := s.Delta()
 
-	for _, table := range allTierTables() {
-		rows, err := db.Query(
-			`SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_name = $1 ORDER BY ordinal_position`, table)
+	// the delta carries the 1s table alone — the coarser tiers never have a
+	// table there — and one archive window per coarse tier covers the rest
+	// of the layout
+	requireTierTableResolvedSchema(t, db, tierTables[Tier1s])
+	var coarse int
+	require.NoError(t, db.QueryRow(
+		`SELECT count(*) FROM duckdb_tables() WHERE table_name IN ('s1m', 's1h')`).Scan(&coarse))
+	require.Zero(t, coarse, "the delta must hold the 1s table alone")
+	for _, tier := range []string{Tier1m, Tier1h} {
+		path := filepath.Join(t.TempDir(), archiveFileName(tier, 0))
+		createTestFile(t, path, []string{tierTables[tier]}, currentTestStamp(t, fileKindArchive), nil)
+		wdb, err := openStoreFile(path, true, ResourcesConfig{})
 		require.NoError(t, err)
-		got := map[string][2]string{}
-		for rows.Next() {
-			var name, dataType, nullable string
-			require.NoError(t, rows.Scan(&name, &dataType, &nullable))
-			got[name] = [2]string{dataType, nullable}
-		}
-		require.NoError(t, rows.Err())
-		rows.Close()
-
-		wantColumns := 2 + 2*format.MaxTags + 6 + 9 + 2
-		require.Len(t, got, wantColumns, "%s column count", table)
-
-		// every column NOT NULL with a zero-value default, so NULL
-		// three-valued logic can never silently drop a row
-		for name, col := range got {
-			require.Equal(t, "NO", col[1], "%s.%s must be NOT NULL", table, name)
-		}
-		require.Equal(t, [2]string{"INTEGER", "NO"}, got["metric"])
-		require.Equal(t, [2]string{"BIGINT", "NO"}, got["time"])
-		require.Equal(t, [2]string{"INTEGER", "NO"}, got["tag47"])
-		require.Equal(t, [2]string{"VARCHAR", "NO"}, got["stag47"])
-		require.Equal(t, [2]string{"DOUBLE", "NO"}, got["count"])
-		require.Equal(t, [2]string{"INTEGER", "NO"}, got["min_host"])
-		require.Equal(t, [2]string{"VARCHAR", "NO"}, got["min_shost"])
-		require.Equal(t, [2]string{"DOUBLE", "NO"}, got["min_host_value"])
-		require.Equal(t, [2]string{"DOUBLE", "NO"}, got["max_host_value"])
-		require.Equal(t, [2]string{"DOUBLE", "NO"}, got["max_count_host_value"])
-		require.Equal(t, [2]string{"INTEGER", "NO"}, got["max_count_host"])
-		// aggregate states stay opaque ClickHouse bytes
-		require.Equal(t, [2]string{"BLOB", "NO"}, got["percentiles"])
-		require.Equal(t, [2]string{"BLOB", "NO"}, got["uniq_state"])
+		defer func() { _ = wdb.Close() }()
+		requireTierTableResolvedSchema(t, wdb, tierTables[tier])
 	}
 
 	// the version stamp records this binary on all three axes
@@ -216,7 +237,7 @@ func TestOpenStoreResumesNewestValidGeneration(t *testing.T) {
 
 	// a crash-recovery-style restart leaves an older generation behind while
 	// a newer one exists: writes must go to the newest, none may be lost
-	createTestFile(t, filepath.Join(dir, deltaFileName(1)), allTierTables(), currentTestStamp(t, fileKindDelta), func(db *sql.DB) {
+	createTestFile(t, filepath.Join(dir, deltaFileName(1)), deltaTables(), currentTestStamp(t, fileKindDelta), func(db *sql.DB) {
 		_, err := db.Exec(`INSERT INTO s1 (metric, time, count) VALUES ($1, $2, $3)`, int32(6), int64(1800000000), 10.0)
 		require.NoError(t, err)
 	})
@@ -365,7 +386,7 @@ func TestOpenStoreDeltaAxisBumpQuarantinesDeltasNotArchives(t *testing.T) {
 
 	// files exactly as the current binary writes them: an undrained delta
 	// generation plus two archive windows, one with rows in it
-	createTestFile(t, filepath.Join(dir, deltaFileName(0)), allTierTables(), currentTestStamp(t, fileKindDelta), func(db *sql.DB) {
+	createTestFile(t, filepath.Join(dir, deltaFileName(0)), deltaTables(), currentTestStamp(t, fileKindDelta), func(db *sql.DB) {
 		_, err := db.Exec(`INSERT INTO s1 (metric, time, count, sum) VALUES ($1, $2, $3, $4)`, int32(1), int64(1700000000), 5.0, 25.0)
 		require.NoError(t, err)
 	})
@@ -411,6 +432,58 @@ func TestOpenStoreDeltaAxisBumpQuarantinesDeltasNotArchives(t *testing.T) {
 	require.NoError(t, db.Close())
 }
 
+// TestOpenStoreShippedDeltaAxisBumpQuarantinesOldDeltas exercises the bump
+// this binary actually shipped — not a simulated future one: a delta stamped
+// with the previous delta axis (the three-table layout the pre-bump binary
+// wrote) is quarantined, while the archive windows whose axis never moved
+// stay served — a store query reads their rows — and a fresh 1s-only
+// generation takes over.
+func TestOpenStoreShippedDeltaAxisBumpQuarantinesOldDeltas(t *testing.T) {
+	dir := t.TempDir()
+
+	// the delta exactly as the previous-axis binary wrote it: all three
+	// tier tables, stamped one delta axis behind
+	oldDelta := currentTestStamp(t, fileKindDelta)
+	oldDelta.schemaVersion = DeltaSchemaVersion - 1
+	createTestFile(t, filepath.Join(dir, deltaFileName(0)), allTierTables(), oldDelta, func(db *sql.DB) {
+		_, err := db.Exec(`INSERT INTO s1 (metric, time, count, sum) VALUES ($1, $2, $3, $4)`,
+			int32(3), int64(86460), 6.0, 12.0)
+		require.NoError(t, err)
+	})
+	// a served archive window with rows, current on the archive axis
+	window := filepath.Join(dir, archiveSubdir, archiveFileName(Tier1m, 86400))
+	createTestFile(t, window, []string{TierTable(Tier1m)}, currentTestStamp(t, fileKindArchive), func(db *sql.DB) {
+		_, err := db.Exec(`INSERT INTO s1m (metric, time, count, sum) VALUES ($1, $2, $3, $4)`,
+			int32(3), int64(86460), 6.0, 12.0)
+		require.NoError(t, err)
+	})
+
+	s, _ := openTestStore(t, dir)
+
+	// the old-axis delta is quarantined — named, counted, on the delta axis
+	quarantined := s.Quarantined()
+	require.Len(t, quarantined, 1)
+	require.Equal(t, filepath.Join(dir, deltaFileName(0)), quarantined[0].Path)
+	require.Equal(t, QuarantineDeltaSchema, quarantined[0].Axis)
+	require.Contains(t, quarantined[0].Reason, "duck-store delta schema version mismatch")
+	require.NoFileExists(t, filepath.Join(dir, deltaFileName(0)))
+
+	// a fresh generation takes over and serves
+	require.Equal(t, []int64{1}, s.DeltaGenerations())
+	requireDeltaServes(t, s)
+
+	// the archive window stays served — a 1m-tier query over its range
+	// decodes its rows through the read path
+	windows := s.Windows()
+	require.Len(t, windows, 1)
+	require.Equal(t, Tier1m, windows[0].Tier)
+	require.EqualValues(t, 86400, windows[0].WindowStart)
+	r := renderSeriesSorted(t, s, 1, seriesReq(3, twoMappedKinds,
+		[]int32{int32(data_model.DigestCount)}, []int32{0}, 86400, 2*86400, 60))
+	require.Equal(t, []int64{86460}, r.time)
+	require.Equal(t, []float64{6}, r.count)
+}
+
 // TestOpenStoreArchiveAxisBumpQuarantinesArchivesNotDeltas is the mirror: an
 // archive-layout change moves only the archive axis, so archive windows
 // written by the older binary are quarantined while the delta generation it
@@ -420,7 +493,7 @@ func TestOpenStoreArchiveAxisBumpQuarantinesArchivesNotDeltas(t *testing.T) {
 	dir := t.TempDir()
 
 	// the current binary's files: an active delta with rows, two archive windows
-	createTestFile(t, filepath.Join(dir, deltaFileName(0)), allTierTables(), currentTestStamp(t, fileKindDelta), func(db *sql.DB) {
+	createTestFile(t, filepath.Join(dir, deltaFileName(0)), deltaTables(), currentTestStamp(t, fileKindDelta), func(db *sql.DB) {
 		_, err := db.Exec(`INSERT INTO s1 (metric, time, count, sum) VALUES ($1, $2, $3, $4)`, int32(6), int64(1700000000), 10.0, 50.0)
 		require.NoError(t, err)
 	})
@@ -469,7 +542,7 @@ func TestOpenStoreMixedSchemaAxesServeTheCorrectSubset(t *testing.T) {
 	oldDelta.schemaVersion = DeltaSchemaVersion - 1
 	createTestFile(t, filepath.Join(dir, deltaFileName(0)), allTierTables(), oldDelta, nil)
 	// delta-1 is current on every axis — it survives and resumes active
-	createTestFile(t, filepath.Join(dir, deltaFileName(1)), allTierTables(), currentTestStamp(t, fileKindDelta), func(db *sql.DB) {
+	createTestFile(t, filepath.Join(dir, deltaFileName(1)), deltaTables(), currentTestStamp(t, fileKindDelta), func(db *sql.DB) {
 		_, err := db.Exec(`INSERT INTO s1 (metric, time, count, sum) VALUES ($1, $2, $3, $4)`, int32(2), int64(1700000000), 7.0, 35.0)
 		require.NoError(t, err)
 	})

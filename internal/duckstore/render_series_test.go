@@ -641,14 +641,15 @@ func TestRenderSeriesRaw64GroupAndFilter(t *testing.T) {
 }
 
 // TestRenderSeriesMonthBuckets checks the one genuinely timezone-dependent
-// step: calendar months in a named zone. Rows are inserted directly (the
-// writer's ingestion guard would drop months this old) into the 1h tier the
-// step reads.
+// step: calendar months in a named zone. Rows are inserted directly into the
+// delta's 1s table (the writer's ingestion guard would drop months this old);
+// the 1h-tier read derives the hour buckets from them, and both seconds are
+// hour-aligned.
 func TestRenderSeriesMonthBuckets(t *testing.T) {
 	s, _ := openTestStore(t, t.TempDir())
 	// 2023-05-02 Moscow and 2023-11-15 Moscow: local months May and November 2023
 	_, err := s.Delta().Exec(
-		"INSERT INTO s1h (metric, time, count) VALUES ($1, $2, 1), ($1, $3, 2)",
+		"INSERT INTO s1 (metric, time, count) VALUES ($1, $2, 1), ($1, $3, 2)",
 		testMetricID, int64(1683000000), int64(1699999200))
 	require.NoError(t, err)
 
@@ -1012,7 +1013,10 @@ func descriptorSourcesForRetired(p *storeQueryPlan, gen int64, qualifiers []stri
 // TestBuildSeriesSQLDescriptorPathMatchesRetiredQualifiers pins the pure seam
 // change: across the renderer's plan matrix and source counts, the descriptor
 // path emits the retired qualifier path's exact statement — same text, same
-// bound arguments in the same order.
+// bound arguments in the same order. The plans run at step 15 — the 1s tier,
+// where the seam is still SQL-neutral; since the deltas hold 1s rows alone,
+// the coarser tiers read a derived projection arm the qualifier shape never
+// had, and those are pinned by decoded answer in the coarse-tier tests.
 func TestBuildSeriesSQLDescriptorPathMatchesRetiredQualifiers(t *testing.T) {
 	b1 := (writerNowUnix - 7200) / 60 * 60
 	var re2 tlstatshouse.StoreTagFilter
@@ -1027,47 +1031,41 @@ func TestBuildSeriesSQLDescriptorPathMatchesRetiredQualifiers(t *testing.T) {
 
 	plans := map[string]tlstatshouse.StoreQuerySeries{
 		"count over mapped tags": seriesReq(testMetricID, twoMappedKinds,
-			[]int32{int32(data_model.DigestCount)}, []int32{0}, b1, b1+120, 60),
-		"empty what": seriesReq(testMetricID, twoMappedKinds, nil, []int32{0}, b1, b1+60, 60),
+			[]int32{int32(data_model.DigestCount)}, []int32{0}, b1, b1+120, 15),
+		"empty what": seriesReq(testMetricID, twoMappedKinds, nil, []int32{0}, b1, b1+60, 15),
 		"all aggregates and hosts": func() tlstatshouse.StoreQuerySeries {
 			q := seriesReq(testMetricID, twoMappedKinds,
 				[]int32{int32(data_model.DigestCount), int32(data_model.DigestSum),
 					int32(data_model.DigestMin), int32(data_model.DigestMax),
 					int32(data_model.DigestStdDev), int32(data_model.DigestCardinality),
 					int32(data_model.DigestPercentile), int32(data_model.DigestUnique)},
-				[]int32{0, 1}, b1, b1+120, 60)
+				[]int32{0, 1}, b1, b1+120, 15)
 			q.SetMinHost(true)
 			q.SetMaxHost(true)
 			return q
 		}(),
 		"raw64 grouping": seriesReq(testMetricID, []int32{tagKindRaw64, tagKindRaw32},
-			[]int32{int32(data_model.DigestCount)}, []int32{0}, b1, b1+60, 60),
+			[]int32{int32(data_model.DigestCount)}, []int32{0}, b1, b1+60, 15),
 		"shard and tag grouping": seriesReq(testMetricID, twoMappedKinds,
-			[]int32{int32(data_model.DigestCount)}, []int32{format.ShardTagIndex, 0}, b1, b1+60, 60),
+			[]int32{int32(data_model.DigestCount)}, []int32{format.ShardTagIndex, 0}, b1, b1+60, 15),
 		"filters": func() tlstatshouse.StoreQuerySeries {
 			q := seriesReq(testMetricID, twoMappedKinds,
-				[]int32{int32(data_model.DigestCount)}, []int32{1}, b1, b1+60, 60)
+				[]int32{int32(data_model.DigestCount)}, []int32{1}, b1, b1+60, 15)
 			q.Base.FilterIn = []tlstatshouse.StoreTagFilter{re2}
 			q.Base.FilterNotIn = []tlstatshouse.StoreTagFilter{values, empty}
 			return q
 		}(),
 		"metric in list": func() tlstatshouse.StoreQuerySeries {
 			q := seriesReq(0, twoMappedKinds,
-				[]int32{int32(data_model.DigestCount)}, []int32{0}, b1, b1+60, 60)
+				[]int32{int32(data_model.DigestCount)}, []int32{0}, b1, b1+60, 15)
 			q.Base.SetMetricIn([]int32{testMetricID, testMetricID2})
 			return q
 		}(),
 		"sort desc and row limit": func() tlstatshouse.StoreQuerySeries {
 			q := seriesReq(testMetricID, twoMappedKinds,
-				[]int32{int32(data_model.DigestCount)}, []int32{0}, b1, b1+120, 60)
+				[]int32{int32(data_model.DigestCount)}, []int32{0}, b1, b1+120, 15)
 			q.SetSortDesc(true)
 			q.Base.RowLimit = 7
-			return q
-		}(),
-		"month lod": func() tlstatshouse.StoreQuerySeries {
-			q := seriesReq(testMetricID, twoMappedKinds,
-				[]int32{int32(data_model.DigestCount)}, []int32{0}, 1682899200, 1700000000, monthLodStep)
-			q.Base.Lod.Location = "Europe/Moscow"
 			return q
 		}(),
 	}
@@ -1106,7 +1104,7 @@ func TestWithQuerySourcesDescriptorPathMatchesRetiredPath(t *testing.T) {
 	args := seriesReq(0, twoMappedKinds,
 		[]int32{int32(data_model.DigestCount), int32(data_model.DigestSum),
 			int32(data_model.DigestMin), int32(data_model.DigestMax)},
-		[]int32{0}, b1, writerNowUnix+60, 60)
+		[]int32{0}, b1, writerNowUnix+60, 15)
 	args.Base.SetMetricIn([]int32{testMetricID2, testMetricID2 + 1})
 	args.SetMinHost(true)
 	args.SetMaxHost(true)

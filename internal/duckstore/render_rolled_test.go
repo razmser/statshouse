@@ -591,3 +591,68 @@ func TestRenderTagValuesPartiallyConsumedGenerationCountedOnce(t *testing.T) {
 	require.Equal(t, []int64{11, 12}, resp.Tag)
 	require.Equal(t, []float64{12, 6}, resp.Count)
 }
+
+// TestCoarseTiersServeFrom1sOnlyDelta proves the derived read end to end:
+// a store whose every generation holds 1s rows alone — an unconsumed rolled
+// one plus the active one — answers 1m- and 1h-tier series and tag-values
+// queries, the buckets folded from raw, unaligned seconds, each row counted
+// exactly once across the two generations, with the partial leading bucket
+// of an unaligned range excluded exactly as the retired per-tier tables'
+// stored bucket times excluded it.
+func TestCoarseTiersServeFrom1sOnlyDelta(t *testing.T) {
+	s, w := newTestWriter(t)
+	b1 := (writerNowUnix - 7200) / 3600 * 3600 // hour-aligned, so the 1h tier reads one bucket
+
+	// generation 0: two rows sharing one minute at different seconds, one
+	// row in the next minute
+	require.NoError(t, w.WriteRound(context.Background(), []Row{
+		{Metric: testMetricID, Time: uint32(b1 + 5), Tags: tag0(11), Count: 2},
+		{Metric: testMetricID, Time: uint32(b1 + 47), Tags: tag0(11), Count: 3},
+		{Metric: testMetricID, Time: uint32(b1 + 65), Tags: tag0(12), Count: 4},
+	}))
+	gen := s.ActiveDeltaGeneration()
+	require.NoError(t, s.RollGeneration())
+	// the active generation contributes its own minute
+	require.NoError(t, w.WriteRound(context.Background(), []Row{
+		{Metric: testMetricID, Time: uint32(b1 + 125), Tags: tag0(11), Count: 5},
+	}))
+
+	// the premise: no generation carries a coarser-tier table
+	var coarse int
+	require.NoError(t, s.Delta().QueryRow(
+		`SELECT count(*) FROM duckdb_tables() WHERE table_name IN ('s1m', 's1h')`).Scan(&coarse))
+	require.Zero(t, coarse)
+	rolled, err := openStoreFile(filepath.Join(s.cfg.Dir, deltaFileName(gen)), true, ResourcesConfig{})
+	require.NoError(t, err)
+	require.NoError(t, rolled.QueryRow(
+		`SELECT count(*) FROM duckdb_tables() WHERE table_name IN ('s1m', 's1h')`).Scan(&coarse))
+	require.NoError(t, rolled.Close())
+	require.Zero(t, coarse)
+
+	what := []int32{int32(data_model.DigestCount)}
+
+	// 1m tier over the full range: minute buckets folded from raw seconds,
+	// the rolled generation and the active one contributing side by side
+	r := renderSeriesSorted(t, s, 1, seriesReq(testMetricID, twoMappedKinds, what, []int32{0}, b1, b1+180, 60))
+	require.Equal(t, []int64{b1, b1 + 60, b1 + 120}, r.time)
+	require.Equal(t, []int64{11, 12, 11}, r.tags[0])
+	require.Equal(t, []float64{5, 4, 5}, r.count, "seconds 5 and 47 fold into their minute, the rolled and active generations each contribute their own")
+
+	// an unaligned range drops the partial leading minute — the bucket the
+	// retired s1m table's stored time would have filtered out the same way
+	r = renderSeriesSorted(t, s, 1, seriesReq(testMetricID, twoMappedKinds, what, []int32{0}, b1+10, b1+130, 60))
+	require.Equal(t, []int64{b1 + 60, b1 + 120}, r.time)
+	require.Equal(t, []float64{4, 5}, r.count)
+
+	// 1h tier: the whole hour folds into one bucket per tag group
+	r = renderSeriesSorted(t, s, 1, seriesReq(testMetricID, twoMappedKinds, what, []int32{0}, b1, b1+3600, 3600))
+	require.Equal(t, []int64{b1, b1}, r.time)
+	require.Equal(t, []int64{11, 12}, r.tags[0])
+	require.Equal(t, []float64{10, 4}, r.count, "every row of both generations folds into the hour bucket")
+
+	// tag values through the derived 1m view: counts per tag value, the
+	// deterministic count-DESC order
+	tv := renderTagValues(t, s, tagValuesReq(testMetricID, twoMappedKinds, 0, b1, b1+180, 60))
+	require.Equal(t, []int64{11, 12}, tv.Tag)
+	require.Equal(t, []float64{10, 4}, tv.Count)
+}

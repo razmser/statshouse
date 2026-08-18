@@ -424,6 +424,20 @@ func expectedRows(t *testing.T, db *sql.DB, tier string) map[decodedKey]*decoded
 	return decodeRows(t, scanTableRows(t, db, tierTables[tier]))
 }
 
+// floorRowsToTier returns the rows with time truncated to the tier's
+// interval — the derivation the coarser tiers are over the delta's 1s rows,
+// applied to the reference read so it can stand in for the retired per-tier
+// tables.
+func floorRowsToTier(rows []rawRow, tier string) []rawRow {
+	secs := tierSeconds[tier]
+	floored := make([]rawRow, len(rows))
+	for i, r := range rows {
+		r.time = r.time - r.time%secs
+		floored[i] = r
+	}
+	return floored
+}
+
 // TestCompactionCollapseMatchesUncollapsedRead proves the load-bearing
 // property: a collapsed archive window decodes to exactly what the uncollapsed
 // delta rows decoded to — every partial row counted once, hosts resolved by
@@ -432,10 +446,14 @@ func TestCompactionCollapseMatchesUncollapsedRead(t *testing.T) {
 	s, w := newTestWriter(t)
 	writeCollapseFixture(t, s, w)
 
-	// the uncollapsed reference, read off the delta before anything moves
+	// the uncollapsed reference, read off the delta's 1s rows before
+	// anything moves: the 1s tier as stored, the coarser tiers the same rows
+	// floored to their buckets — exactly what the retired per-tier tables
+	// held and what compaction must now derive
 	want := map[string]map[decodedKey]*decodedGroup{}
+	raw := scanTableRows(t, s.Delta(), tierTables[Tier1s])
 	for _, tier := range tiers {
-		want[tier] = expectedRows(t, s.Delta(), tier)
+		want[tier] = decodeRows(t, floorRowsToTier(raw, tier))
 	}
 	// golden spot checks on the 1s tier
 	ts := int64(writerNow.Unix() - 5)
@@ -988,19 +1006,45 @@ func goldenReferenceConsume(t *testing.T, s *Store, gen int64) {
 	require.True(t, s.unlinkDelta(deltaPath, gen), "the reference consume must finish like the real one")
 }
 
+// backfillRetiredTierTables rebuilds, in a delta the current 1s-only writer
+// produced, the coarser-tier tables the retired writer appended — each tier's
+// rows derived from the 1s ones, landing in the same physical order that
+// path's per-tier appends did — so the retired reference consume can run
+// against the pre-derivation layout and its output stays the byte-identity
+// reference for the derived path.
+func backfillRetiredTierTables(t *testing.T, deltaPath string) {
+	t.Helper()
+	db, err := openStoreFile(deltaPath, false, ResourcesConfig{})
+	require.NoError(t, err)
+	defer func() { _ = db.Close() }()
+	for _, tier := range []string{Tier1m, Tier1h} {
+		_, err := db.Exec(tierTableDDL(tierTables[tier]))
+		require.NoError(t, err)
+		_, err = db.Exec(fmt.Sprintf("INSERT INTO %s SELECT %s FROM %s",
+			tierTables[tier], derivedTierSelect(tierTimeExpr(tier)), tierTables[Tier1s]))
+		require.NoError(t, err)
+	}
+}
+
 // TestCollapseSQLMatchesGoFoldReference pins the SQL-fold rewrite's byte
 // identity: the same golden generation consumed by the retired Go round-trip —
 // collapse SELECT, fold in Go, prepared-statement insert — and by the
 // production one-statement SQL fold (collapseInsert plus the fold UDFs)
 // produces window files holding the same rows — every column, the two
 // aggregate-state blobs included — in the same physical order, with the same
-// consumption records. This golden set is the reference Task 9 keeps
-// comparing against.
+// consumption records. The retired side runs over the delta backfilled to the
+// pre-derivation three-table layout, so this is also the Task-9 pin: the
+// production consume, reading the 1s table alone and deriving the coarse
+// buckets through the tier truncation, writes byte-identical 1m and 1h
+// archive rows to the old three-tier path.
 func TestCollapseSQLMatchesGoFoldReference(t *testing.T) {
 	refDir := t.TempDir()
 	seedGoldenGeneration(t, refDir)
 	sqlDir := t.TempDir()
 	copyTree(t, refDir, sqlDir)
+	// the reference side re-gains the retired layout; the production side
+	// stays 1s-only and must derive
+	backfillRetiredTierTables(t, filepath.Join(refDir, deltaFileName(0)))
 
 	ref, _ := openTestStore(t, refDir)
 	defer func() { _ = ref.Close() }()

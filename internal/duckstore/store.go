@@ -349,7 +349,7 @@ func (s *Store) openDeltas() error {
 		// never reused.
 		gen := maxSeen + 1
 		path := filepath.Join(s.cfg.Dir, deltaFileName(gen))
-		if err := createFile(path, allTierTables(), s.currentStamp(fileKindDelta), s.cfg.Resources); err != nil {
+		if err := createFile(path, deltaTables(), s.currentStamp(fileKindDelta), s.cfg.Resources); err != nil {
 			return fmt.Errorf("duck-store: %w", err)
 		}
 		deltas = append(deltas, gen)
@@ -700,6 +700,13 @@ func allTierTables() []string {
 		tables = append(tables, tierTables[tier])
 	}
 	return tables
+}
+
+// deltaTables is the table list a delta generation file carries: the 1s tier
+// alone (see DeltaSchemaVersion 5). The coarser tiers are derived views over
+// those 1s rows, never stored in a delta.
+func deltaTables() []string {
+	return []string{tierTables[Tier1s]}
 }
 
 func tierOrder(tier string) int {

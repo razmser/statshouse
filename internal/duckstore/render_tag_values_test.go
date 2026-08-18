@@ -379,6 +379,10 @@ func buildTagValuesSQLRetiredQualifiers(p *tagValuesPlan, sources []string) (*se
 // seam change: across the renderer's plan matrix and source counts, the
 // descriptor path emits the retired qualifier path's exact statement — same
 // text, same bound arguments in the same order.
+// The plans run at step 15 — the 1s tier, where the descriptor seam is
+// still SQL-neutral; the coarser tiers read the derived projection arm the
+// qualifier shape never had and are pinned by decoded answer in the
+// coarse-tier tests.
 func TestBuildTagValuesSQLDescriptorPathMatchesRetiredQualifiers(t *testing.T) {
 	b1 := (writerNowUnix - 7200) / 60 * 60
 	var re2 tlstatshouse.StoreTagFilter
@@ -389,27 +393,27 @@ func TestBuildTagValuesSQLDescriptorPathMatchesRetiredQualifiers(t *testing.T) {
 	values.SetValues([]string{"plain"})
 
 	plans := map[string]tlstatshouse.StoreQueryTagValues{
-		"values mode": tagValuesReq(testMetricID, twoMappedKinds, 0, b1, b1+120, 60),
+		"values mode": tagValuesReq(testMetricID, twoMappedKinds, 0, b1, b1+120, 15),
 		"ids only": func() tlstatshouse.StoreQueryTagValues {
-			q := tagValuesReq(testMetricID, twoMappedKinds, 0, b1, b1+120, 60)
+			q := tagValuesReq(testMetricID, twoMappedKinds, 0, b1, b1+120, 15)
 			q.SetIdsOnly(true)
 			return q
 		}(),
-		"raw64 tag": tagValuesReq(testMetricID, []int32{tagKindRaw64, tagKindRaw32}, 0, b1, b1+60, 60),
-		"raw32 tag": tagValuesReq(testMetricID, []int32{tagKindRaw64, tagKindRaw32}, 1, b1, b1+60, 60),
+		"raw64 tag": tagValuesReq(testMetricID, []int32{tagKindRaw64, tagKindRaw32}, 0, b1, b1+60, 15),
+		"raw32 tag": tagValuesReq(testMetricID, []int32{tagKindRaw64, tagKindRaw32}, 1, b1, b1+60, 15),
 		"filters": func() tlstatshouse.StoreQueryTagValues {
-			q := tagValuesReq(testMetricID, twoMappedKinds, 0, b1, b1+60, 60)
+			q := tagValuesReq(testMetricID, twoMappedKinds, 0, b1, b1+60, 15)
 			q.Base.FilterIn = []tlstatshouse.StoreTagFilter{re2}
 			q.Base.FilterNotIn = []tlstatshouse.StoreTagFilter{values}
 			return q
 		}(),
 		"metric in list": func() tlstatshouse.StoreQueryTagValues {
-			q := tagValuesReq(0, twoMappedKinds, 0, b1, b1+60, 60)
+			q := tagValuesReq(0, twoMappedKinds, 0, b1, b1+60, 15)
 			q.Base.SetMetricIn([]int32{testMetricID, testMetricID2})
 			return q
 		}(),
 		"row limit": func() tlstatshouse.StoreQueryTagValues {
-			q := tagValuesReq(testMetricID, twoMappedKinds, 0, b1, b1+120, 60)
+			q := tagValuesReq(testMetricID, twoMappedKinds, 0, b1, b1+120, 15)
 			q.Base.RowLimit = 5
 			return q
 		}(),
@@ -447,7 +451,7 @@ func TestRenderTagValuesDescriptorPathMatchesRetiredPath(t *testing.T) {
 	require.NotEmpty(t, s.Windows())
 
 	now := writerNowUnix
-	args := tagValuesReq(0, twoMappedKinds, 0, now-7200, now+60, 60)
+	args := tagValuesReq(0, twoMappedKinds, 0, now-7200, now+60, 15)
 	args.Base.SetMetricIn([]int32{testMetricID2, testMetricID2 + 1})
 	p, err := planTagValuesQuery(args)
 	require.NoError(t, err)

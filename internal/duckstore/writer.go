@@ -91,10 +91,11 @@ type WriterConfig struct {
 	// storage failure would. It exists for tests; production leaves it nil.
 	FlushFault func(round int64) error
 
-	// FlushTierFault, when set, is consulted before each tier's flush inside
-	// the round transaction; a non-nil error skips that flush and fails the
-	// round mid-way, standing in for a storage failure that lands between the
-	// tiers' commits. It exists for tests; production leaves it nil.
+	// FlushTierFault, when set, is consulted before the 1s appender's flush
+	// inside the round transaction; a non-nil error skips that flush and fails
+	// the round mid-way, standing in for a storage failure that lands between
+	// the append and the commit. It exists for tests; production leaves it
+	// nil.
 	FlushTierFault func(round int64, tier string) error
 }
 
@@ -112,19 +113,22 @@ type writeRequest struct {
 var errWriterClosed = errors.New("duck-store: writer is closed")
 
 // Writer is the delta file's single writer: one goroutine through which every
-// insert round passes, holding one Appender per tier table on one dedicated
+// insert round passes, holding the 1s tier table's Appender on one dedicated
 // connection to the active delta generation. No sorting, no dedup and no
-// fan-out happen here — rows land in conveyor order, all three tiers per row,
-// and read-time GROUP BY remains the correctness mechanism.
+// fan-out happen here — rows land in conveyor order, once each in the 1s
+// table, and read-time GROUP BY remains the correctness mechanism. The coarser
+// tiers are derived views over these 1s rows: compaction folds them out at
+// consumption and queries project them on the read (see tierTimeExpr), so the
+// writer never appends a row twice.
 //
 // Every round runs inside one explicit transaction on the writer's connection:
-// appender flushes join it (verified against duckdb-go), so the three tier
-// writes commit — and fsync the write-ahead log — together at COMMIT. A failed
-// round rolls back and has written nothing, which is what makes the conveyor's
+// the appender's flush joins it (verified against duckdb-go), so the round's
+// rows commit — and fsync the write-ahead log — at COMMIT. A failed round
+// rolls back and has written nothing, which is what makes the conveyor's
 // at-least-once resend safe: an acknowledged round is durable exactly when
-// ClickHouse's 200 made it durable, and a failed one is absent from all three
-// tiers, never just some of them (a partial round would double-count counts
-// and sums once the conveyor retries it).
+// ClickHouse's 200 made it durable, and a failed one is absent from the delta
+// entirely (a partial round would double-count counts and sums once the
+// conveyor retries it).
 type Writer struct {
 	cfg WriterConfig
 
@@ -292,11 +296,11 @@ func (w *Writer) switchDelta(db *sql.DB) error {
 	return nil
 }
 
-// writeRound appends every guard-passing row to all three tier appenders and
-// commits them as one transaction, so a round is either entirely in the delta
-// or entirely absent from it — the atomicity ClickHouse gets from a single
-// INSERT, and what makes the conveyor's at-least-once resend of a failed round
-// safe. Runs on the writer goroutine only.
+// writeRound appends every guard-passing row to the 1s tier appender and
+// commits the round as one transaction, so a round is either entirely in the
+// delta or entirely absent from it — the atomicity ClickHouse gets from a
+// single INSERT, and what makes the conveyor's at-least-once resend of a
+// failed round safe. Runs on the writer goroutine only.
 func (w *Writer) writeRound(ctx context.Context, rows []Row) error {
 	if err := w.ensureAppenders(); err != nil {
 		return err
@@ -307,8 +311,8 @@ func (w *Writer) writeRound(ctx context.Context, rows []Row) error {
 			return fmt.Errorf("duck-store: round %d failed: %w", w.round, err)
 		}
 	}
-	// Appender flushes join the connection's open transaction (the tx-probe
-	// test pins this), so no tier can commit without the others. The rollbacks
+	// The appender's flush joins the connection's open transaction (the
+	// tx-probe test pins this), so the round cannot partially commit. The rollbacks
 	// below run on a background context by necessity — the round's own context
 	// may be exactly what died — and are best-effort: a connection too broken
 	// to roll back fails the next round's BEGIN too, so the store stays loud
@@ -329,27 +333,25 @@ func (w *Writer) writeRound(ctx context.Context, rows []Row) error {
 		if !withinIngestGuard(int64(r.Time), nowUnix) {
 			continue // older than the historic window or far future: unplaceable
 		}
-		for _, tier := range tiers {
-			if err := w.appendTierRow(tier, r); err != nil {
-				rollback() // a failed appender is invalidated; recreate next round
-				return fmt.Errorf("duck-store: append %s row (metric %d, time %d): %w", tier, r.Metric, r.Time, err)
-			}
+		if err := w.appendTierRow(Tier1s, r); err != nil {
+			rollback() // a failed appender is invalidated; recreate next round
+			return fmt.Errorf("duck-store: append %s row (metric %d, time %d): %w", Tier1s, r.Metric, r.Time, err)
 		}
 	}
-	for _, tier := range tiers {
+	{
 		if w.cfg.FlushTierFault != nil {
-			if err := w.cfg.FlushTierFault(w.round, tier); err != nil {
+			if err := w.cfg.FlushTierFault(w.round, Tier1s); err != nil {
 				rollback()
-				return fmt.Errorf("duck-store: flush %s: %w", tier, err)
+				return fmt.Errorf("duck-store: flush %s: %w", Tier1s, err)
 			}
 		}
-		if err := w.appenders[tier].FlushWithCancel(ctx); err != nil {
+		if err := w.appenders[Tier1s].FlushWithCancel(ctx); err != nil {
 			rollback() // the appender is invalidated; recreate next round
-			return fmt.Errorf("duck-store: flush %s: %w", tier, err)
+			return fmt.Errorf("duck-store: flush %s: %w", Tier1s, err)
 		}
 	}
-	// COMMIT is the durability point of the whole write path: it makes all
-	// three tiers' rows visible together and fsyncs the delta's WAL.
+	// COMMIT is the durability point of the whole write path: it makes the
+	// round's rows visible and fsyncs the delta's WAL.
 	if _, err := w.conn.ExecContext(context.Background(), "COMMIT"); err != nil {
 		rollback()
 		return fmt.Errorf("duck-store: commit round %d: %w", w.round, err)
@@ -364,9 +366,11 @@ func withinIngestGuard(rowTime, nowUnix int64) bool {
 	return rowTime >= nowUnix-ingestGuardOldSecs && rowTime < nowUnix+ingestGuardFutureSecs
 }
 
-// appendTierRow appends one row to the tier's appender with time truncated to
-// the tier interval, mapping every tag pair the way the RowBinary encoder
-// does: a non-zero id wins and its string half stays empty.
+// appendTierRow appends one row to the 1s appender — the truncation to the
+// tier interval is the identity there, kept so the derivation the coarser
+// tiers read (tierTimeExpr) stays the exact floor of the stored seconds —
+// mapping every tag pair the way the RowBinary encoder does: a non-zero id
+// wins and its string half stays empty.
 func (w *Writer) appendTierRow(tier string, r *Row) error {
 	a := w.appenders[tier]
 	secs := int64(tierSeconds[tier])
@@ -404,12 +408,12 @@ func tagColumnValues(id int32, s string) (int64, string) {
 	return 0, s
 }
 
-// ensureAppenders (re)creates the tier appenders on the writer's dedicated
-// connection when none survive. A failed append or flush invalidates a DuckDB
-// appender, so failures drop the whole set and the next round starts from
-// fresh ones; creation is cheap, and the set is always complete or empty.
+// ensureAppenders (re)creates the 1s appender on the writer's dedicated
+// connection when none survives. A failed append or flush invalidates a DuckDB
+// appender, so failures drop it and the next round starts from a fresh one;
+// creation is cheap, and the appender is always present or absent.
 func (w *Writer) ensureAppenders() error {
-	if len(w.appenders) == len(tiers) {
+	if len(w.appenders) == 1 {
 		return nil
 	}
 	w.dropAppenders()
@@ -421,27 +425,23 @@ func (w *Writer) ensureAppenders() error {
 	return nil
 }
 
-// createTierAppenders builds one appender per tier table on conn.
+// createTierAppenders builds the 1s tier table's appender on conn — the one
+// table a delta carries.
 func createTierAppenders(conn *sql.Conn) (map[string]*duckdb.Appender, error) {
-	appenders := make(map[string]*duckdb.Appender, len(tiers))
-	for _, tier := range tiers {
-		var a *duckdb.Appender
-		err := conn.Raw(func(c any) error {
-			created, err := duckdb.NewAppender(c.(driver.Conn), "", "", tierTables[tier])
-			if err != nil {
-				return err
-			}
-			a = created
-			return nil
-		})
+	appenders := make(map[string]*duckdb.Appender, 1)
+	var a *duckdb.Appender
+	err := conn.Raw(func(c any) error {
+		created, err := duckdb.NewAppender(c.(driver.Conn), "", "", tierTables[Tier1s])
 		if err != nil {
-			for _, x := range appenders {
-				_ = x.CloseWithCancel(context.Background())
-			}
-			return nil, fmt.Errorf("duck-store: create %s appender: %w", tier, err)
+			return err
 		}
-		appenders[tier] = a
+		a = created
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("duck-store: create %s appender: %w", Tier1s, err)
 	}
+	appenders[Tier1s] = a
 	return appenders, nil
 }
 

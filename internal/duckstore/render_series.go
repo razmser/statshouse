@@ -293,6 +293,23 @@ func (q *queryParams) param(v any) string {
 	return fmt.Sprintf("$%d", len(q.args))
 }
 
+// sourceArm builds one source's arm of the UNION ALL the read folds: the
+// plain star over the source's own time column when the stored time is the
+// tier's own bucket — every 1s-tier and archive-window arm, byte-identical to
+// the retired qualifier-per-source path — and, for a delta arm serving a
+// coarser tier, every column with the tier's truncation projected AS time and
+// the same expression doing the range filtering, so an unaligned range never
+// keeps a partial leading bucket nor drops a trailing one.
+func (q *queryParams) sourceArm(src querySource) string {
+	if src.timeExpr == "" {
+		return "SELECT * FROM " + src.tableRef() +
+			" WHERE time >= " + q.rangeParam(src.from) + " AND time < " + q.rangeParam(src.to)
+	}
+	return "SELECT " + derivedTierSelect(src.timeExpr) + " FROM " + src.tableRef() +
+		" WHERE " + src.timeExpr + " >= " + q.rangeParam(src.from) +
+		" AND " + src.timeExpr + " < " + q.rangeParam(src.to)
+}
+
 func (q *queryParams) rangeParam(v int64) string {
 	if ph, ok := q.ranges[v]; ok {
 		return ph
@@ -401,8 +418,7 @@ func buildSeriesSQL(p *seriesPlan, sources []querySource) (*seriesQuerySQL, erro
 
 	var arms []string
 	for _, src := range sources {
-		arms = append(arms, "SELECT * FROM "+src.tableRef()+
-			" WHERE time >= "+qp.rangeParam(src.from)+" AND time < "+qp.rangeParam(src.to))
+		arms = append(arms, qp.sourceArm(src))
 	}
 
 	where, err := p.where(param)
@@ -744,14 +760,21 @@ func (s *Store) serveQuerySources(ctx context.Context, snap *querySnapshot, tier
 		}
 	}
 
+	// The active delta serves the tier's buckets out of its 1s rows through
+	// the truncation; the 1s tier itself reads the plain time column.
+	active := querySource{
+		kind: fileKindDelta,
+		gen:  snap.gen,
+		from: from,
+		to:   to,
+	}
+	if tier == Tier1s {
+		active.table = tierTables[Tier1s]
+	} else {
+		active.table, active.timeExpr = tierTables[Tier1s], tierTimeExpr(tier)
+	}
 	sources := make([]querySource, 0, len(snap.windows)+1)
-	sources = append(sources, querySource{
-		kind:  fileKindDelta,
-		gen:   snap.gen,
-		table: TierTable(tier),
-		from:  from,
-		to:    to,
-	})
+	sources = append(sources, active)
 	sources = append(sources, snap.rolledSources(tier, from, to)...)
 	for i := range snap.windows {
 		sources = append(sources, snap.windows[i].src)

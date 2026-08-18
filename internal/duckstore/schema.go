@@ -34,8 +34,10 @@ import (
 //	   (the axes split here; from now on a delta-only change bumps only
 //	   DeltaSchemaVersion and an archive-only change only
 //	   ArchiveSchemaVersion)
+//	5 (delta axis): delta generations hold the 1s tier table only; the
+//	   coarser tiers derive from it at compaction and read time
 const (
-	DeltaSchemaVersion   = 4
+	DeltaSchemaVersion   = 5
 	ArchiveSchemaVersion = 4
 )
 
@@ -104,8 +106,10 @@ const SealedTableDDL = "CREATE TABLE IF NOT EXISTS " + SealedTable + " (" +
 	"sealed BOOLEAN NOT NULL)"
 
 // Tier names, used both as archive file-name prefixes and to map a tier to its
-// table. Delta files hold all three tier tables; an archive window file holds
-// exactly one.
+// table. A delta generation holds the 1s tier table alone — the writer appends
+// each row once and the coarser tiers derive from those 1s rows at compaction
+// and read time (see tierTimeExpr); an archive window file holds exactly the
+// one table of its tier.
 const (
 	Tier1s = "1s"
 	Tier1m = "1m"
@@ -125,6 +129,58 @@ var tierSeconds = map[string]int64{
 	Tier1s: 1,
 	Tier1m: 60,
 	Tier1h: 3600,
+}
+
+// tierColumns is the tier tables' column list in DDL order — the shape every
+// whole-row projection enumerates when it must substitute one column, which
+// SELECT * cannot express.
+var tierColumns = func() []string {
+	cols := []string{"metric", "time"}
+	for i := 0; i < format.MaxTags; i++ {
+		cols = append(cols, fmt.Sprintf("tag%d", i), fmt.Sprintf("stag%d", i))
+	}
+	return append(cols,
+		"count", "min", "max", "max_count", "sum", "sumsquare",
+		"min_host", "min_shost", "min_host_value",
+		"max_host", "max_shost", "max_host_value",
+		"max_count_host", "max_count_shost", "max_count_host_value",
+		"percentiles", "uniq_state")
+}()
+
+// tierTimeExpr returns the SQL expression over a 1s-tier time column that
+// yields the tier's own bucket start: the plain column for 1s, the floor
+// truncation for the coarser tiers (times are unix seconds and never
+// negative, so the floor and Go's truncation toward zero agree). Because
+// every window length is a whole multiple of its tier's seconds, truncating
+// to the tier first never moves a row across a window edge — the derived
+// bucket is exactly the one the old per-tier tables held, so deriving the
+// coarse tiers from the 1s rows loses nothing.
+func tierTimeExpr(tier string) string {
+	if tier == Tier1s {
+		return "time"
+	}
+	return fmt.Sprintf("time - time %% %d", tierSeconds[tier])
+}
+
+// derivedTierSelect returns the tier tables' whole-row select list with time
+// read through expr: the star when expr is the time column itself — keeping
+// every 1s-tier and archive statement byte-identical — else every column
+// with the expression projected AS time. Whatever filters rows must use the
+// same expression too, or an unaligned range would keep partial leading
+// buckets and drop trailing ones.
+func derivedTierSelect(expr string) string {
+	if expr == "time" {
+		return "*"
+	}
+	parts := make([]string, 0, len(tierColumns))
+	for _, c := range tierColumns {
+		if c == "time" {
+			parts = append(parts, expr+" AS time")
+			continue
+		}
+		parts = append(parts, c)
+	}
+	return strings.Join(parts, ", ")
 }
 
 // TierTable returns the table name a tier is stored in.

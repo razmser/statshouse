@@ -85,9 +85,10 @@ func sinkTierCount(t *testing.T, s *duckstore.Store, tier string, metric int32) 
 
 // TestDuckSinkRoundLandsInStore drives one append/send cycle end to end and
 // checks the conversion: the resolved row's tags, string top, hosts, aggregate
-// states and aggregates must land decoded in the store, in all three tiers with time
-// truncated, and the per-row size accounting must match the ClickHouse
-// encoder's.
+// states and aggregates must land decoded in the store — once, in the delta's
+// 1s table at its raw second, with no coarser-tier table in the file (those
+// tiers derive at compaction and read time) — and the per-row size accounting
+// must match the ClickHouse encoder's.
 func TestDuckSinkRoundLandsInStore(t *testing.T) {
 	s, sink := newTestDuckSink(t, duckstore.WriterConfig{})
 	ts := uint32(sinkNowUnix - 37) // inside the guard, second 63 of its minute
@@ -101,22 +102,18 @@ func TestDuckSinkRoundLandsInStore(t *testing.T) {
 	require.Equal(t, http.StatusOK, status)
 	require.Zero(t, exception)
 
-	// all three tiers, each with its own time truncation
-	for _, tc := range []struct {
-		tier   string
-		wantTS int64
-	}{
-		{duckstore.Tier1s, int64(ts)},
-		{duckstore.Tier1m, int64(ts) / 60 * 60},
-		{duckstore.Tier1h, int64(ts) / 3600 * 3600},
-	} {
-		require.Equal(t, 1, sinkTierCount(t, s, tc.tier, sinkTestMetricID), "%s must hold the row", tc.tier)
-		var gotTS int64
-		require.NoError(t, s.Delta().QueryRow(
-			fmt.Sprintf(`SELECT time FROM %s WHERE metric = $1`, duckstore.TierTable(tc.tier)),
-			sinkTestMetricID).Scan(&gotTS))
-		require.EqualValues(t, tc.wantTS, gotTS, "%s time must be truncated to the tier", tc.tier)
-	}
+	// the row lands once, at its raw second, and no coarser-tier table
+	// exists in the delta
+	require.Equal(t, 1, sinkTierCount(t, s, duckstore.Tier1s, sinkTestMetricID), "the 1s tier must hold the row")
+	var gotTS int64
+	require.NoError(t, s.Delta().QueryRow(
+		fmt.Sprintf(`SELECT time FROM %s WHERE metric = $1`, duckstore.TierTable(duckstore.Tier1s)),
+		sinkTestMetricID).Scan(&gotTS))
+	require.EqualValues(t, ts, gotTS, "1s time is the row's own second")
+	var coarse int
+	require.NoError(t, s.Delta().QueryRow(
+		`SELECT count(*) FROM duckdb_tables() WHERE table_name IN ('s1m', 's1h')`).Scan(&coarse))
+	require.Zero(t, coarse, "the delta must hold the 1s table alone")
 
 	// the conversion: tags in both encodings, the string top in slot 47, and
 	// an id with a string keeping only its id half

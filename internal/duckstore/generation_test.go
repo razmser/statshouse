@@ -135,7 +135,8 @@ type consumeTotals struct {
 // archive windows, rolls to generation 1 and writes one row there, then
 // closes everything — the on-disk state a process that died after the roll
 // leaves. It returns the totals every metric must reach, identical in each
-// tier because every row lands in all three.
+// tier because the coarser tiers derive from the very 1s rows the delta
+// holds.
 func writeConsumeFixture(t *testing.T, dir string) map[string]consumeTotals {
 	t.Helper()
 	s, _ := openTestStore(t, dir)
@@ -180,7 +181,10 @@ func writeConsumeFixture(t *testing.T, dir string) map[string]consumeTotals {
 func readerTotals(t *testing.T, s *Store) map[string]consumeTotals {
 	t.Helper()
 	got := map[string]consumeTotals{}
-	add := func(db *sql.DB, table string) {
+	// add folds one table's per-metric totals into got under keyTable —
+	// which differs from the queried table for the delta, whose 1s rows
+	// stand in for every tier's derived view.
+	add := func(db *sql.DB, table, keyTable string) {
 		rows, err := db.Query(fmt.Sprintf(
 			`SELECT metric, sum(count), sum(sum), min(min), max(max), sum(sumsquare) FROM %s GROUP BY metric`, table))
 		require.NoError(t, err)
@@ -189,7 +193,7 @@ func readerTotals(t *testing.T, s *Store) map[string]consumeTotals {
 			var m int32
 			var tt consumeTotals
 			require.NoError(t, rows.Scan(&m, &tt.count, &tt.sum, &tt.min, &tt.max, &tt.sumsquare))
-			key := fmt.Sprintf("%s/%d", table, m)
+			key := fmt.Sprintf("%s/%d", keyTable, m)
 			all := got[key]
 			all.count += tt.count
 			all.sum += tt.sum
@@ -205,14 +209,16 @@ func readerTotals(t *testing.T, s *Store) map[string]consumeTotals {
 		require.NoError(t, rows.Err())
 	}
 	// the active generation is read through the store's own handle: DuckDB
-	// refuses a read-only open of a file the process already holds read-write
+	// refuses a read-only open of a file the process already holds
+	// read-write. The delta holds 1s rows alone, so its totals join every
+	// tier's key — the derived view is exactly those rows.
 	for _, tier := range tiers {
-		add(s.Delta(), tierTables[tier])
+		add(s.Delta(), tierTables[Tier1s], tierTables[tier])
 	}
 	for _, wf := range s.Windows() {
 		db, err := openStoreFile(wf.Path, true, ResourcesConfig{})
 		require.NoError(t, err)
-		add(db, tierTables[wf.Tier])
+		add(db, tierTables[wf.Tier], tierTables[wf.Tier])
 		require.NoError(t, db.Close())
 	}
 	return got
@@ -446,4 +452,46 @@ func TestConsumeGenerationSealedWindowDropsAndCompletes(t *testing.T) {
 	}
 	require.Len(t, errors, 1)
 	require.Contains(t, errors[0], "is sealed")
+}
+
+// TestGenerationWindowsDerivesEveryTierFrom1sRows pins the Task-9 plan
+// derivation: a delta holding 1s rows alone plans the same archive windows
+// the retired three-table delta planned, every tier's starts floored from the
+// raw seconds. The seconds straddle each tier's own boundaries independently
+// — two seconds in different 1s windows but one 1m window, two straddling a
+// 1m boundary inside one 1h window, and a pair across a 1h boundary — and
+// the expected starts are spelled out, not recomputed.
+func TestGenerationWindowsDerivesEveryTierFrom1sRows(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, deltaFileName(0))
+	seconds := []int64{
+		3700, 7300, // different 1s windows, one 1m window
+		86340, 86460, // different 1m windows, one 1h window
+		2588400, 2592001, // different 1h windows
+	}
+	createTestFile(t, path, deltaTables(), currentTestStamp(t, fileKindDelta), func(db *sql.DB) {
+		for _, ts := range seconds {
+			_, err := db.Exec(`INSERT INTO s1 (metric, time, count) VALUES ($1, $2, 1)`, int32(1), ts)
+			require.NoError(t, err)
+		}
+	})
+
+	windows, err := generationWindows(path, ResourcesConfig{})
+	require.NoError(t, err)
+
+	want := map[windowKey]struct{}{}
+	for _, k := range []windowKey{
+		// 1s tier: one window per hour the seconds touch
+		{Tier1s, 3600}, {Tier1s, 7200}, {Tier1s, 82800}, {Tier1s, 86400},
+		{Tier1s, 2588400}, {Tier1s, 2592000},
+		// 1m tier: the day windows — the first four seconds share one day,
+		// the boundary pair splits it
+		{Tier1m, 0}, {Tier1m, 86400}, {Tier1m, 2505600}, {Tier1m, 2592000},
+		// 1h tier: everything before the last second sits in the first
+		// 30-day window
+		{Tier1h, 0}, {Tier1h, 2592000},
+	} {
+		want[k] = struct{}{}
+	}
+	require.Equal(t, want, windows, "the derived plan must be the retired three-table plan")
 }
