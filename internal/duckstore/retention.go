@@ -91,9 +91,9 @@ type RetentionConfig struct {
 }
 
 // Retainer drives a store's retention passes. It is one goroutine whose every
-// touch on a window file goes through the archive maintenance lock — which
-// ingestion never takes — so retention runs at lowest priority and can never
-// delay an insert round.
+// touch on a window file goes through that window's own maintenance lock —
+// which ingestion never takes — so retention runs at lowest priority and can
+// never delay an insert round.
 type Retainer struct {
 	store *Store
 	cfg   RetentionConfig
@@ -282,13 +282,26 @@ func windowExpired(tier string, windowStart, nowUnix int64, retention time.Durat
 // not deferred here — while a reader holds a lease on the window
 // (ErrWindowLeased), and is a no-op for a window that is not served
 // (ErrWindowNotServed). It serializes against compaction's appends and the
-// sealer's rewrite of the same file, so a window never disappears between a
-// transaction's open and its commit.
+// sealer's rewrite of the same file through the window's own write lock
+// (window_locks.go), so a window never disappears between a transaction's
+// open and its commit — and dropping one window no longer fences maintenance
+// of every other.
+//
+// A successful unlink takes the window's consumption records with it — an
+// entry in s.consumed claims the archive holds generations a removed file no
+// longer does — and leaves a tombstone in s.evicted in their place. That is
+// what keeps an absent s.consumed entry meaning "never consumed": the
+// consumed-then-evicted case is distinguishable for the readers that will
+// resolve serving boundaries from it, where re-serving a dropped window's
+// rows and dropping them for good are different decisions. Nothing on disk
+// records an eviction, so an open rebuilds only the served windows' records
+// and the tombstone set starts empty — the same information a restart has,
+// which is why nothing may treat the tombstone as durable.
 func (s *Store) DropWindow(tier string, windowStart int64) error {
-	s.archiveMu.Lock()
-	defer s.archiveMu.Unlock()
-
 	k := windowKey{tier: tier, start: windowStart}
+	unlock := s.lockWindowWrite(k)
+	defer unlock()
+
 	s.mu.Lock()
 	idx := -1
 	for i := range s.windows {
@@ -310,11 +323,12 @@ func (s *Store) DropWindow(tier string, windowStart int64) error {
 	// fails.
 	wf := s.windows[idx]
 	s.windows = append(s.windows[:idx], s.windows[idx+1:]...)
-	delete(s.consumed, k)
 	s.mu.Unlock()
 
 	if err := os.Remove(wf.Path); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		// the file stays, so the window keeps serving; the next pass retries
+		// the file stays, so the window keeps serving — with its consumption
+		// records, which the unlink never touched: the delete below runs only
+		// after a successful one. The next pass retries the drop.
 		s.mu.Lock()
 		s.windows = append(s.windows, wf)
 		sort.Slice(s.windows, func(i, j int) bool { return lessWindow(s.windows[i], s.windows[j]) })
@@ -322,6 +336,15 @@ func (s *Store) DropWindow(tier string, windowStart int64) error {
 		return fmt.Errorf("duck-store: unlink %s: %w", wf.Path, err)
 	}
 	_ = os.Remove(wf.Path + ".wal")
+
+	s.mu.Lock()
+	delete(s.consumed, k)
+	s.evicted[k] = struct{}{}
+	s.mu.Unlock()
+	// The window the entry guarded is gone; later fetches must not serialize
+	// against stale holders forever, but the entry itself stays until its
+	// references drain (window_locks.go).
+	s.windowLocks.retire(k)
 	return nil
 }
 

@@ -195,10 +195,9 @@ const DefaultLivenessSamplerInterval = DefaultCompactorInterval
 // immediately and then once per interval until ctx is done. It returns nil
 // when ctx is done; a rec of nil records nothing and still respects the
 // protocol, so callers need not special-case it. It is a loop separate from
-// RunSizeSampler on purpose: the size sample takes the store's archive
-// maintenance lock, so the sampler meant to reveal a stuck compaction would
-// itself hang on that compaction — liveness must read nothing a pass can
-// hold.
+// RunSizeSampler on purpose: the size sample takes window read locks, so the
+// sampler meant to reveal a stuck compaction would itself hang on that
+// compaction — liveness must read nothing a pass can hold.
 func RunLivenessSampler(ctx context.Context, s *Store, maintenance []MaintenanceLiveness, rec MetricsRecorder, interval time.Duration) error {
 	if interval <= 0 {
 		interval = DefaultLivenessSamplerInterval
@@ -271,16 +270,20 @@ func (s *Store) SampleStoreSize(rec MetricsRecorder) {
 	}
 
 	// Archive windows are opened read-only exactly where queries attach them:
-	// under the archive maintenance lock shared, so a probe never overlaps
-	// the sealer's read-write open of the same file.
-	s.archiveMu.RLock()
+	// under the window's own read lock (window_locks.go), so a probe never
+	// overlaps the sealer's read-write open of the same file — and a stuck
+	// pass on one window no longer stalls the size sample of every other.
+	// The served list is a snapshot; a window dropped after its entry was
+	// copied simply fails its probe and is skipped, like an unlinked or
+	// quarantined one.
 	for _, wf := range s.Windows() {
+		unlock := s.lockWindowRead(windowKey{tier: wf.Tier, start: wf.WindowStart})
 		used, free, err := probeFileSize(wf.Path, s.cfg.Resources)
+		unlock()
 		if err == nil {
 			archive[0], archive[1] = archive[0]+used, archive[1]+free
 		}
 	}
-	s.archiveMu.RUnlock()
 
 	rec.StoreSize(SizeDelta, delta[0], delta[1])
 	rec.StoreSize(SizeArchive, archive[0], archive[1])

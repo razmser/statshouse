@@ -511,12 +511,15 @@ func TestRunSizeSamplerSamplesImmediatelyAndStops(t *testing.T) {
 
 // TestLivenessSamplerEmitsWhileWindowLockHeld is the direct regression test
 // for the blind spot the load test hit: the size sampler hangs on the very
-// compaction it is meant to observe, because SampleStoreSize takes the store's
-// archive maintenance lock while it walks the windows. The liveness sampler
-// must keep emitting while that lock is held the way a stuck pass holds it —
-// its backlog read touches in-memory state only.
+// compaction it is meant to observe, because SampleStoreSize takes window
+// read locks while it walks the windows. The liveness sampler must keep
+// emitting while those locks are held the way a stuck pass holds them — its
+// backlog read touches in-memory state only.
 func TestLivenessSamplerEmitsWhileWindowLockHeld(t *testing.T) {
-	s, _ := newTestWriter(t)
+	dir := t.TempDir()
+	writeConsumeFixture(t, dir)
+	s, _ := openTestStore(t, dir)
+	require.NoError(t, s.ConsumeGeneration(context.Background(), 0, ConsumeOptions{}))
 	m := &recordingMetrics{}
 	liveness := []MaintenanceLiveness{{Kind: MaintenanceCompaction, SinceLastPass: func() time.Duration { return 0 }}}
 
@@ -527,13 +530,19 @@ func TestLivenessSamplerEmitsWhileWindowLockHeld(t *testing.T) {
 	// samples flow while nothing is held (the immediate one plus the ticker's)
 	require.Eventually(t, func() bool { return len(m.snapshotBacklogs()) > 0 }, 5*time.Second, 1*time.Millisecond)
 
-	// the store's whole archive maintenance lock, held the way a stuck
-	// compaction or sealing pass would hold it
-	s.archiveMu.Lock()
+	// every served window's write lock, held the way stuck compaction or
+	// sealing passes would hold theirs — all of them at once, so no per-window
+	// lock can be the one that blocks the sampler
+	var unlocks []func()
+	for _, wf := range s.Windows() {
+		unlocks = append(unlocks, s.lockWindowWrite(windowKey{tier: wf.Tier, start: wf.WindowStart}))
+	}
 	before := len(m.snapshotBacklogs())
 	require.Eventually(t, func() bool { return len(m.snapshotBacklogs()) > before+1 }, 5*time.Second, 1*time.Millisecond,
-		"the liveness sampler must keep emitting while the window lock is held")
-	s.archiveMu.Unlock()
+		"the liveness sampler must keep emitting while the window locks are held")
+	for i := len(unlocks) - 1; i >= 0; i-- {
+		unlocks[i]()
+	}
 
 	// a canceled context ends the loop; nothing more arrives
 	cancel()

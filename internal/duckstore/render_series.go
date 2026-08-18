@@ -610,18 +610,25 @@ func (s *Store) withQuerySources(ctx context.Context, tier string, from, to int6
 	if err != nil {
 		return err
 	}
-	// LIFO with the defers below: detach the aliases, then hand the archive
-	// lock back, then release the snapshot — the leases, the pin and the
-	// connection go last, after nothing else addresses the files.
+	// LIFO with the defers below: detach the aliases, then hand the windows'
+	// read locks back, then release the snapshot — the leases, the pin and
+	// the connection go last, after nothing else addresses the files.
 	defer snap.release()
 
 	if len(snap.windows) > 0 {
-		// Shared with window maintenance for as long as a window is
-		// attached: DuckDB allows a file one handle per process, so the
-		// read-only attach must never overlap a maintenance open of the same
-		// file. Queries still run concurrently with each other.
-		s.archiveMu.RLock()
-		defer s.archiveMu.RUnlock()
+		// The read lock of each window this query reads — one per file
+		// (window_locks.go), not the store-global archive lock this replaced:
+		// DuckDB allows a file one handle per process, so the read-only
+		// attach must never overlap a maintenance open of the same file, but
+		// a maintenance pass on any *other* window no longer fences this
+		// query. lockWindowsRead nests them in the canonical sorted order;
+		// queries still run concurrently with each other.
+		keys := make([]windowKey, len(snap.windows))
+		for i := range snap.windows {
+			keys[i] = snap.windows[i].src.key
+		}
+		releaseWindows := s.lockWindowsRead(keys)
+		defer releaseWindows()
 	}
 
 	// The alias is unique to this query, so two concurrent queries attaching

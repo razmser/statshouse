@@ -62,9 +62,9 @@ type SealerConfig struct {
 
 // Sealer drives a store's sealing passes. It is one goroutine working one
 // window at a time at a relaxed cadence, and it never holds anything the
-// write path needs — the archive maintenance lock it shares with compaction's
-// appends is never taken by ingestion — so sealing runs at lowest priority
-// and can never delay an insert round.
+// write path needs — the per-window maintenance lock it shares with
+// compaction's appends is never taken by ingestion — so sealing runs at
+// lowest priority and can never delay an insert round.
 type Sealer struct {
 	store *Store
 	cfg   SealerConfig
@@ -155,13 +155,16 @@ func (s *Store) SealWindow(ctx context.Context, tier string, windowStart int64) 
 	table := tierTables[tier]
 
 	// Serialize against compaction's appends and retention's unlinks of the
-	// same file: a rewrite and an append must never interleave, and the
-	// existence check below must not race an unlink — a read-write open of a
-	// freshly unlinked path would create a fresh empty database there. The
-	// check runs under the lock, where unlinks are serialized away.
-	// Ingestion never takes this lock, so a seal can never delay a write.
-	s.archiveMu.Lock()
-	defer s.archiveMu.Unlock()
+	// same file through the window's own write lock (window_locks.go) — not
+	// the store-global archive lock it replaces: a rewrite and an append must
+	// never interleave on one file, while sealing one window no longer fences
+	// work on every other. The existence check below must not race an unlink
+	// either — a read-write open of a freshly unlinked path would create a
+	// fresh empty database there. The check runs under the lock, where
+	// unlinks are serialized away. Ingestion never takes this lock, so a seal
+	// can never delay a write.
+	unlock := s.lockWindowWrite(windowKey{tier: tier, start: windowStart})
+	defer unlock()
 
 	if _, err := os.Stat(path); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {

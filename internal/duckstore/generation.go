@@ -238,13 +238,15 @@ func (s *Store) ConsumeGeneration(ctx context.Context, gen int64, opts ConsumeOp
 // consumeWindow lands one archive window's share of the generation: the
 // append and the consumption record in a single transaction on the window
 // file, skipped entirely when an earlier attempt already committed it. The
-// whole window maintenance holds archiveMu, so the append can never interleave
-// with the sealer's rewrite of the same file, and a sealed window — whose
-// contents must never change again — records the generation without
-// appending, so one unplaceable row cannot wedge consumption.
+// whole window maintenance holds the window's own write lock
+// (window_locks.go), so the append can never interleave with the sealer's
+// rewrite of the same file — while passes and queries on every other window
+// proceed in parallel — and a sealed window — whose contents must never
+// change again — records the generation without appending, so one
+// unplaceable row cannot wedge consumption.
 func (s *Store) consumeWindow(ctx context.Context, gen int64, deltaPath string, k windowKey, opts ConsumeOptions) error {
-	s.archiveMu.Lock()
-	defer s.archiveMu.Unlock()
+	unlock := s.lockWindowWrite(k)
+	defer unlock()
 	if err := opts.fault(CrashBeforeAppend); err != nil {
 		return err
 	}
@@ -306,6 +308,7 @@ func (s *Store) consumeWindow(ctx context.Context, gen int64, deltaPath string, 
 			s.consumed[k] = map[int64]struct{}{}
 		}
 		s.consumed[k][gen] = struct{}{}
+		delete(s.evicted, k) // the window is served and holding again; any eviction tombstone is stale
 		s.mu.Unlock()
 		return nil
 	}
@@ -369,6 +372,7 @@ func (s *Store) consumeWindow(ctx context.Context, gen int64, deltaPath string, 
 		s.consumed[k] = map[int64]struct{}{}
 	}
 	s.consumed[k][gen] = struct{}{}
+	delete(s.evicted, k) // the window is served and holding again; any eviction tombstone is stale
 	s.mu.Unlock()
 	return nil
 }
@@ -518,19 +522,14 @@ func lessWindow(a, b WindowFile) bool {
 	return a.WindowStart < b.WindowStart
 }
 
-// sortedWindowKeys returns the plan's windows in consume order: tier, then
-// window start.
+// sortedWindowKeys returns the plan's windows in consume order: the canonical
+// window order (see lessWindowKey).
 func sortedWindowKeys(windows map[windowKey]struct{}) []windowKey {
 	keys := make([]windowKey, 0, len(windows))
 	for k := range windows {
 		keys = append(keys, k)
 	}
-	sort.Slice(keys, func(i, j int) bool {
-		if keys[i].tier != keys[j].tier {
-			return tierOrder(keys[i].tier) < tierOrder(keys[j].tier)
-		}
-		return keys[i].start < keys[j].start
-	})
+	sort.Slice(keys, func(i, j int) bool { return lessWindowKey(keys[i], keys[j]) })
 	return keys
 }
 

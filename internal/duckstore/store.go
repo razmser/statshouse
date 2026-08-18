@@ -123,21 +123,17 @@ type Store struct {
 	rolledOff map[int64]time.Time // per rolled-off generation, when it stopped accepting writes — the backlog's age axis
 	writer    *Writer             // the store's single writer, when one is attached
 
-	// archiveMu serializes read-write maintenance of archive window files:
-	// compaction's appends and the sealer's rewrite must never interleave on
-	// one file — an append landing between a seal's rewrite and its marker
-	// would violate the sealed window's immutability — and the retainer's
-	// unlinks serialize against both. Queries hold the lock shared for as
-	// long as an archive window is attached to the delta instance: DuckDB
-	// allows a file exactly one handle per process, so a query's read-only
-	// attach and a maintenance open of the same file must never overlap,
-	// while queries still run concurrently with each other. Ingestion never
-	// takes it, so maintenance can never delay a write; take it before mu,
-	// never after.
-	archiveMu sync.RWMutex
+	// windowLocks is the per-archive-window lock registry (window_locks.go):
+	// one lock per window file — reference-counted, with a retiring state —
+	// instead of the store-global archive mutex it replaces, so a maintenance
+	// pass on one window no longer fences queries reading every other. Its
+	// doc comment states the per-file invariant, the refcount protocol and
+	// the lock ordering.
+	windowLocks windowLockRegistry
 
 	windows     []WindowFile
 	consumed    map[windowKey]map[int64]struct{} // per archive window, the delta generations it already holds
+	evicted     map[windowKey]struct{}           // per successfully unlinked window: a tombstone marking "consumed, then evicted" so an absent s.consumed entry keeps meaning "never consumed" (see DropWindow)
 	leases      map[windowKey]int                // per archive window, the read leases queries hold; retention defers unlinks to them
 	deltaPins   map[int64]*deltaPinState         // per delta generation, the read pins queries hold; consumption's unlink waits for them (see lease.go)
 	quarantined []QuarantineInfo
@@ -165,6 +161,7 @@ func OpenStore(cfg StoreConfig) (*Store, error) {
 		deltaSchemaVersion:   DeltaSchemaVersion,
 		archiveSchemaVersion: ArchiveSchemaVersion,
 		consumed:             map[windowKey]map[int64]struct{}{},
+		evicted:              map[windowKey]struct{}{},
 		rolledOff:            map[int64]time.Time{},
 	}
 
@@ -246,7 +243,7 @@ func (s *Store) DeltaGenerations() []int64 {
 // generation recovered from disk by an open reports the age since that open,
 // the earliest moment this process can vouch for. The read takes only mu,
 // held everywhere for in-memory map updates and nowhere across file work, so
-// it answers while maintenance holds the archive lock: that is what makes it
+// it answers while maintenance holds the window locks: that is what makes it
 // safe for the liveness sampler.
 func (s *Store) DeltaBacklog() (generations int, oldestAge time.Duration) {
 	s.mu.RLock()
