@@ -104,18 +104,23 @@ the store uses whatever disk the filesystem has rather than demanding a
 reservation.
 
 ```
-<dir>/delta-<generation>.duckdb          all writes; rolled to a new generation for compaction
+<dir>/delta-<generation>.duckdb          all writes, the 1s tier only; rolled to a new generation for compaction
 <dir>/archive/1s-<window_start>.duckdb   one sealed/unsealed window file per tier
 <dir>/archive/1m-<window_start>.duckdb
 <dir>/archive/1h-<window_start>.duckdb
 ```
 
 Write acknowledgement means durable: rows are fsynced into the delta file
-before contributors are acked, exactly as a ClickHouse 200 does today. A
-background compactor moves delta rows into the archive window their own
-timestamp belongs to; a window is *sealed* (rewritten into one sorted run,
-reopened read-only) at window end plus 48 hours; retention then removes whole
-window files. Rows older than the historic window (48 hours) are dropped at
+before contributors are acked, exactly as a ClickHouse 200 does today. The
+delta stores one tier — second-resolution rows; a background compactor moves
+them into the archive window their own timestamp belongs to, deriving the
+minute- and hour-resolution archive rows by truncating the second-resolution
+ones, so the archive ends up with all three tiers without the coarser two
+ever being written at ingest. A window is *sealed* (rewritten into one sorted
+run, reopened read-only) at window end plus 48 hours, and until then it is
+periodically re-collapsed in place so partial rows from successive
+compaction passes do not accumulate; retention then removes whole window
+files. Rows older than the historic window (48 hours) are dropped at
 write time: a window seals at its end plus the historic window, so an older
 row could only target a sealed window. This is tighter than ClickHouse's
 materialized-view guard (three days), which does not seal windows.
@@ -148,22 +153,43 @@ which the sampler enforces as `max(MinInsertBudget, InsertBudgetFixed +
 InsertBudget × contributors)` bytes per insert round (`InsertBudgetFixed` is
 300 000 bytes; the terms live beside `MinInsertBudget` in the aggregator
 config). Because that bounds the serialized bytes per second entering the
-store, and retention bounds how long they stay, disk per tier is a formula
-rather than an estimate:
+store, and retention bounds how long the archive keeps them, how the budget
+lands on disk is two separate terms — the delta and the archive hold
+different shapes of the same rows:
 
 ```
-disk_per_tier ≈ insert_budget_bytes_per_sec × retention_sec × duck_bytes_per_rowbinary_byte
+archive, per tier ≈ insert_budget_bytes_per_sec × retention_sec × duck_bytes_per_rowbinary_byte
+delta             ≈ 1s_rows_per_sec × backlog_sec × duck_bytes_per_delta_row
 ```
 
 Turning disk down means turning the sampling budget down — the same lever,
 with the same meaning, operators already use on ClickHouse.
 
-**Caveat:** the `duck_bytes_per_rowbinary_byte` constant is **unmeasured**.
-The ~10 bytes-per-row figure behind it came from synthetic rows with no
-percentile or unique aggregate-state payloads. Do not capacity-plan against this
-formula until the constant has been measured against the real wide schema
-with realistic aggregate states; until then treat the formula's output as a
-lower bound.
+- The **archive** term is the retention-bounded steady state: whole window
+  files per tier, each holding collapsed rows — one per (key, second),
+  (key, minute) or (key, hour). How far each tier's collapse shrinks the row
+  count is workload-dependent, which is one of the two unknowns below.
+- The **delta** term has no retention bound at all: the delta holds the
+  uncollapsed 1s rows for exactly as long as compaction takes to drain them.
+  Healthy, that is a few seconds of ingest (one generation at the compaction
+  cadence plus the pass in flight); when compaction falls behind ingest, the
+  term grows without bound. The load-test run that motivated the 2026-08
+  compaction rework failed precisely here — 96% of a 1662 MB store was
+  undrained delta.
+
+**Measurements, and their limits.** The one load-test run to date
+(`20260817-233113`) observed **~32 bytes per physical delta row and ~46 bytes
+per collapsed archive row**. These are observations from a single workload,
+taken by a throwaway probe that is deliberately not kept in the tree — not
+capacity-planning constants. They also cannot be substituted for
+`duck_bytes_per_rowbinary_byte`, which remains unmeasured: that constant's
+units are duck bytes per serialized RowBinary byte, and the budget it
+multiplies bounds serialized bytes, not rows. Converting between per-row
+figures and the budget needs rows-per-input-byte (row width varies with tag
+population and aggregate-state weight), and a complete formula additionally
+needs a workload-dependent collapse ratio per tier. Until those are measured
+for an install, size by watching `__duck_store_size` on a pilot rather than
+by formula.
 
 ## Resource flags
 
@@ -190,15 +216,27 @@ conveyor.
 ## Version stamps, quarantine, upgrades
 
 Every store file carries a version stamp: the duck-store schema version, the
-DuckDB storage version, and the StatsHouse version. On any mismatch the
-aggregator **quarantines** the file — it is excluded from queries, the rest of
-the store keeps serving, the file and the reason are written to the process
-log, and the count is published as the `__duck_store_quarantined_files`
-metric. There is no in-place upgrade, no compatibility shim; downgrading
-StatsHouse is safe but equally lossy (files written by the newer binary are
-quarantined by the older one rather than misread — never wrong numbers).
-Because retention is bounded, the worst case after an upgrade is that queries
-lose coverage of at most one retention window while fresh data accumulates.
+DuckDB storage version, and the StatsHouse version. The schema version is
+**scoped by file kind** — delta files are checked against the delta schema
+axis, archive windows against the archive schema axis, and the two axes move
+independently — so a delta layout change can never evict archive history,
+and vice versa. On any mismatch the aggregator **quarantines** the file — it
+is excluded from queries, the rest of the store keeps serving, the file and
+the reason are written to the process log, and the count is published as the
+`__duck_store_quarantined_files` metric with the failing axis named
+(`delta_schema`, `archive_schema`, `storage`, `statshouse` or `unreadable`).
+What a quarantine costs depends on the axis: a `delta_schema` quarantine
+loses only undrained ingest data — rows still waiting for compaction — while
+every archive window keeps serving and fresh data accumulates in a new
+generation (the 2026-08 single-tier-delta change quarantines delta files
+written by older binaries on first start, and that is its whole cost); an
+`archive_schema` quarantine loses the history in the affected windows while
+ingestion continues. There is no in-place upgrade, no compatibility shim;
+downgrading StatsHouse is safe but equally lossy (files written by the newer
+binary are quarantined by the older one rather than misread — never wrong
+numbers). Because retention is bounded, the worst case after an upgrade is
+that queries lose coverage of at most one retention window while fresh data
+accumulates.
 
 ## Backup, restore, and starting clean
 
@@ -222,10 +260,27 @@ diagnosed from StatsHouse:
 
 - `__duck_store_maintenance_time` — duration of compaction, sealing and
   retention passes, by kind and outcome.
+- `__duck_store_backlog` — ingestion backlog, sampled from in-memory state
+  only, so it keeps flowing while maintenance holds the store's file locks:
+  `generations` counts rolled delta generations still holding rows compaction
+  has not taken, and `oldest_age_seconds` is how long the oldest has waited
+  (counted from process start for generations recovered from disk). A healthy
+  store sits at 0–2 generations; growth means compaction is falling behind
+  ingest and the delta term of the disk sizing is growing with it.
+- `__duck_store_maintenance_age` — seconds since each maintenance
+  (compaction, sealing, retention) last completed a successful pass, counted
+  from the component's start until its first success. A pass that never
+  returns reads as a growing age instead of as no data; healthy compaction
+  hugs its 5-second cadence, so growth here means a pass is stuck or starved.
 - `__duck_store_windows` — archive windows acted on: sealed, unlinked,
   **early-evicted** (the watermark shortening history), unlink-deferred by
-  a reader's lease, or **late-dropped** (a consume found the window already
-  sealed and dropped that generation's rows for it), per tier.
+  a reader's lease, **late-dropped** (a consume found the window already
+  sealed and dropped that generation's rows for it — with the seal barrier
+  draining every contributing generation before a seal, a nonzero count
+  indicts the sender, not the store), or **recollapsed** (an unsealed window
+  rewritten in place so partial rows from successive compaction passes do
+  not accumulate; a steady rate is the expected shape of a busy store), per
+  tier.
 - `__duck_store_quarantined_files` — quarantined file count per reason axis.
 - `__duck_store_query_time` — store-query latency and errors per verb
   (series, tag values) — the query load. The same metric's status tag also
