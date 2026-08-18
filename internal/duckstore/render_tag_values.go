@@ -87,19 +87,17 @@ func planTagValuesQuery(args tlstatshouse.StoreQueryTagValues) (*tagValuesPlan, 
 }
 
 // buildTagValuesSQL renders the plan into parameterized SQL over the given
-// sources: an empty qualifier addresses the delta (the connection's own
-// database), anything else is an attached archive window's alias. The shape
-// mirrors the ClickHouse builder's buildTagValuesQueryEx — group by the tag
-// (and its string half in values mode), count by summed `count`, zero-count
-// groups dropped — with the user's ORDER BY ... LIMIT N+1 replaced by the
-// safety cap and a deterministic order, because the global top N belongs to
-// the API, after the shards' counts are summed.
-func buildTagValuesSQL(p *tagValuesPlan, sources []string) (*seriesQuerySQL, error) {
-	var args []any
-	param := func(v any) string {
-		args = append(args, v)
-		return fmt.Sprintf("$%d", len(args))
-	}
+// sources: one UNION ALL arm per source, each addressing the source's own
+// table under its own qualifier and bounded by the range the source is
+// allowed to contribute — the descriptor shape both renderers build on. The
+// shape mirrors the ClickHouse builder's buildTagValuesQueryEx — group by the
+// tag (and its string half in values mode), count by summed `count`,
+// zero-count groups dropped — with the user's ORDER BY ... LIMIT N+1 replaced
+// by the safety cap and a deterministic order, because the global top N
+// belongs to the API, after the shards' counts are summed.
+func buildTagValuesSQL(p *tagValuesPlan, sources []querySource) (*seriesQuerySQL, error) {
+	var qp queryParams
+	param := qp.param
 
 	var sel []string
 	sel = append(sel, p.expr+" AS _tag")
@@ -108,14 +106,10 @@ func buildTagValuesSQL(p *tagValuesPlan, sources []string) (*seriesQuerySQL, err
 	}
 	sel = append(sel, "sum(count) AS _count")
 
-	from, to := param(p.from), param(p.to)
 	var arms []string
 	for _, src := range sources {
-		table := p.table
-		if src != "" {
-			table = src + "." + table
-		}
-		arms = append(arms, "SELECT * FROM "+table+" WHERE time >= "+from+" AND time < "+to)
+		arms = append(arms, "SELECT * FROM "+src.tableRef()+
+			" WHERE time >= "+qp.rangeParam(src.from)+" AND time < "+qp.rangeParam(src.to))
 	}
 
 	where, err := p.where(param)
@@ -142,7 +136,7 @@ func buildTagValuesSQL(p *tagValuesPlan, sources []string) (*seriesQuerySQL, err
 	sb.WriteString(" ORDER BY ")
 	sb.WriteString(strings.Join(order, ", "))
 	sb.WriteString(" LIMIT " + param(int64(p.rowLimit+1)))
-	return &seriesQuerySQL{sql: sb.String(), args: args}, nil
+	return &seriesQuerySQL{sql: sb.String(), args: qp.args}, nil
 }
 
 // RenderTagValues executes one structured tag-values query against the store.
@@ -162,7 +156,7 @@ func (s *Store) renderTagValues(ctx context.Context, args tlstatshouse.StoreQuer
 		return tlstatshouse.StoreTagValuesResponse{}, err
 	}
 	var resp tlstatshouse.StoreTagValuesResponse
-	err = s.withQuerySources(ctx, p.tier, p.from, p.to, func(ctx context.Context, conn *sql.Conn, sources []string) error {
+	err = s.withQuerySources(ctx, p.tier, p.from, p.to, func(ctx context.Context, conn *sql.Conn, sources []querySource) error {
 		q, err := buildTagValuesSQL(p, sources)
 		if err != nil {
 			return err

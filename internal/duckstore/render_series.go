@@ -25,12 +25,14 @@ import (
 // shard's store, answered as the columnar storeSeriesResponse.
 //
 // The read is a UNION ALL over the active delta generation and every served
-// archive window of the tier overlapping the range — windows attached
-// read-only on demand, leased against retention and detached again — followed
-// by the outer GROUP BY that is the correctness mechanism: the answer is the
-// same whether or not compaction has collapsed the rows it reads. Aggregate
-// states (percentiles, uniques) come out of the GROUP BY as lists of blobs and
-// are folded in Go before the reply, because DuckDB can neither merge nor
+// archive window of the tier overlapping the range — one source descriptor
+// per file, resolved into a single atomic snapshot (query_snapshot.go) with
+// the windows attached read-only on demand, leased against retention, and
+// the generation pinned against consumption's unlink — followed by the outer
+// GROUP BY that is the correctness mechanism: the answer is the same whether
+// or not compaction has collapsed the rows it reads. Aggregate states
+// (percentiles, uniques) come out of the GROUP BY as lists of blobs and are
+// folded in Go before the reply, because DuckDB can neither merge nor
 // re-import ClickHouse's states.
 //
 // Every request value — including RE2 patterns and unmapped string values —
@@ -273,15 +275,40 @@ type seriesQuerySQL struct {
 	args []any
 }
 
-// buildSeriesSQL renders the plan into parameterized SQL over the given
-// sources: an empty qualifier addresses the delta (the connection's own
-// database), anything else is an attached archive window's alias.
-func buildSeriesSQL(p *seriesPlan, sources []string) (*seriesQuerySQL, error) {
-	var args []any
-	param := func(v any) string {
-		args = append(args, v)
-		return fmt.Sprintf("$%d", len(args))
+// queryParams binds statement parameters in order, handing back $N
+// placeholders. rangeParam additionally dedupes the time-range parameters by
+// value, so sources sharing a range share one placeholder pair — today's
+// uniform sources, every descriptor carrying the query's own [from, to),
+// produce exactly the statement the retired qualifier-per-source path built.
+type queryParams struct {
+	args   []any
+	ranges map[int64]string
+}
+
+func (q *queryParams) param(v any) string {
+	q.args = append(q.args, v)
+	return fmt.Sprintf("$%d", len(q.args))
+}
+
+func (q *queryParams) rangeParam(v int64) string {
+	if ph, ok := q.ranges[v]; ok {
+		return ph
 	}
+	ph := q.param(v)
+	if q.ranges == nil {
+		q.ranges = make(map[int64]string)
+	}
+	q.ranges[v] = ph
+	return ph
+}
+
+// buildSeriesSQL renders the plan into parameterized SQL over the given
+// sources: one UNION ALL arm per source, each addressing the source's own
+// table under its own qualifier and bounded by the range the source is
+// allowed to contribute — the descriptor shape both renderers build on.
+func buildSeriesSQL(p *seriesPlan, sources []querySource) (*seriesQuerySQL, error) {
+	var qp queryParams
+	param := qp.param
 	base := p.base
 	lod := base.Lod
 
@@ -369,14 +396,10 @@ func buildSeriesSQL(p *seriesPlan, sources []string) (*seriesQuerySQL, error) {
 			"coalesce(("+agg+").s, '') AS _max_host_stag")
 	}
 
-	from, to := param(p.from), param(p.to)
 	var arms []string
 	for _, src := range sources {
-		table := p.table
-		if src != "" {
-			table = src + "." + table
-		}
-		arms = append(arms, "SELECT * FROM "+table+" WHERE time >= "+from+" AND time < "+to)
+		arms = append(arms, "SELECT * FROM "+src.tableRef()+
+			" WHERE time >= "+qp.rangeParam(src.from)+" AND time < "+qp.rangeParam(src.to))
 	}
 
 	where, err := p.where(param)
@@ -417,7 +440,7 @@ func buildSeriesSQL(p *seriesPlan, sources []string) (*seriesQuerySQL, error) {
 		}
 	}
 	sb.WriteString(" LIMIT " + param(int64(p.rowLimit+1)))
-	return &seriesQuerySQL{sql: sb.String(), args: args}, nil
+	return &seriesQuerySQL{sql: sb.String(), args: qp.args}, nil
 }
 
 // where renders the metric predicate and every tag filter, mirroring the
@@ -553,7 +576,7 @@ func (s *Store) renderSeries(ctx context.Context, shardNum int32, args tlstatsho
 		return tlstatshouse.StoreSeriesResponse{}, err
 	}
 	var resp tlstatshouse.StoreSeriesResponse
-	err = s.withQuerySources(ctx, p.tier, p.from, p.to, func(ctx context.Context, conn *sql.Conn, sources []string) error {
+	err = s.withQuerySources(ctx, p.tier, p.from, p.to, func(ctx context.Context, conn *sql.Conn, sources []querySource) error {
 		q, err := buildSeriesSQL(p, sources)
 		if err != nil {
 			return err
@@ -572,34 +595,27 @@ func (s *Store) renderSeries(ctx context.Context, shardNum int32, args tlstatsho
 	return resp, nil
 }
 
-// withQuerySources gathers everything one store query reads — the active
-// delta generation plus every served archive window of the tier overlapping
-// the range — and runs read against them: the delta's connection with one
-// source qualifier per file ("" for the delta itself, a unique alias per
-// attached window). Windows are leased so retention cannot unlink them under
-// the read — a window whose lease comes back nil was dropped in between and
-// is simply absent, the same as under ClickHouse after a TTL pass — attached
-// read-only on demand and detached again after the read: keeping them
-// attached buys latency that is not needed and costs resident memory that
-// is.
-func (s *Store) withQuerySources(ctx context.Context, tier string, from, to int64, read func(ctx context.Context, conn *sql.Conn, sources []string) error) error {
-	type queryWindow struct {
-		alias string
-		path  string
-		lease *Lease
+// withQuerySources gathers everything one store query reads — one atomic
+// snapshot of the store's query-relevant state (see querySnapshot) — and runs
+// read against it on the snapshot's own connection, with one source
+// descriptor per file: the active delta generation, addressed as the
+// connection's own database, plus every served archive window of the tier
+// overlapping the range, each attached read-only under a unique alias. The
+// snapshot leases every window and pins the generation, so neither retention
+// nor consumption can remove a file underneath the read; the windows are
+// attached on demand and detached again after it — keeping them attached buys
+// latency that is not needed and costs resident memory that is.
+func (s *Store) withQuerySources(ctx context.Context, tier string, from, to int64, read func(ctx context.Context, conn *sql.Conn, sources []querySource) error) error {
+	snap, err := s.acquireQuerySnapshot(ctx, tier, from, to)
+	if err != nil {
+		return err
 	}
-	var wins []queryWindow
-	for _, wf := range s.Windows() {
-		if wf.Tier != tier || wf.WindowStart >= to || wf.WindowStart+tierWindowSecs[tier] <= from {
-			continue
-		}
-		l := s.AcquireWindowLease(wf.Tier, wf.WindowStart)
-		if l == nil {
-			continue
-		}
-		wins = append(wins, queryWindow{path: wf.Path, lease: l})
-	}
-	if len(wins) > 0 {
+	// LIFO with the defers below: detach the aliases, then hand the archive
+	// lock back, then release the snapshot — the leases, the pin and the
+	// connection go last, after nothing else addresses the files.
+	defer snap.release()
+
+	if len(snap.windows) > 0 {
 		// Shared with window maintenance for as long as a window is
 		// attached: DuckDB allows a file one handle per process, so the
 		// read-only attach must never overlap a maintenance open of the same
@@ -607,15 +623,6 @@ func (s *Store) withQuerySources(ctx context.Context, tier string, from, to int6
 		s.archiveMu.RLock()
 		defer s.archiveMu.RUnlock()
 	}
-	for i := range wins {
-		defer wins[i].lease.Release()
-	}
-
-	conn, err := s.deltaConn(ctx)
-	if err != nil {
-		return fmt.Errorf("duck-store: store query connection: %w", err)
-	}
-	defer conn.Close()
 
 	// The alias is unique to this query, so two concurrent queries attaching
 	// windows to the shared delta instance never collide on a name. Every
@@ -626,47 +633,33 @@ func (s *Store) withQuerySources(ctx context.Context, tier string, from, to int6
 	// to it fail. Detaching an alias that never attached is a harmless
 	// ignored error.
 	seq := queryAliasSeq.Add(1)
-	for i := range wins {
-		wins[i].alias = fmt.Sprintf("q%d_a%d", seq, i)
+	for i := range snap.windows {
+		snap.windows[i].src.alias = fmt.Sprintf("q%d_a%d", seq, i)
 	}
 	defer func() {
-		for i := range wins {
-			_, _ = conn.ExecContext(context.Background(), "DETACH "+wins[i].alias)
+		for i := range snap.windows {
+			_, _ = snap.conn.ExecContext(context.Background(), "DETACH "+snap.windows[i].src.alias)
 		}
 	}()
-	for i := range wins {
-		if _, err := conn.ExecContext(ctx, fmt.Sprintf("ATTACH %s AS %s (READ_ONLY)", sqlString(wins[i].path), wins[i].alias)); err != nil {
-			return fmt.Errorf("duck-store: attach %s for store query: %w", wins[i].path, err)
+	for i := range snap.windows {
+		if _, err := snap.conn.ExecContext(ctx, fmt.Sprintf("ATTACH %s AS %s (READ_ONLY)",
+			sqlString(snap.windows[i].path), snap.windows[i].src.alias)); err != nil {
+			return fmt.Errorf("duck-store: attach %s for store query: %w", snap.windows[i].path, err)
 		}
 	}
 
-	sources := make([]string, 0, len(wins)+1)
-	sources = append(sources, "") // the delta is the connection's own database
-	for i := range wins {
-		sources = append(sources, wins[i].alias)
+	sources := make([]querySource, 0, len(snap.windows)+1)
+	sources = append(sources, querySource{
+		kind:  fileKindDelta,
+		gen:   snap.gen,
+		table: TierTable(tier),
+		from:  from,
+		to:    to,
+	})
+	for i := range snap.windows {
+		sources = append(sources, snap.windows[i].src)
 	}
-	return read(ctx, conn, sources)
-}
-
-// deltaConn checks a connection out of the active delta generation's pool. A
-// generation roll swaps the pool under the store lock and closes the old one:
-// a query already holding a connection runs to completion on the old file,
-// while a caller that reaches the closed pool gets an error — so a query
-// racing the swap retries once on the new pool rather than failing.
-func (s *Store) deltaConn(ctx context.Context) (*sql.Conn, error) {
-	var err error
-	for attempt := 0; attempt < 2; attempt++ {
-		db := s.Delta()
-		if db == nil {
-			return nil, fmt.Errorf("duck-store: store is closed")
-		}
-		var conn *sql.Conn
-		conn, err = db.Conn(ctx)
-		if err == nil {
-			return conn, nil
-		}
-	}
-	return nil, err
+	return read(ctx, snap.conn, sources)
 }
 
 // seriesScanRow is the scan target for one result row, in the SELECT list's

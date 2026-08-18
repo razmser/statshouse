@@ -10,7 +10,9 @@ package duckstore
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
+	"strings"
 	// the month-LOD validator needs IANA zones even on a tzdata-less runner
 	"testing"
 	_ "time/tzdata"
@@ -862,4 +864,292 @@ func TestRenderSeriesConcurrentQueries(t *testing.T) {
 func tdigestOf(t *testing.T, values ...float64) *tdigest.TDigest {
 	t.Helper()
 	return decodePct(t, pctState(t, values...))
+}
+
+// buildSeriesSQLRetiredQualifiers is the series builder as it stood before
+// the source-descriptor seam — one identical arm per bare qualifier string,
+// from/to bound once for all of them — kept verbatim as the golden reference
+// the descriptor path must match byte for byte over today's descriptor set.
+func buildSeriesSQLRetiredQualifiers(p *seriesPlan, sources []string) (*seriesQuerySQL, error) {
+	var args []any
+	param := func(v any) string {
+		args = append(args, v)
+		return fmt.Sprintf("$%d", len(args))
+	}
+	base := p.base
+	lod := base.Lod
+
+	var sel []string
+	if p.monthLod {
+		loc := param(lod.Location)
+		sel = append(sel, "(epoch(timezone("+loc+
+			", date_trunc('month', timezone("+loc+
+			", timezone('UTC', make_timestamp(time * 1000000)))))))::BIGINT AS _time")
+	} else {
+		utc := param(lod.UtcOffset)
+		step := param(lod.StepSec)
+		sel = append(sel, "((((time + "+utc+") // "+step+") * "+step+") - "+utc+") AS _time")
+	}
+	for i := range p.by {
+		bc := &p.by[i]
+		if bc.index == format.ShardTagIndex {
+			continue
+		}
+		sel = append(sel, bc.expr+" AS "+bc.alias)
+		if bc.stag {
+			sel = append(sel, bc.stagExpr+" AS "+bc.stagAlias)
+		}
+	}
+	if p.cols.count {
+		sel = append(sel, "sum(count) AS _count")
+	}
+	if p.cols.min {
+		sel = append(sel, "min(min) AS _min")
+	}
+	if p.cols.max {
+		sel = append(sel, "max(max) AS _max")
+	}
+	if p.cols.sum {
+		sel = append(sel, "sum(sum) AS _sum")
+	}
+	if p.cols.sumsquare {
+		sel = append(sel, "sum(sumsquare) AS _sumsquare")
+	}
+	if p.cols.cardinality {
+		sel = append(sel, "CAST(count(*) AS DOUBLE) AS _cardinality")
+	}
+	if p.cols.percentiles {
+		sel = append(sel, "list(percentiles) AS _pct_list")
+	}
+	if p.cols.uniq {
+		sel = append(sel, "list(uniq_state) AS _uniq_list")
+	}
+	if p.cols.minHost {
+		agg := "arg_min(struct_pack(v := min_host_value, i := min_host, s := min_shost), min_host_value)" +
+			" FILTER (WHERE (min_host <> 0 OR min_shost <> ''))"
+		sel = append(sel,
+			"coalesce(("+agg+").v, 0) AS _min_host_value",
+			"coalesce(("+agg+").i, 0) AS _min_host_tag",
+			"coalesce(("+agg+").s, '') AS _min_host_stag")
+	}
+	if p.cols.maxHost {
+		valueCol, hostCol, hostSCol := "max_host_value", "max_host", "max_shost"
+		if !p.whatMax {
+			valueCol, hostCol, hostSCol = "max_count_host_value", "max_count_host", "max_count_shost"
+		}
+		agg := "arg_max(struct_pack(v := " + valueCol + ", i := " + hostCol + ", s := " + hostSCol + "), " + valueCol + ")" +
+			" FILTER (WHERE (" + hostCol + " <> 0 OR " + hostSCol + " <> ''))"
+		sel = append(sel,
+			"coalesce(("+agg+").v, 0) AS _max_host_value",
+			"coalesce(("+agg+").i, 0) AS _max_host_tag",
+			"coalesce(("+agg+").s, '') AS _max_host_stag")
+	}
+
+	from, to := param(p.from), param(p.to)
+	var arms []string
+	for _, src := range sources {
+		table := p.table
+		if src != "" {
+			table = src + "." + table
+		}
+		arms = append(arms, "SELECT * FROM "+table+" WHERE time >= "+from+" AND time < "+to)
+	}
+
+	where, err := p.where(param)
+	if err != nil {
+		return nil, err
+	}
+
+	group := []string{"_time"}
+	for i := range p.by {
+		if p.by[i].index == format.ShardTagIndex {
+			continue
+		}
+		group = append(group, p.by[i].alias)
+		if p.by[i].stag {
+			group = append(group, p.by[i].stagAlias)
+		}
+	}
+
+	var sb strings.Builder
+	sb.WriteString("SELECT ")
+	sb.WriteString(strings.Join(sel, ", "))
+	sb.WriteString(" FROM (")
+	sb.WriteString(strings.Join(arms, " UNION ALL "))
+	sb.WriteString(") WHERE ")
+	sb.WriteString(where)
+	sb.WriteString(" GROUP BY ")
+	sb.WriteString(strings.Join(group, ", "))
+	if p.order != "" {
+		sb.WriteString(" ORDER BY ")
+		sb.WriteString(strings.Join(group, ", "))
+		if p.order == "DESC" {
+			sb.WriteString(" DESC")
+		}
+	}
+	sb.WriteString(" LIMIT " + param(int64(p.rowLimit+1)))
+	return &seriesQuerySQL{sql: sb.String(), args: args}, nil
+}
+
+// descriptorSourcesForRetired builds the descriptor set withQuerySources
+// produces for the retired qualifier list: the delta first — its own
+// database, the query's range — then one window per alias with the same range
+// and table, which is today's uniform set.
+func descriptorSourcesForRetired(p *storeQueryPlan, gen int64, qualifiers []string) []querySource {
+	srcs := make([]querySource, 0, len(qualifiers))
+	for _, q := range qualifiers {
+		src := querySource{table: p.table, from: p.from, to: p.to}
+		if q == "" {
+			src.kind, src.gen = fileKindDelta, gen
+		} else {
+			src.kind, src.alias = fileKindArchive, q
+		}
+		srcs = append(srcs, src)
+	}
+	return srcs
+}
+
+// TestBuildSeriesSQLDescriptorPathMatchesRetiredQualifiers pins the pure seam
+// change: across the renderer's plan matrix and source counts, the descriptor
+// path emits the retired qualifier path's exact statement — same text, same
+// bound arguments in the same order.
+func TestBuildSeriesSQLDescriptorPathMatchesRetiredQualifiers(t *testing.T) {
+	b1 := (writerNowUnix - 7200) / 60 * 60
+	var re2 tlstatshouse.StoreTagFilter
+	re2.TagIndex = 1
+	re2.SetRe2(`^o'brien"\\x.*--$`)
+	var values tlstatshouse.StoreTagFilter
+	values.TagIndex = 1
+	values.SetValues([]string{"plain"})
+	var empty tlstatshouse.StoreTagFilter
+	empty.TagIndex = 1
+	empty.SetEmpty(true)
+
+	plans := map[string]tlstatshouse.StoreQuerySeries{
+		"count over mapped tags": seriesReq(testMetricID, twoMappedKinds,
+			[]int32{int32(data_model.DigestCount)}, []int32{0}, b1, b1+120, 60),
+		"empty what": seriesReq(testMetricID, twoMappedKinds, nil, []int32{0}, b1, b1+60, 60),
+		"all aggregates and hosts": func() tlstatshouse.StoreQuerySeries {
+			q := seriesReq(testMetricID, twoMappedKinds,
+				[]int32{int32(data_model.DigestCount), int32(data_model.DigestSum),
+					int32(data_model.DigestMin), int32(data_model.DigestMax),
+					int32(data_model.DigestStdDev), int32(data_model.DigestCardinality),
+					int32(data_model.DigestPercentile), int32(data_model.DigestUnique)},
+				[]int32{0, 1}, b1, b1+120, 60)
+			q.SetMinHost(true)
+			q.SetMaxHost(true)
+			return q
+		}(),
+		"raw64 grouping": seriesReq(testMetricID, []int32{tagKindRaw64, tagKindRaw32},
+			[]int32{int32(data_model.DigestCount)}, []int32{0}, b1, b1+60, 60),
+		"shard and tag grouping": seriesReq(testMetricID, twoMappedKinds,
+			[]int32{int32(data_model.DigestCount)}, []int32{format.ShardTagIndex, 0}, b1, b1+60, 60),
+		"filters": func() tlstatshouse.StoreQuerySeries {
+			q := seriesReq(testMetricID, twoMappedKinds,
+				[]int32{int32(data_model.DigestCount)}, []int32{1}, b1, b1+60, 60)
+			q.Base.FilterIn = []tlstatshouse.StoreTagFilter{re2}
+			q.Base.FilterNotIn = []tlstatshouse.StoreTagFilter{values, empty}
+			return q
+		}(),
+		"metric in list": func() tlstatshouse.StoreQuerySeries {
+			q := seriesReq(0, twoMappedKinds,
+				[]int32{int32(data_model.DigestCount)}, []int32{0}, b1, b1+60, 60)
+			q.Base.SetMetricIn([]int32{testMetricID, testMetricID2})
+			return q
+		}(),
+		"sort desc and row limit": func() tlstatshouse.StoreQuerySeries {
+			q := seriesReq(testMetricID, twoMappedKinds,
+				[]int32{int32(data_model.DigestCount)}, []int32{0}, b1, b1+120, 60)
+			q.SetSortDesc(true)
+			q.Base.RowLimit = 7
+			return q
+		}(),
+		"month lod": func() tlstatshouse.StoreQuerySeries {
+			q := seriesReq(testMetricID, twoMappedKinds,
+				[]int32{int32(data_model.DigestCount)}, []int32{0}, 1682899200, 1700000000, monthLodStep)
+			q.Base.Lod.Location = "Europe/Moscow"
+			return q
+		}(),
+	}
+	for name, args := range plans {
+		t.Run(name, func(t *testing.T) {
+			p, err := planSeriesQuery(args)
+			require.NoError(t, err)
+			for _, qualifiers := range [][]string{
+				{""},
+				{"", "q7_a0"},
+				{"", "q7_a0", "q7_a1", "q7_a2"},
+			} {
+				legacy, err := buildSeriesSQLRetiredQualifiers(p, qualifiers)
+				require.NoError(t, err)
+				got, err := buildSeriesSQL(p, descriptorSourcesForRetired(p.storeQueryPlan, 3, qualifiers))
+				require.NoError(t, err)
+				require.Equal(t, legacy.sql, got.sql, "the descriptor path must emit the retired path's statement")
+				require.Equal(t, legacy.args, got.args, "the descriptor path must bind the retired path's arguments")
+			}
+		})
+	}
+}
+
+// TestWithQuerySourcesDescriptorPathMatchesRetiredPath runs both builders'
+// statements against one real store — the active delta plus its archive
+// windows attached under the production aliases — and checks the decoded
+// answers agree, on a query whose rows come from every source kind at once.
+func TestWithQuerySourcesDescriptorPathMatchesRetiredPath(t *testing.T) {
+	dir := t.TempDir()
+	writeConsumeFixture(t, dir) // windows-bound rows in generation 0, a live row in the active one
+	s, _ := openTestStore(t, dir)
+	require.NoError(t, s.ConsumeGeneration(context.Background(), 0, ConsumeOptions{}))
+	require.NotEmpty(t, s.Windows())
+
+	b1 := (writerNowUnix - 7200) / 60 * 60
+	args := seriesReq(0, twoMappedKinds,
+		[]int32{int32(data_model.DigestCount), int32(data_model.DigestSum),
+			int32(data_model.DigestMin), int32(data_model.DigestMax)},
+		[]int32{0}, b1, writerNowUnix+60, 60)
+	args.Base.SetMetricIn([]int32{testMetricID2, testMetricID2 + 1})
+	args.SetMinHost(true)
+	args.SetMaxHost(true)
+	p, err := planSeriesQuery(args)
+	require.NoError(t, err)
+
+	var legacyRows, gotRows seriesRows
+	require.NoError(t, s.withQuerySources(context.Background(), p.tier, p.from, p.to,
+		func(ctx context.Context, conn *sql.Conn, sources []querySource) error {
+			qualifiers := []string{""} // the delta is the connection's own database
+			for _, src := range sources[1:] {
+				qualifiers = append(qualifiers, src.alias)
+			}
+			legacy, err := buildSeriesSQLRetiredQualifiers(p, qualifiers)
+			if err != nil {
+				return err
+			}
+			got, err := buildSeriesSQL(p, sources)
+			if err != nil {
+				return err
+			}
+			require.Equal(t, legacy.sql, got.sql)
+			require.Equal(t, legacy.args, got.args)
+
+			run := func(q *seriesQuerySQL) (seriesRows, error) {
+				rows, err := conn.QueryContext(ctx, q.sql, q.args...)
+				if err != nil {
+					return seriesRows{}, err
+				}
+				defer rows.Close()
+				resp, err := scanSeriesRows(rows, p, 1)
+				if err != nil {
+					return seriesRows{}, err
+				}
+				return flattenSeries(t, resp), nil
+			}
+			if legacyRows, err = run(legacy); err != nil {
+				return err
+			}
+			gotRows, err = run(got)
+			return err
+		}))
+	require.Equal(t, legacyRows, gotRows, "both paths decode to the same answer")
+	require.NotEmpty(t, gotRows.time, "the windows and the delta both contributed rows")
+	require.NotEmpty(t, gotRows.minHostValue, "the host columns travelled")
 }

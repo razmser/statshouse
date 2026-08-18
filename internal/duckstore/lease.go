@@ -8,7 +8,10 @@
 
 package duckstore
 
-import "sync"
+import (
+	"context"
+	"sync"
+)
 
 // A file lease is retention's handshake with readers. DuckDB gives no help
 // here: a running cursor survives another connection detaching the alias — it
@@ -19,6 +22,10 @@ import "sync"
 // releases it once the read is done, and the retainer defers the unlink of a
 // leased window to a later pass instead of removing a file from underneath a
 // running query.
+//
+// Delta generations carry the same handshake as pins: a query holds one on the
+// generation its connection serves, and consumption's unlink waits for the
+// last pin instead of removing a file a running read still addresses.
 
 // Lease is one held read lease on an archive window. Release returns it;
 // after that, retention may unlink the window's file at any time.
@@ -45,7 +52,13 @@ func (l *Lease) Release() {
 func (s *Store) AcquireWindowLease(tier string, windowStart int64) *Lease {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	k := windowKey{tier: tier, start: windowStart}
+	return s.acquireWindowLeaseLocked(windowKey{tier: tier, start: windowStart})
+}
+
+// acquireWindowLeaseLocked is AcquireWindowLease for callers already holding
+// s.mu, so a reader can lease every window of one view without releasing the
+// lock in between.
+func (s *Store) acquireWindowLeaseLocked(k windowKey) *Lease {
 	if !s.windowServedLocked(k) {
 		return nil
 	}
@@ -72,6 +85,122 @@ func (s *Store) releaseLease(k windowKey) {
 func (s *Store) windowServedLocked(k windowKey) bool {
 	for _, w := range s.windows {
 		if w.Tier == k.tier && w.WindowStart == k.start {
+			return true
+		}
+	}
+	return false
+}
+
+// deltaPinState is one generation's pin bookkeeping: how many readers hold
+// the generation, and the channel a consumer waiting to unlink blocks on. The
+// channel is created by the waiter, closed when the count returns to zero,
+// and replaced by the next waiter — a release that empties the state deletes
+// it from the store's map, so a pin taken afterwards starts a fresh one.
+type deltaPinState struct {
+	held int
+	zero chan struct{}
+}
+
+// DeltaPin is one held pin on a delta generation's file. Release returns it;
+// after the last pin on a generation goes back, ConsumeGeneration may unlink
+// the generation's file.
+type DeltaPin struct {
+	store *Store
+	gen   int64
+	once  sync.Once
+}
+
+// Release returns the pin. It is safe to call more than once and safe to call
+// on a nil DeltaPin.
+func (p *DeltaPin) Release() {
+	if p == nil {
+		return
+	}
+	p.once.Do(func() { p.store.releaseDeltaPin(p.gen) })
+}
+
+// AcquireDeltaPin takes a pin on one present delta generation, active or
+// rolled off, bought before the reader addresses the file, so consumption
+// cannot unlink it underneath the read. It returns nil when the generation is
+// not present — consumed, quarantined or never existed — and the caller must
+// treat the generation as absent rather than open a path it cannot vouch for.
+func (s *Store) AcquireDeltaPin(gen int64) *DeltaPin {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.acquireDeltaPinLocked(gen)
+}
+
+// acquireDeltaPinLocked is AcquireDeltaPin for callers already holding s.mu,
+// so a query can pin the generation of the same view it resolved its
+// connection and windows from.
+func (s *Store) acquireDeltaPinLocked(gen int64) *DeltaPin {
+	if !s.generationPresentLocked(gen) {
+		return nil
+	}
+	if s.deltaPins == nil {
+		s.deltaPins = make(map[int64]*deltaPinState)
+	}
+	st := s.deltaPins[gen]
+	if st == nil {
+		st = &deltaPinState{}
+		s.deltaPins[gen] = st
+	}
+	st.held++
+	return &DeltaPin{store: s, gen: gen}
+}
+
+// releaseDeltaPin returns one pin on a generation, closing the state's wait
+// channel when the count reaches zero so a consumer blocked in waitDeltaPins
+// proceeds.
+func (s *Store) releaseDeltaPin(gen int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st := s.deltaPins[gen]
+	if st == nil {
+		return
+	}
+	st.held--
+	if st.held > 0 {
+		return
+	}
+	delete(s.deltaPins, gen)
+	if st.zero != nil {
+		close(st.zero)
+	}
+}
+
+// waitDeltaPins blocks until no pin is held on gen, or ctx is done. It holds
+// no lock and no file while waiting — a reader holding the pin needs nothing
+// from the waiter, so this cannot deadlock, only outlast a slow read. The
+// waiter wakes and re-checks whenever the count returns to zero, so pins
+// taken after a wake are honoured too.
+func (s *Store) waitDeltaPins(ctx context.Context, gen int64) error {
+	for {
+		s.mu.Lock()
+		var zero chan struct{}
+		if st := s.deltaPins[gen]; st != nil && st.held > 0 {
+			if st.zero == nil {
+				st.zero = make(chan struct{})
+			}
+			zero = st.zero
+		}
+		s.mu.Unlock()
+		if zero == nil {
+			return nil
+		}
+		select {
+		case <-zero:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// generationPresentLocked reports whether a delta generation is among the
+// store's present generations. Callers hold s.mu.
+func (s *Store) generationPresentLocked(gen int64) bool {
+	for _, g := range s.deltas {
+		if g == gen {
 			return true
 		}
 	}

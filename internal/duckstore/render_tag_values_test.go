@@ -10,7 +10,9 @@ package duckstore
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -315,4 +317,175 @@ func TestRenderTagValuesValidation(t *testing.T) {
 			requireBadRequest(t, renderTagValuesErr(t, s, q), tc.problem)
 		})
 	}
+}
+
+// buildTagValuesSQLRetiredQualifiers is the tag-values builder as it stood
+// before the source-descriptor seam — one identical arm per bare qualifier
+// string, from/to bound once for all of them — kept verbatim as the golden
+// reference the descriptor path must match byte for byte over today's
+// descriptor set.
+func buildTagValuesSQLRetiredQualifiers(p *tagValuesPlan, sources []string) (*seriesQuerySQL, error) {
+	var args []any
+	param := func(v any) string {
+		args = append(args, v)
+		return fmt.Sprintf("$%d", len(args))
+	}
+
+	var sel []string
+	sel = append(sel, p.expr+" AS _tag")
+	if p.stag {
+		sel = append(sel, fmt.Sprintf("stag%d AS _stag", p.tag))
+	}
+	sel = append(sel, "sum(count) AS _count")
+
+	from, to := param(p.from), param(p.to)
+	var arms []string
+	for _, src := range sources {
+		table := p.table
+		if src != "" {
+			table = src + "." + table
+		}
+		arms = append(arms, "SELECT * FROM "+table+" WHERE time >= "+from+" AND time < "+to)
+	}
+
+	where, err := p.where(param)
+	if err != nil {
+		return nil, err
+	}
+
+	group := []string{"_tag"}
+	if p.stag {
+		group = append(group, "_stag")
+	}
+	order := append([]string{"_count DESC"}, group...)
+
+	var sb strings.Builder
+	sb.WriteString("SELECT ")
+	sb.WriteString(strings.Join(sel, ", "))
+	sb.WriteString(" FROM (")
+	sb.WriteString(strings.Join(arms, " UNION ALL "))
+	sb.WriteString(") WHERE ")
+	sb.WriteString(where)
+	sb.WriteString(" GROUP BY ")
+	sb.WriteString(strings.Join(group, ", "))
+	sb.WriteString(" HAVING _count > 0")
+	sb.WriteString(" ORDER BY ")
+	sb.WriteString(strings.Join(order, ", "))
+	sb.WriteString(" LIMIT " + param(int64(p.rowLimit+1)))
+	return &seriesQuerySQL{sql: sb.String(), args: args}, nil
+}
+
+// TestBuildTagValuesSQLDescriptorPathMatchesRetiredQualifiers pins the pure
+// seam change: across the renderer's plan matrix and source counts, the
+// descriptor path emits the retired qualifier path's exact statement — same
+// text, same bound arguments in the same order.
+func TestBuildTagValuesSQLDescriptorPathMatchesRetiredQualifiers(t *testing.T) {
+	b1 := (writerNowUnix - 7200) / 60 * 60
+	var re2 tlstatshouse.StoreTagFilter
+	re2.TagIndex = 0
+	re2.SetRe2(`^o'brien"\\x.*--$`)
+	var values tlstatshouse.StoreTagFilter
+	values.TagIndex = 0
+	values.SetValues([]string{"plain"})
+
+	plans := map[string]tlstatshouse.StoreQueryTagValues{
+		"values mode": tagValuesReq(testMetricID, twoMappedKinds, 0, b1, b1+120, 60),
+		"ids only": func() tlstatshouse.StoreQueryTagValues {
+			q := tagValuesReq(testMetricID, twoMappedKinds, 0, b1, b1+120, 60)
+			q.SetIdsOnly(true)
+			return q
+		}(),
+		"raw64 tag": tagValuesReq(testMetricID, []int32{tagKindRaw64, tagKindRaw32}, 0, b1, b1+60, 60),
+		"raw32 tag": tagValuesReq(testMetricID, []int32{tagKindRaw64, tagKindRaw32}, 1, b1, b1+60, 60),
+		"filters": func() tlstatshouse.StoreQueryTagValues {
+			q := tagValuesReq(testMetricID, twoMappedKinds, 0, b1, b1+60, 60)
+			q.Base.FilterIn = []tlstatshouse.StoreTagFilter{re2}
+			q.Base.FilterNotIn = []tlstatshouse.StoreTagFilter{values}
+			return q
+		}(),
+		"metric in list": func() tlstatshouse.StoreQueryTagValues {
+			q := tagValuesReq(0, twoMappedKinds, 0, b1, b1+60, 60)
+			q.Base.SetMetricIn([]int32{testMetricID, testMetricID2})
+			return q
+		}(),
+		"row limit": func() tlstatshouse.StoreQueryTagValues {
+			q := tagValuesReq(testMetricID, twoMappedKinds, 0, b1, b1+120, 60)
+			q.Base.RowLimit = 5
+			return q
+		}(),
+	}
+	for name, args := range plans {
+		t.Run(name, func(t *testing.T) {
+			p, err := planTagValuesQuery(args)
+			require.NoError(t, err)
+			for _, qualifiers := range [][]string{
+				{""},
+				{"", "q7_a0"},
+				{"", "q7_a0", "q7_a1", "q7_a2"},
+			} {
+				legacy, err := buildTagValuesSQLRetiredQualifiers(p, qualifiers)
+				require.NoError(t, err)
+				got, err := buildTagValuesSQL(p, descriptorSourcesForRetired(p.storeQueryPlan, 3, qualifiers))
+				require.NoError(t, err)
+				require.Equal(t, legacy.sql, got.sql, "the descriptor path must emit the retired path's statement")
+				require.Equal(t, legacy.args, got.args, "the descriptor path must bind the retired path's arguments")
+			}
+		})
+	}
+}
+
+// TestRenderTagValuesDescriptorPathMatchesRetiredPath runs both builders'
+// statements against one real store — the active delta plus its archive
+// windows attached under the production aliases — and checks the decoded
+// answers agree, over a range whose rows come from the windows and the delta
+// at once.
+func TestRenderTagValuesDescriptorPathMatchesRetiredPath(t *testing.T) {
+	dir := t.TempDir()
+	writeConsumeFixture(t, dir)
+	s, _ := openTestStore(t, dir)
+	require.NoError(t, s.ConsumeGeneration(context.Background(), 0, ConsumeOptions{}))
+	require.NotEmpty(t, s.Windows())
+
+	now := writerNowUnix
+	args := tagValuesReq(0, twoMappedKinds, 0, now-7200, now+60, 60)
+	args.Base.SetMetricIn([]int32{testMetricID2, testMetricID2 + 1})
+	p, err := planTagValuesQuery(args)
+	require.NoError(t, err)
+
+	var legacy, got tlstatshouse.StoreTagValuesResponse
+	require.NoError(t, s.withQuerySources(context.Background(), p.tier, p.from, p.to,
+		func(ctx context.Context, conn *sql.Conn, sources []querySource) error {
+			qualifiers := []string{""} // the delta is the connection's own database
+			for _, src := range sources[1:] {
+				qualifiers = append(qualifiers, src.alias)
+			}
+			legacyQ, err := buildTagValuesSQLRetiredQualifiers(p, qualifiers)
+			if err != nil {
+				return err
+			}
+			gotQ, err := buildTagValuesSQL(p, sources)
+			if err != nil {
+				return err
+			}
+			require.Equal(t, legacyQ.sql, gotQ.sql)
+			require.Equal(t, legacyQ.args, gotQ.args)
+
+			run := func(q *seriesQuerySQL) (tlstatshouse.StoreTagValuesResponse, error) {
+				rows, err := conn.QueryContext(ctx, q.sql, q.args...)
+				if err != nil {
+					return tlstatshouse.StoreTagValuesResponse{}, err
+				}
+				defer rows.Close()
+				return scanTagValuesRows(rows, p)
+			}
+			if legacy, err = run(legacyQ); err != nil {
+				return err
+			}
+			got, err = run(gotQ)
+			return err
+		}))
+	require.Equal(t, legacy.Tag, got.Tag, "both paths decode to the same values")
+	require.Equal(t, legacy.Stag, got.Stag)
+	require.Equal(t, legacy.Count, got.Count)
+	require.NotEmpty(t, got.Tag, "the windows and the delta both contributed values")
 }

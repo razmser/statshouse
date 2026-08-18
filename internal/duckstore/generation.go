@@ -188,7 +188,8 @@ func (s *Store) RollGeneration() error {
 // every window in the generation's plan is recorded. OpenStore performs the
 // same check when the store reopens, so a generation left behind by a crash
 // between the last commit and the unlink is unlinked without appending
-// anything again.
+// anything again. The unlink itself waits for the last reader pin on the
+// generation (lease.go) rather than remove a file a running read addresses.
 //
 // Until its consumption completes, a sealed generation is input to this
 // protocol rather than a query source: its rows re-enter queries from the
@@ -213,6 +214,16 @@ func (s *Store) ConsumeGeneration(ctx context.Context, gen int64, opts ConsumeOp
 	}
 	if err := opts.fault(CrashAfterCommitBeforeUnlink); err != nil {
 		return err
+	}
+	// The windows hold the generation's rows durably; the file itself may
+	// still be under a reader — a query runs on a connection checked out of
+	// the generation's pool, pinned for exactly that (see lease.go) — so the
+	// unlink waits for the last pin instead of relying on the OS keeping an
+	// unlinked file's descriptor open. Nothing is held while waiting, and a
+	// cancelled context returns before the bookkeeping below, leaving the
+	// recorded generation for the next pass to finish.
+	if err := s.waitDeltaPins(ctx, gen); err != nil {
+		return fmt.Errorf("duck-store: consume generation %d: %w", gen, err)
 	}
 	s.mu.Lock()
 	s.deltas = removeGeneration(s.deltas, gen)
