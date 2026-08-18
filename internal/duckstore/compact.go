@@ -57,7 +57,7 @@ type CompactorConfig struct {
 type Compactor struct {
 	store *Store
 	cfg   CompactorConfig
-	clock maintenanceClock // liveness: time since the last successful pass
+	clock *maintenanceClock // liveness: time since the last successful pass
 
 	mu sync.Mutex // one pass at a time
 }

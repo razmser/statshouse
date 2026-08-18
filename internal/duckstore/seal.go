@@ -115,7 +115,7 @@ type SealerConfig struct {
 type Sealer struct {
 	store *Store
 	cfg   SealerConfig
-	clock maintenanceClock // liveness: time since the last successful pass
+	clock *maintenanceClock // liveness: time since the last successful pass
 
 	mu sync.Mutex // one pass at a time
 }
@@ -212,11 +212,15 @@ func (sl *Sealer) sealOnce(ctx context.Context) error {
 // sweep drains the candidate set before opening any file — an append that
 // lands while it works cannot hold the window's write lock, so it either
 // marked before the drain and is being checked, or marks after it and is the
-// next pass's candidate; no append is missed either way. A window whose check
-// fails is re-armed before the pass gives up, so the next pass retries it.
+// next pass's candidate; no append is missed either way. A pass that gives up
+// mid-sweep re-arms every candidate it did not get to check, so the next pass
+// retries them — a quiet window owes its check to the sweep, not to a future
+// append.
 func (sl *Sealer) recollapseSweep(ctx context.Context) error {
-	for _, k := range sl.store.takeRecollapseCandidates() {
+	ks := sl.store.takeRecollapseCandidates()
+	for i, k := range ks {
 		if ctx.Err() != nil {
+			sl.store.rearmRecollapse(ks[i:])
 			return ctx.Err()
 		}
 		recollapsed, err := sl.store.RecollapseWindow(ctx, k.tier, k.start, sl.cfg.RecollapseFactor)
@@ -224,7 +228,7 @@ func (sl *Sealer) recollapseSweep(ctx context.Context) error {
 			if errors.Is(err, fs.ErrNotExist) {
 				continue // the window left between the sweep and the rewrite
 			}
-			sl.store.markRecollapse(k) // the next pass retries this window
+			sl.store.rearmRecollapse(ks[i:]) // the next pass retries these windows
 			return err
 		}
 		if recollapsed {
@@ -561,11 +565,18 @@ func (s *Store) markRecollapseLocked(k windowKey) {
 	s.recollapsePending[k] = struct{}{}
 }
 
-// markRecollapse is markRecollapseLocked taking s.mu itself.
-func (s *Store) markRecollapse(k windowKey) {
+// rearmRecollapse puts a drained candidate slice back into the candidate set
+// under one lock — the sweep's give-up paths call it with every candidate they
+// did not get to check, so the next pass retries the whole remainder.
+func (s *Store) rearmRecollapse(ks []windowKey) {
+	if len(ks) == 0 {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.markRecollapseLocked(k)
+	for _, k := range ks {
+		s.markRecollapseLocked(k)
+	}
 }
 
 // takeRecollapseCandidates drains the re-collapse candidate set in the

@@ -229,15 +229,15 @@ func TestWriterFlushJoinsRoundTransaction(t *testing.T) {
 	conn, err := s.Delta().Conn(ctx)
 	require.NoError(t, err)
 	defer func() { _ = conn.Close() }()
-	appenders, err := createTierAppenders(conn)
+	appender, err := createAppender(conn)
 	require.NoError(t, err)
-	wa := &Writer{appenders: appenders, conn: conn}
+	wa := &Writer{appender: appender, conn: conn}
 
 	row := testRow(testMetricID, uint32(writerNow.Unix()))
 	_, err = conn.ExecContext(ctx, "BEGIN TRANSACTION")
 	require.NoError(t, err)
-	require.NoError(t, wa.appendTierRow(Tier1s, &row))
-	require.NoError(t, appenders[Tier1s].FlushWithCancel(ctx))
+	require.NoError(t, wa.appendRow(&row))
+	require.NoError(t, appender.FlushWithCancel(ctx))
 	var n int
 	require.NoError(t, conn.QueryRowContext(ctx, "SELECT count(*) FROM s1 WHERE metric = $1", testMetricID).Scan(&n))
 	require.Equal(t, 1, n, "the flushed row must be visible inside the transaction")
@@ -255,9 +255,9 @@ func TestWriterFlushJoinsRoundTransaction(t *testing.T) {
 func TestWriterFailedMidRoundCommitsNothing(t *testing.T) {
 	s, w := newTestWriterCfg(t, WriterConfig{
 		NowFunc: func() time.Time { return writerNow },
-		FlushTierFault: func(round int64, tier string) error {
-			if round == 1 && tier == Tier1s { // the round's rows are already appended when this fires
-				return fmt.Errorf("round %d: simulated %s flush failure", round, tier)
+		FlushTierFault: func(round int64) error {
+			if round == 1 { // the round's rows are already appended when this fires
+				return fmt.Errorf("round %d: simulated %s flush failure", round, Tier1s)
 			}
 			return nil
 		},
@@ -341,7 +341,7 @@ func TestWriterCancelledContextKeepsRowOwnership(t *testing.T) {
 	inRound := make(chan struct{})
 	release := make(chan struct{})
 	_, w := newTestWriterCfg(t, WriterConfig{
-		FlushTierFault: func(round int64, tier string) error {
+		FlushTierFault: func(round int64) error {
 			select {
 			case <-inRound:
 			default:

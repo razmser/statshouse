@@ -21,7 +21,7 @@ duck-store install starts empty.
 `--storage-backend=clickhouse|duck` on both `statshouse-agg` and
 `statshouse-api` (default `clickhouse`).
 
-Three build requirements:
+Four build requirements:
 
 - the **aggregator** binary must be compiled with the `duckdb` build tag —
   `make build-agg-duckdb` produces it with the verified static link flags. A
@@ -33,6 +33,13 @@ Three build requirements:
   target checks for it and refuses to link otherwise). A naive static link of
   DuckDB produces a binary that segfaults on first use, which is why the
   flags live in the make target and not in ad-hoc `go build` invocations.
+- the static Linux build must also carry the `osusergo` tag (the make target
+  does): a statically-linked glibc cannot load its NSS modules, so the cgo
+  group lookup behind the privilege drop (`--user`/`--group`, the standard
+  start shape for a daemon running as root) fails and the aggregator exits
+  fatally at startup. `osusergo` makes the lookup read `/etc/passwd` and
+  `/etc/group` directly; the e2e harness builds its duck aggregator with the
+  same tag for exactly this reason.
 - the **API** never embeds DuckDB; any `statshouse-api` binary accepts `duck`.
 
 A minimal single-shard setup (all other standard flags — `--agg-addr`,

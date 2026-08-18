@@ -458,6 +458,52 @@ func TestSealBarrierHoldsWindowWithPendingGeneration(t *testing.T) {
 		"the pending rows must land in the window, not drop")
 }
 
+// TestSealBarrierPlanFailureFailsThePass pins the barrier's other error
+// exit: a rolled generation whose window plan cannot be read — an
+// undecidable contribution — fails the whole pass and leaves the due window
+// unsealed, rather than sealing on an assumption. Repairing the generation
+// lets the next pass drain it and seal with the rows landed.
+func TestSealBarrierPlanFailureFailsThePass(t *testing.T) {
+	s, w := newTestWriter(t)
+	now := uint32(writerNowUnix)
+	ctx := context.Background()
+
+	const oldAge = 47 * 3600
+	first := partialRow(t, testMetricID, now-oldAge)
+	first.Count, first.Sum = 3, 30
+	require.NoError(t, w.WriteRound(ctx, []Row{first}))
+	require.NoError(t, NewCompactor(s, CompactorConfig{}).CompactOnce(ctx))
+	oldWindow := testWindowStart(Tier1s, int64(now)-oldAge)
+
+	second := partialRow(t, testMetricID, now-oldAge)
+	second.Count, second.Sum = 4, 40
+	require.NoError(t, w.WriteRound(ctx, []Row{second}))
+	gen := s.ActiveDeltaGeneration() // the generation the boundary rows sit in
+	require.NoError(t, s.RollGeneration())
+
+	// the plan read fails: the generation's file is not openable, so whether
+	// it contributes to the due window cannot be decided
+	path := filepath.Join(s.cfg.Dir, deltaFileName(gen))
+	aside := path + ".aside"
+	require.NoError(t, os.Rename(path, aside))
+
+	err := NewSealer(s, SealerConfig{NowFunc: func() time.Time { return sealDueClock(oldWindow) }}).
+		SealOnce(ctx)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "plan generation", "the unreadable plan must fail the pass")
+	require.False(t, findWindow(t, s, Tier1s, oldWindow).Sealed,
+		"a window must not seal while a contributor's plan is undecidable")
+
+	// repaired, the same pass drains the generation and seals holding its rows
+	require.NoError(t, os.Rename(aside, path))
+	require.NoError(t, NewSealer(s, SealerConfig{NowFunc: func() time.Time { return sealDueClock(oldWindow) }}).
+		SealOnce(ctx))
+	wf := findWindow(t, s, Tier1s, oldWindow)
+	require.True(t, wf.Sealed)
+	require.EqualValues(t, 7, windowMetricCount(t, wf, testMetricID),
+		"the pending rows must land in the window once the plan reads again")
+}
+
 // TestSealBarrierLandsBoundaryRowInsteadOfLosingIt reproduces the loss the
 // barrier closes. Pre-fix, a row accepted in the last conforming second sat
 // in a pending generation when its window came due; the pass sealed on

@@ -281,6 +281,8 @@ func TestDuckMetricsTagMappings(t *testing.T) {
 	require.Equal(t, int32(format.TagValueIDDuckWindowUnlinked), duckWindowEventTag(duckstore.WindowUnlinked))
 	require.Equal(t, int32(format.TagValueIDDuckWindowEarlyEvicted), duckWindowEventTag(duckstore.WindowEarlyEvicted))
 	require.Equal(t, int32(format.TagValueIDDuckWindowLeaseDeferred), duckWindowEventTag(duckstore.WindowLeaseDeferred))
+	require.Equal(t, int32(format.TagValueIDDuckWindowLateDropped), duckWindowEventTag(duckstore.WindowLateDropped))
+	require.Equal(t, int32(format.TagValueIDDuckWindowRecollapsed), duckWindowEventTag(duckstore.WindowRecollapsed))
 	require.Zero(t, duckWindowEventTag(duckstore.WindowEventKind("other")))
 
 	require.Equal(t, int32(format.TagValueIDDuckTier1s), duckTierTag(duckstore.Tier1s))

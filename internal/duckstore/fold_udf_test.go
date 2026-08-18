@@ -58,9 +58,9 @@ func TestFoldUDFMatchesGoFoldOverTheCaseExpression(t *testing.T) {
 		pct  [][]byte
 		uniq [][]byte
 	}{
-		{k: 1, pct: [][]byte{pctA}, uniq: [][]byte{uniqA}},             // one state: passthrough
+		{k: 1, pct: [][]byte{pctA}, uniq: [][]byte{uniqA}}, // one state: passthrough
 		{k: 2, pct: [][]byte{pctA, pctB, pctC}, uniq: [][]byte{uniqA, uniqB, uniqC}},
-		{k: 3, pct: [][]byte{{}, {}}, uniq: [][]byte{{}, {}}},          // empty states only
+		{k: 3, pct: [][]byte{{}, {}}, uniq: [][]byte{{}, {}}},                   // empty states only
 		{k: 4, pct: [][]byte{pctA, {}, pctB}, uniq: [][]byte{uniqA, {}, uniqB}}, // mixed
 	}
 	for _, g := range groups {

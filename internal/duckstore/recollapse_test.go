@@ -10,6 +10,7 @@ package duckstore
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -126,6 +127,64 @@ func TestRecollapseMatchesSingleCompaction(t *testing.T) {
 	require.Zero(t, countWindowEvents(rec2, WindowRecollapsed), "an idle sweep must not rewrite")
 	for _, tier := range tiers {
 		require.Equal(t, 2, recollapseWindowRows(t, sRep, tier, testWindowStart(tier, ts)))
+	}
+}
+
+// TestRecollapseSweepFailureRearmsEveryUncheckedWindow pins the sweep's
+// give-up contract: a pass that fails on one candidate must re-arm every
+// candidate it did not get to check — the failing one and the whole unvisited
+// remainder — so a quiet window's fold is owed to the next pass, not to a
+// future append or a restart. Without the remainder re-arm, one transient
+// failure on the first candidate silently disarmed every later one until
+// seal.
+func TestRecollapseSweepFailureRearmsEveryUncheckedWindow(t *testing.T) {
+	s, w := newTestWriter(t)
+	now := uint32(writerNowUnix)
+	ts := int64(now) - 5
+	for i := 0; i < 5; i++ { // every tier's window past the default factor
+		writeFixturePass(t, s, w)
+	}
+	require.NoError(t, w.Close())
+
+	pending := func() map[windowKey]struct{} {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		out := make(map[windowKey]struct{}, len(s.recollapsePending))
+		for k := range s.recollapsePending {
+			out[k] = struct{}{}
+		}
+		return out
+	}
+	require.Len(t, pending(), len(tiers), "every tier's window must be a candidate")
+
+	// fail the sweep on its FIRST candidate: a directory at the 1s window's
+	// path passes the stat but fails the open, and the sweep visits windows
+	// in tier order, so 1m and 1h are the unvisited remainder
+	start1s := testWindowStart(Tier1s, ts)
+	path1s := filepath.Join(s.cfg.Dir, archiveSubdir, archiveFileName(Tier1s, start1s))
+	aside := path1s + ".aside"
+	require.NoError(t, os.Rename(path1s, aside))
+	require.NoError(t, os.Mkdir(path1s, 0o755))
+
+	err := recollapseSealer(s, &recordingMetrics{}, DefaultRecollapseFactor).SealOnce(context.Background())
+	require.Error(t, err, "the unopenable window must fail the pass")
+
+	still := pending()
+	for _, tier := range tiers {
+		_, ok := still[windowKey{tier: tier, start: testWindowStart(tier, ts)}]
+		require.True(t, ok, "%s: a give-up pass must re-arm every unchecked window", tier)
+	}
+
+	// repair the file: the next pass must reach every re-armed candidate
+	require.NoError(t, os.Remove(path1s))
+	require.NoError(t, os.Rename(aside, path1s))
+	rec := &recordingMetrics{}
+	require.NoError(t, recollapseSealer(s, rec, DefaultRecollapseFactor).SealOnce(context.Background()))
+	require.Equal(t, len(tiers), countWindowEvents(rec, WindowRecollapsed),
+		"the repaired sweep must fold every re-armed window")
+	for _, tier := range tiers {
+		require.Equal(t, 2, recollapseWindowRows(t, s, tier, testWindowStart(tier, ts)),
+			"%s: one row per key after the repaired sweep", tier)
 	}
 }
 

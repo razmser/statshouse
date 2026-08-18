@@ -73,11 +73,17 @@ DUCKDB_LIBPTHREAD :=
 DUCKDB_EXTLDFLAGS := -O2
 endif
 
+# osusergo is load-bearing for the static Linux link: a statically-linked
+# glibc cannot dlopen its NSS modules, so the cgo group lookup behind
+# ChangeUserGroup fails and the daemon dies at startup whenever it starts as
+# root with --user/--group (the standard daemon start shape). osusergo makes
+# os/user read /etc/passwd and /etc/group directly instead. The e2e harness
+# builds its duck aggregator with the same tag for exactly this reason.
 build-agg-duckdb:
 ifneq ($(DUCKDB_LIBPTHREAD),)
 	@test "$(DUCKDB_LIBPTHREAD)" != "libpthread.a" || { echo 'ERROR: $(CC) -print-file-name=libpthread.a echoed the argument back (no libpthread.a in the toolchain?) — the static duckdb build needs a complete toolchain' >&2; exit 1; }
 endif
-	go build -tags duckdb -ldflags "$(COMMON_BUILD_VARS) -extldflags '$(DUCKDB_EXTLDFLAGS)'" -buildvcs=false -o target/statshouse-agg-duckdb ./cmd/statshouse-agg
+	go build -tags "duckdb osusergo" -ldflags "$(COMMON_BUILD_VARS) -extldflags '$(DUCKDB_EXTLDFLAGS)'" -buildvcs=false -o target/statshouse-agg-duckdb ./cmd/statshouse-agg
 
 build-sh-grafana:
 	go build -ldflags "$(COMMON_LDFLAGS)" -buildvcs=false -o target/statshouse-grafana-plugin ./cmd/statshouse-grafana-plugin

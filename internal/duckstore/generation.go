@@ -381,7 +381,7 @@ func (s *Store) consumeWindow(ctx context.Context, gen int64, deltaPath string, 
 		s.consumed[k] = map[int64]struct{}{}
 	}
 	s.consumed[k][gen] = struct{}{}
-	delete(s.evicted, k) // the window is served and holding again; any eviction tombstone is stale
+	delete(s.evicted, k)      // the window is served and holding again; any eviction tombstone is stale
 	s.markRecollapseLocked(k) // the append left partial rows; the sealer's re-collapse sweep owes this window a check
 	s.mu.Unlock()
 	return nil

@@ -20,14 +20,14 @@ import (
 // data. The clock starts at the component's creation: until the first
 // successful pass, the age is time-since-start. There is deliberately no lock
 // around it — a stuck pass must not be able to block the gauge meant to
-// expose it — so the timestamp is atomic and the component holding the clock
-// is never copied.
+// expose it — so the timestamp is atomic and the clock is only ever handed
+// around by pointer, never copied.
 type maintenanceClock struct {
 	last atomic.Int64 // unix nanos of the last successful pass, or of start
 }
 
-func newMaintenanceClock() maintenanceClock {
-	var c maintenanceClock
+func newMaintenanceClock() *maintenanceClock {
+	c := &maintenanceClock{}
 	c.last.Store(time.Now().UnixNano())
 	return c
 }

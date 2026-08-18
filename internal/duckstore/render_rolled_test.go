@@ -481,6 +481,47 @@ func TestQuerySnapshotInvalidatedByOwnGenerationConsumptionRetries(t *testing.T)
 	require.Equal(t, []float64{5}, r.count)
 }
 
+// TestQuerySnapshotInvalidationExhaustionFailsLoudly pins the retry bound's
+// far end: a record that invalidates every fresh snapshot — a state no
+// interleaving can hold for long, but one a bug could pin — exhausts the
+// bounded retries and fails the query with the invalidation as its cause,
+// rather than spinning forever or answering a possibly double-counted view.
+func TestQuerySnapshotInvalidationExhaustionFailsLoudly(t *testing.T) {
+	s, w := newTestWriter(t)
+	b1 := (writerNowUnix - 7200) / 60 * 60
+
+	require.NoError(t, w.WriteRound(context.Background(), []Row{
+		{Metric: testMetricID, Time: uint32(b1), Tags: tag0(11), Count: 2},
+	}))
+	genA := s.ActiveDeltaGeneration()
+	require.NoError(t, s.RollGeneration())
+	require.NoError(t, s.ConsumeGeneration(context.Background(), genA, ConsumeOptions{}))
+
+	require.NoError(t, w.WriteRound(context.Background(), []Row{
+		{Metric: testMetricID, Time: uint32(b1), Tags: tag0(11), Count: 3},
+	}))
+	genB := s.ActiveDeltaGeneration()
+
+	snap, err := s.acquireQuerySnapshot(context.Background(), Tier1s, b1, b1+120)
+	require.NoError(t, err)
+	kCur := snap.windows[0].src.key
+	snap.release()
+
+	// the record stays for every attempt: each fresh snapshot sees its own
+	// generation recorded in the window it reads and must refuse to serve it
+	s.mu.Lock()
+	if s.consumed[kCur] == nil {
+		s.consumed[kCur] = map[int64]struct{}{}
+	}
+	s.consumed[kCur][genB] = struct{}{}
+	s.mu.Unlock()
+
+	err = renderSeriesErr(t, s, 1, seriesReq(testMetricID, twoMappedKinds,
+		[]int32{int32(data_model.DigestCount)}, []int32{0}, b1, b1+120, 15))
+	require.ErrorIs(t, err, errQuerySnapshotInvalidated, "exhaustion must surface the invalidation as the cause")
+	require.Contains(t, err.Error(), "could not settle on a consistent view")
+}
+
 // TestEvictedWindowTombstoneBlocksGenerationServing pins the tombstone rule
 // from Task 6 as the rolled-generation serving sees it: a window retention
 // unlinked after consuming it is gone by policy, so a later generation's

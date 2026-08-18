@@ -100,6 +100,17 @@ func openTestStoreWithSchemaAxes(t *testing.T, dir string, deltaAxis, archiveAxi
 	return s, &logs
 }
 
+// allTierTables lists every tier table — the retired three-table delta
+// layout, which the quarantine fixtures below fabricate the way a binary
+// older than DeltaSchemaVersion 5 would have written it.
+func allTierTables() []string {
+	tables := make([]string, 0, len(tiers))
+	for _, tier := range tiers {
+		tables = append(tables, tierTables[tier])
+	}
+	return tables
+}
+
 // createTestFile fabricates a store file with an arbitrary stamp and optional
 // row content, the way a different binary version would have written it.
 func createTestFile(t *testing.T, path string, tables []string, st stamp, rows func(db *sql.DB)) {

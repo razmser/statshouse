@@ -97,7 +97,7 @@ type RetentionConfig struct {
 type Retainer struct {
 	store *Store
 	cfg   RetentionConfig
-	clock maintenanceClock // liveness: time since the last successful pass
+	clock *maintenanceClock // liveness: time since the last successful pass
 
 	mu sync.Mutex // one pass at a time
 }

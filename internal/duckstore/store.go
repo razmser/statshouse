@@ -131,9 +131,9 @@ type Store struct {
 	// the lock ordering.
 	windowLocks windowLockRegistry
 
-	windows     []WindowFile
-	consumed    map[windowKey]map[int64]struct{} // per archive window, the delta generations it already holds
-	evicted     map[windowKey]struct{}           // per successfully unlinked window: a tombstone marking "consumed, then evicted" so an absent s.consumed entry keeps meaning "never consumed" (see DropWindow)
+	windows  []WindowFile
+	consumed map[windowKey]map[int64]struct{} // per archive window, the delta generations it already holds
+	evicted  map[windowKey]struct{}           // per successfully unlinked window: a tombstone marking "consumed, then evicted" so an absent s.consumed entry keeps meaning "never consumed" (see DropWindow)
 	// recollapsePending is the set of archive windows whose tables may hold
 	// more partial rows than the re-collapse factor allows: every window an
 	// append commits into is marked, and the sealer's sweep drains the set
@@ -141,9 +141,9 @@ type Store struct {
 	// count, in-memory only — an open re-seeds it from the unsealed windows
 	// it recovers, which is the same information a restart has.
 	recollapsePending map[windowKey]struct{}
-	leases      map[windowKey]int                // per archive window, the read leases queries hold; retention defers unlinks to them
-	deltaPins   map[int64]*deltaPinState         // per delta generation, the read pins queries hold; consumption's unlink waits for them (see lease.go)
-	quarantined []QuarantineInfo
+	leases            map[windowKey]int        // per archive window, the read leases queries hold; retention defers unlinks to them
+	deltaPins         map[int64]*deltaPinState // per delta generation, the read pins queries hold; consumption's unlink waits for them (see lease.go)
+	quarantined       []QuarantineInfo
 }
 
 // OpenStore opens (creating on first start) the store in cfg.Dir.
@@ -706,14 +706,6 @@ func embeddedDuckDBVersion() (string, error) {
 		return "", fmt.Errorf("cannot read embedded DuckDB version: %w", err)
 	}
 	return version, nil
-}
-
-func allTierTables() []string {
-	tables := make([]string, 0, len(tiers))
-	for _, tier := range tiers {
-		tables = append(tables, tierTables[tier])
-	}
-	return tables
 }
 
 // deltaTables is the table list a delta generation file carries: the 1s tier

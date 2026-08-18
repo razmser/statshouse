@@ -590,6 +590,37 @@ func TestLivenessSamplerReportsBacklog(t *testing.T) {
 	require.Zero(t, m.backlogs[3].oldest)
 }
 
+// TestLivenessSamplerBacklogCountsRecoveredGenerations pins the restart case:
+// the open stamps every disk-recovered rolled generation as backlog from the
+// open itself — the earliest instant the process can vouch for — so a store
+// that comes back with undrained deltas reports them immediately, with an age
+// that keeps growing until compaction takes them.
+func TestLivenessSamplerBacklogCountsRecoveredGenerations(t *testing.T) {
+	dir := t.TempDir()
+	s, err := OpenStore(StoreConfig{Dir: dir, StatshouseVersion: testStatshouseVersion})
+	require.NoError(t, err)
+	w, err := NewWriter(s, WriterConfig{NowFunc: func() time.Time { return writerNow }})
+	require.NoError(t, err)
+	row := partialRow(t, testMetricID, uint32(writerNowUnix)-5)
+	row.Count, row.Sum = 1, 1
+	require.NoError(t, w.WriteRound(context.Background(), []Row{row}))
+	require.NoError(t, s.RollGeneration())
+	require.NoError(t, w.Close())
+	require.NoError(t, s.Close())
+
+	// the restart: only the open's recovery can feed the backlog gauge
+	s2, _ := openTestStore(t, dir)
+	m := &recordingMetrics{}
+	SampleLiveness(s2, nil, m)
+	require.Equal(t, 1, m.backlogs[0].generations, "the recovered rolled generation must count as backlog")
+	require.GreaterOrEqual(t, m.backlogs[0].oldest, time.Duration(0))
+
+	time.Sleep(20 * time.Millisecond)
+	SampleLiveness(s2, nil, m)
+	require.Equal(t, 1, m.backlogs[1].generations)
+	require.Greater(t, m.backlogs[1].oldest, m.backlogs[0].oldest, "the recovered generation's age must grow while it waits")
+}
+
 // TestMaintenanceAgeGrowsUntilSuccessfulPass proves the compaction clock the
 // liveness sampler reports counts only successful passes: the age grows while
 // no pass completes and through failed passes alike, and resets when one
