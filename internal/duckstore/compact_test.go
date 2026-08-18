@@ -948,7 +948,7 @@ func goldenReferenceConsume(t *testing.T, s *Store, gen int64) {
 	for _, k := range sortedWindowKeys(windows) {
 		path := filepath.Join(s.cfg.Dir, archiveSubdir, archiveFileName(k.tier, k.start))
 		if _, err := os.Stat(path); os.IsNotExist(err) {
-			require.NoError(t, createArchiveWindow(path, k.tier, s.currentStamp(), s.cfg.Resources))
+			require.NoError(t, createArchiveWindow(path, k.tier, s.currentStamp(fileKindArchive), s.cfg.Resources))
 		}
 		db, err := openStoreFile(path, false, s.cfg.Resources)
 		require.NoError(t, err)
@@ -1093,7 +1093,7 @@ func TestConsumeCancelledMidAppendHoldsNeitherRowsNorRecord(t *testing.T) {
 	aborted, err := openStoreFile(filepath.Join(crashDir, archiveSubdir, archiveFileName(first.tier, first.start)), true, ResourcesConfig{})
 	require.NoError(t, err)
 	var rows int
-	require.NoError(t, aborted.QueryRow("SELECT count(*) FROM " + tierTables[first.tier]).Scan(&rows))
+	require.NoError(t, aborted.QueryRow("SELECT count(*) FROM "+tierTables[first.tier]).Scan(&rows))
 	require.Zero(t, rows, "appender rows flushed into the open transaction must not survive its rollback")
 	recorded, err := readConsumed(aborted)
 	require.NoError(t, err)

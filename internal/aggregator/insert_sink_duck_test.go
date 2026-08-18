@@ -291,7 +291,8 @@ func TestDuckMetricsTagMappings(t *testing.T) {
 	require.Equal(t, int32(format.TagValueIDDuckTier1h), duckTierTag(duckstore.Tier1h))
 	require.Zero(t, duckTierTag("no such tier"))
 
-	require.Equal(t, int32(format.TagValueIDDuckQuarantineSchema), duckQuarantineAxisTag(duckstore.QuarantineSchema))
+	require.Equal(t, int32(format.TagValueIDDuckQuarantineDeltaSchema), duckQuarantineAxisTag(duckstore.QuarantineDeltaSchema))
+	require.Equal(t, int32(format.TagValueIDDuckQuarantineArchiveSchema), duckQuarantineAxisTag(duckstore.QuarantineArchiveSchema))
 	require.Equal(t, int32(format.TagValueIDDuckQuarantineStorage), duckQuarantineAxisTag(duckstore.QuarantineStorage))
 	require.Equal(t, int32(format.TagValueIDDuckQuarantineStatshouse), duckQuarantineAxisTag(duckstore.QuarantineStatshouse))
 	require.Equal(t, int32(format.TagValueIDDuckQuarantineUnreadable), duckQuarantineAxisTag(duckstore.QuarantineUnreadable))

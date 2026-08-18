@@ -211,8 +211,10 @@ func duckTierTag(tier string) int32 {
 
 func duckQuarantineAxisTag(axis duckstore.QuarantineAxis) int32 {
 	switch axis {
-	case duckstore.QuarantineSchema:
-		return format.TagValueIDDuckQuarantineSchema
+	case duckstore.QuarantineDeltaSchema:
+		return format.TagValueIDDuckQuarantineDeltaSchema
+	case duckstore.QuarantineArchiveSchema:
+		return format.TagValueIDDuckQuarantineArchiveSchema
 	case duckstore.QuarantineStorage:
 		return format.TagValueIDDuckQuarantineStorage
 	case duckstore.QuarantineStatshouse:

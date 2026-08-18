@@ -55,14 +55,20 @@ const (
 )
 
 // QuarantineAxis is why a store file was quarantined on open: which of the
-// three version axes disagreed, or that the file could not be read at all.
+// version axes disagreed — the delta-generation schema axis, the
+// archive-window schema axis, DuckDB's storage format, the StatsHouse
+// version — or that the file could not be read at all. The two schema axes
+// are reported separately so an operator can tell a delta-only bump (fresh
+// data, recovered by reingestion) from an archive-axis bump (history lost
+// for the quarantined files).
 type QuarantineAxis string
 
 const (
-	QuarantineSchema     QuarantineAxis = "schema"
-	QuarantineStorage    QuarantineAxis = "storage"
-	QuarantineStatshouse QuarantineAxis = "statshouse"
-	QuarantineUnreadable QuarantineAxis = "unreadable"
+	QuarantineDeltaSchema   QuarantineAxis = "delta_schema"
+	QuarantineArchiveSchema QuarantineAxis = "archive_schema"
+	QuarantineStorage       QuarantineAxis = "storage"
+	QuarantineStatshouse    QuarantineAxis = "statshouse"
+	QuarantineUnreadable    QuarantineAxis = "unreadable"
 )
 
 // QueryVerb distinguishes the two structured store-query verbs.

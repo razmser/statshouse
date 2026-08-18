@@ -324,8 +324,8 @@ func TestRetainerReportsWindowEvents(t *testing.T) {
 }
 
 // TestOpenStoreReportsQuarantinedFilesPerAxis proves each quarantined file is
-// counted on the axis that excluded it: the three version axes and the
-// unreadable catch-all.
+// counted on the axis that excluded it: the two kind-scoped schema axes, the
+// two shared version axes and the unreadable catch-all.
 func TestOpenStoreReportsQuarantinedFilesPerAxis(t *testing.T) {
 	for _, tc := range []struct {
 		axis string
@@ -333,19 +333,28 @@ func TestOpenStoreReportsQuarantinedFilesPerAxis(t *testing.T) {
 		file func(t *testing.T, dir string)
 	}{
 		{
-			axis: "schema",
-			want: QuarantineSchema,
+			axis: "delta schema",
+			want: QuarantineDeltaSchema,
 			file: func(t *testing.T, dir string) {
-				bad := currentTestStamp(t)
-				bad.schemaVersion = SchemaVersion + 1
+				bad := currentTestStamp(t, fileKindDelta)
+				bad.schemaVersion = DeltaSchemaVersion + 1
 				createTestFile(t, filepath.Join(dir, deltaFileName(0)), allTierTables(), bad, nil)
+			},
+		},
+		{
+			axis: "archive schema",
+			want: QuarantineArchiveSchema,
+			file: func(t *testing.T, dir string) {
+				bad := currentTestStamp(t, fileKindArchive)
+				bad.schemaVersion = ArchiveSchemaVersion + 1
+				createTestFile(t, filepath.Join(dir, archiveSubdir, archiveFileName(Tier1s, 3600)), []string{TierTable(Tier1s)}, bad, nil)
 			},
 		},
 		{
 			axis: "storage",
 			want: QuarantineStorage,
 			file: func(t *testing.T, dir string) {
-				bad := currentTestStamp(t)
+				bad := currentTestStamp(t, fileKindDelta)
 				bad.storageVersion = "v0.0.0-someotherduckdb"
 				createTestFile(t, filepath.Join(dir, deltaFileName(0)), allTierTables(), bad, nil)
 			},
@@ -354,7 +363,7 @@ func TestOpenStoreReportsQuarantinedFilesPerAxis(t *testing.T) {
 			axis: "statshouse",
 			want: QuarantineStatshouse,
 			file: func(t *testing.T, dir string) {
-				bad := currentTestStamp(t)
+				bad := currentTestStamp(t, fileKindDelta)
 				bad.statshouseVersion = "some-other-binary"
 				createTestFile(t, filepath.Join(dir, deltaFileName(0)), allTierTables(), bad, nil)
 			},

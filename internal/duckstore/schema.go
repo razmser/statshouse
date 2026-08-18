@@ -14,23 +14,63 @@ import (
 	"github.com/VKCOM/statshouse/internal/format"
 )
 
-// SchemaVersion is the duck-store on-disk schema version. Every store file is
-// stamped with the version that wrote it; a file whose stamp does not match
-// the running binary is quarantined, never upgraded in place and never read
-// through a compatibility shim.
+// The duck-store on-disk schema version is two axes, one per file kind:
+// DeltaSchemaVersion stamps delta generation files, ArchiveSchemaVersion
+// stamps archive window files. Every store file carries the version of its
+// own kind that wrote it; a file whose stamp does not match the running
+// binary on its kind's axis is quarantined, never upgraded in place and
+// never read through a compatibility shim — ADR-0002's exact-match rule,
+// held by each axis separately. The axes are separate because the two kinds
+// have different lifetimes: delta generations are transient by design, while
+// archive windows are the store's whole history, and a layout change to one
+// kind must never evict the other's files (ADR-0005).
 //
-// History:
+// History (shared until the axes split at 4, so each axis starts there):
 //
 //	1: initial layout — tier tables plus the version stamp
 //	2: every store file also carries duck_store_consumed
 //	3: every store file also carries duck_store_sealed
 //	4: host columns also carry their skewed argMin/argMax state values
-const SchemaVersion = 4
+//	   (the axes split here; from now on a delta-only change bumps only
+//	   DeltaSchemaVersion and an archive-only change only
+//	   ArchiveSchemaVersion)
+const (
+	DeltaSchemaVersion   = 4
+	ArchiveSchemaVersion = 4
+)
+
+// fileKind is which of the store's two file kinds a file is: a delta
+// generation the writer appends to, or an archive window compaction
+// produces. The kinds' layouts evolve independently, so the schema-version
+// axis a file is stamped with and verified against is its own kind's. The
+// kind is a property of the file's name and directory, not of its contents:
+// nothing on disk records it, and nothing needs to, because every open path
+// already knows which kind of file it is opening.
+type fileKind int
+
+const (
+	fileKindDelta   fileKind = iota // delta-<generation>.duckdb in the store root
+	fileKindArchive                 // <tier>-<window>.duckdb under the archive directory
+)
+
+// label names the kind in operator-facing messages, such as the quarantine
+// reason a stamp mismatch produces.
+func (k fileKind) label() string {
+	switch k {
+	case fileKindDelta:
+		return "delta"
+	default:
+		return "archive"
+	}
+}
 
 // VersionTable is the version-stamp table written into every store file
-// (delta generations and archive windows alike). It carries the three version
-// axes the store verifies on open: the duck-store schema version, the DuckDB
-// version that wrote the file and the StatsHouse version that wrote it.
+// (delta generations and archive windows alike). It carries the version axes
+// the store verifies on open: the file's own kind's duck-store schema version
+// (delta files against DeltaSchemaVersion, archive windows against
+// ArchiveSchemaVersion), the DuckDB version that wrote the file and the
+// StatsHouse version that wrote it. The table's shape is identical for both
+// kinds; only the meaning of the schema_version column is scoped by kind.
 const VersionTable = "duck_store_version"
 
 // VersionTableDDL creates the version-stamp table (see VersionTable).

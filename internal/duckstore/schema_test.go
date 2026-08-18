@@ -80,6 +80,18 @@ func TestTierSeconds(t *testing.T) {
 	require.EqualValues(t, 3600, tierSeconds[Tier1h])
 }
 
+// TestSchemaVersionAxesAreScopedByFileKind pins the file-kind taxonomy the two
+// schema-version axes hang on (DeltaSchemaVersion / ArchiveSchemaVersion) —
+// in the untagged build, where this file is the axes' only visible surface.
+// The labels are load-bearing: they name the axis in the quarantine reason a
+// stamp mismatch produces, and the metric tag values the aggregator reports.
+func TestSchemaVersionAxesAreScopedByFileKind(t *testing.T) {
+	require.Equal(t, "delta", fileKindDelta.label())
+	require.Equal(t, "archive", fileKindArchive.label())
+	require.Positive(t, DeltaSchemaVersion)
+	require.Positive(t, ArchiveSchemaVersion)
+}
+
 func TestDeltaFileNames(t *testing.T) {
 	for _, gen := range []int64{0, 1, 42, 1 << 40} {
 		name := deltaFileName(gen)

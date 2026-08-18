@@ -40,17 +40,53 @@ func openTestStore(t *testing.T, dir string) (*Store, *[]string) {
 	return s, &logs
 }
 
-// currentTestStamp is the exact stamp a file must carry to be accepted by
-// openTestStore.
-func currentTestStamp(t *testing.T) stamp {
+// currentTestStamp is the exact stamp a file of the given kind must carry to
+// be accepted by openTestStore: the kind's own schema-version axis plus the
+// two axes shared by every file.
+func currentTestStamp(t *testing.T, kind fileKind) stamp {
 	t.Helper()
 	storageVersion, err := embeddedDuckDBVersion()
 	require.NoError(t, err)
+	schemaVersion := ArchiveSchemaVersion
+	if kind == fileKindDelta {
+		schemaVersion = DeltaSchemaVersion
+	}
 	return stamp{
-		schemaVersion:     SchemaVersion,
+		schemaVersion:     schemaVersion,
 		storageVersion:    storageVersion,
 		statshouseVersion: testStatshouseVersion,
 	}
+}
+
+// openTestStoreWithSchemaAxes opens a store through the same scan-and-open
+// sequence OpenStore drives, with the schema-version axes set explicitly —
+// standing in for a binary whose axes hold these numbers, the way the next
+// delta or archive layout change makes them diverge. Production always opens
+// on the constants; nothing outside the package can configure this.
+func openTestStoreWithSchemaAxes(t *testing.T, dir string, deltaAxis, archiveAxis int) (*Store, *[]string) {
+	t.Helper()
+	for _, d := range []string{dir, filepath.Join(dir, archiveSubdir), filepath.Join(dir, quarantineSubdir)} {
+		require.NoError(t, os.MkdirAll(d, 0o755))
+	}
+	storageVersion, err := embeddedDuckDBVersion()
+	require.NoError(t, err)
+	var logs []string
+	s := &Store{
+		cfg: StoreConfig{
+			Dir:               dir,
+			StatshouseVersion: testStatshouseVersion,
+			Logf:              func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) },
+		},
+		storageVersion:       storageVersion,
+		deltaSchemaVersion:   deltaAxis,
+		archiveSchemaVersion: archiveAxis,
+		consumed:             map[windowKey]map[int64]struct{}{},
+		rolledOff:            map[int64]time.Time{},
+	}
+	require.NoError(t, s.scanArchives())
+	require.NoError(t, s.openDeltas())
+	t.Cleanup(func() { _ = s.Close() })
+	return s, &logs
 }
 
 // createTestFile fabricates a store file with an arbitrary stamp and optional
@@ -158,8 +194,8 @@ func TestOpenStoreSchemaIsTransliteratedDDL(t *testing.T) {
 	require.NoError(t, db.QueryRow(
 		`SELECT schema_version, storage_version, statshouse_version FROM `+VersionTable).
 		Scan(&schemaVersion, &storageVersion, &statshouseVersion))
-	require.Equal(t, SchemaVersion, schemaVersion)
-	require.Equal(t, currentTestStamp(t).storageVersion, storageVersion)
+	require.Equal(t, DeltaSchemaVersion, schemaVersion)
+	require.Equal(t, currentTestStamp(t, fileKindDelta).storageVersion, storageVersion)
 	require.Equal(t, testStatshouseVersion, statshouseVersion)
 }
 
@@ -171,7 +207,7 @@ func TestOpenStoreResumesNewestValidGeneration(t *testing.T) {
 
 	// a crash-recovery-style restart leaves an older generation behind while
 	// a newer one exists: writes must go to the newest, none may be lost
-	createTestFile(t, filepath.Join(dir, deltaFileName(1)), allTierTables(), currentTestStamp(t), func(db *sql.DB) {
+	createTestFile(t, filepath.Join(dir, deltaFileName(1)), allTierTables(), currentTestStamp(t, fileKindDelta), func(db *sql.DB) {
 		_, err := db.Exec(`INSERT INTO s1 (metric, time, count) VALUES ($1, $2, $3)`, int32(6), int64(1800000000), 10.0)
 		require.NoError(t, err)
 	})
@@ -254,9 +290,9 @@ func TestOpenStoreQuarantinesDeltaOnAnyStampAxisMismatch(t *testing.T) {
 		pertub func(st *stamp)
 	}{
 		{
-			axis:   "duck-store schema version",
-			reason: "duck-store schema version mismatch",
-			pertub: func(st *stamp) { st.schemaVersion = SchemaVersion + 1 },
+			axis:   "duck-store delta schema version",
+			reason: "duck-store delta schema version mismatch",
+			pertub: func(st *stamp) { st.schemaVersion = DeltaSchemaVersion + 1 },
 		},
 		{
 			axis:   "DuckDB storage version",
@@ -273,14 +309,14 @@ func TestOpenStoreQuarantinesDeltaOnAnyStampAxisMismatch(t *testing.T) {
 			dir := t.TempDir()
 
 			// a delta written by a binary that disagrees on exactly one axis
-			bad := currentTestStamp(t)
+			bad := currentTestStamp(t, fileKindDelta)
 			tc.pertub(&bad)
 			createTestFile(t, filepath.Join(dir, deltaFileName(0)), allTierTables(), bad, nil)
 
 			// ...and an archive window the running binary fully vouches for
 			archive := filepath.Join(dir, archiveSubdir, archiveFileName(Tier1s, 3600))
 			require.NoError(t, os.MkdirAll(filepath.Join(dir, archiveSubdir), 0o755))
-			createTestFile(t, archive, []string{TierTable(Tier1s)}, currentTestStamp(t), nil)
+			createTestFile(t, archive, []string{TierTable(Tier1s)}, currentTestStamp(t, fileKindArchive), nil)
 
 			s, logs := openTestStore(t, dir)
 
@@ -308,6 +344,180 @@ func TestOpenStoreQuarantinesDeltaOnAnyStampAxisMismatch(t *testing.T) {
 	}
 }
 
+// TestOpenStoreDeltaAxisBumpQuarantinesDeltasNotArchives pins the split's
+// reason to exist: the next binary that changes only the delta layout bumps
+// only the delta axis, and the files the older binary wrote must divide
+// accordingly — the delta generations it left behind are quarantined, but the
+// archive windows that very binary wrote stay in service, because their axis
+// never moved. Under the shared version every archive window would have been
+// evicted together with the deltas (ADR-0005).
+func TestOpenStoreDeltaAxisBumpQuarantinesDeltasNotArchives(t *testing.T) {
+	dir := t.TempDir()
+
+	// files exactly as the current binary writes them: an undrained delta
+	// generation plus two archive windows, one with rows in it
+	createTestFile(t, filepath.Join(dir, deltaFileName(0)), allTierTables(), currentTestStamp(t, fileKindDelta), func(db *sql.DB) {
+		_, err := db.Exec(`INSERT INTO s1 (metric, time, count, sum) VALUES ($1, $2, $3, $4)`, int32(1), int64(1700000000), 5.0, 25.0)
+		require.NoError(t, err)
+	})
+	one := filepath.Join(dir, archiveSubdir, archiveFileName(Tier1s, 3600))
+	two := filepath.Join(dir, archiveSubdir, archiveFileName(Tier1m, 0))
+	createTestFile(t, one, []string{TierTable(Tier1s)}, currentTestStamp(t, fileKindArchive), func(db *sql.DB) {
+		_, err := db.Exec(`INSERT INTO s1 (metric, time, count, sum) VALUES ($1, $2, $3, $4)`, int32(9), int64(3600), 4.0, 16.0)
+		require.NoError(t, err)
+	})
+	createTestFile(t, two, []string{TierTable(Tier1m)}, currentTestStamp(t, fileKindArchive), nil)
+
+	// the binary after a delta-layout change: the delta axis moved, the
+	// archive axis did not
+	s, logs := openTestStoreWithSchemaAxes(t, dir, DeltaSchemaVersion+1, ArchiveSchemaVersion)
+
+	// the older binary's delta is quarantined — named, counted, on the delta axis
+	quarantined := s.Quarantined()
+	require.Len(t, quarantined, 1)
+	require.Equal(t, filepath.Join(dir, deltaFileName(0)), quarantined[0].Path)
+	require.Equal(t, QuarantineDeltaSchema, quarantined[0].Axis)
+	require.Contains(t, quarantined[0].Reason, "duck-store delta schema version mismatch")
+	require.NoFileExists(t, filepath.Join(dir, deltaFileName(0)))
+	require.Contains(t, strings.Join(*logs, "\n"), "quarantined "+filepath.Join(dir, deltaFileName(0)))
+
+	// a fresh generation takes over and serves
+	require.Equal(t, []int64{1}, s.DeltaGenerations())
+	require.EqualValues(t, 1, s.ActiveDeltaGeneration())
+	requireDeltaServes(t, s)
+
+	// both archive windows from the older binary stay in service with their
+	// rows — the eviction the shared version would have performed
+	windows := s.Windows()
+	require.Len(t, windows, 2)
+	require.Equal(t, Tier1s, windows[0].Tier)
+	require.EqualValues(t, 3600, windows[0].WindowStart)
+	require.Equal(t, Tier1m, windows[1].Tier)
+	require.EqualValues(t, 0, windows[1].WindowStart)
+	db, err := openStoreFile(one, true, ResourcesConfig{})
+	require.NoError(t, err)
+	var count float64
+	require.NoError(t, db.QueryRow(`SELECT sum(count) FROM s1`).Scan(&count))
+	require.EqualValues(t, 4, count, "the surviving window's rows must be intact")
+	require.NoError(t, db.Close())
+}
+
+// TestOpenStoreArchiveAxisBumpQuarantinesArchivesNotDeltas is the mirror: an
+// archive-layout change moves only the archive axis, so archive windows
+// written by the older binary are quarantined while the delta generation it
+// was writing resumes untouched — same generation number, rows intact, still
+// taking writes.
+func TestOpenStoreArchiveAxisBumpQuarantinesArchivesNotDeltas(t *testing.T) {
+	dir := t.TempDir()
+
+	// the current binary's files: an active delta with rows, two archive windows
+	createTestFile(t, filepath.Join(dir, deltaFileName(0)), allTierTables(), currentTestStamp(t, fileKindDelta), func(db *sql.DB) {
+		_, err := db.Exec(`INSERT INTO s1 (metric, time, count, sum) VALUES ($1, $2, $3, $4)`, int32(6), int64(1700000000), 10.0, 50.0)
+		require.NoError(t, err)
+	})
+	archiveDir := filepath.Join(dir, archiveSubdir)
+	createTestFile(t, filepath.Join(archiveDir, archiveFileName(Tier1s, 3600)), []string{TierTable(Tier1s)}, currentTestStamp(t, fileKindArchive), nil)
+	createTestFile(t, filepath.Join(archiveDir, archiveFileName(Tier1h, 0)), []string{TierTable(Tier1h)}, currentTestStamp(t, fileKindArchive), nil)
+
+	// the binary after an archive-layout change: only the archive axis moved
+	s, logs := openTestStoreWithSchemaAxes(t, dir, DeltaSchemaVersion, ArchiveSchemaVersion+1)
+
+	// both windows are quarantined on the archive axis — named and counted
+	quarantined := s.Quarantined()
+	require.Len(t, quarantined, 2)
+	for _, q := range quarantined {
+		require.Equal(t, QuarantineArchiveSchema, q.Axis)
+		require.Contains(t, q.Reason, "duck-store archive schema version mismatch")
+	}
+	require.Empty(t, s.Windows())
+	require.NoFileExists(t, filepath.Join(archiveDir, archiveFileName(Tier1s, 3600)))
+	require.NoFileExists(t, filepath.Join(archiveDir, archiveFileName(Tier1h, 0)))
+	require.Contains(t, strings.Join(*logs, "\n"), "quarantined "+filepath.Join(archiveDir, archiveFileName(Tier1s, 3600)))
+
+	// the delta the older binary was writing survives the bump and resumes
+	// as the active generation with its rows — quarantine of one kind never
+	// touches the other
+	require.Equal(t, []int64{0}, s.DeltaGenerations())
+	require.EqualValues(t, 0, s.ActiveDeltaGeneration())
+	var count float64
+	require.NoError(t, s.Delta().QueryRow(`SELECT sum(count) FROM s1`).Scan(&count))
+	require.EqualValues(t, 10, count, "the delta's rows must survive the archive-axis bump")
+	requireDeltaServes(t, s)
+}
+
+// TestOpenStoreMixedSchemaAxesServeTheCorrectSubset opens a directory whose
+// files disagree on several axes at once — a delta from an older delta axis,
+// a window from a future archive axis, a window from a foreign DuckDB, next
+// to a good delta and a good window — and pins both halves: exactly the
+// mismatching files leave, each counted on its own axis, and exactly the
+// vouched-for subset keeps serving.
+func TestOpenStoreMixedSchemaAxesServeTheCorrectSubset(t *testing.T) {
+	dir := t.TempDir()
+	archiveDir := filepath.Join(dir, archiveSubdir)
+
+	// delta-0 was written before a delta-axis bump — quarantined on the delta axis
+	oldDelta := currentTestStamp(t, fileKindDelta)
+	oldDelta.schemaVersion = DeltaSchemaVersion - 1
+	createTestFile(t, filepath.Join(dir, deltaFileName(0)), allTierTables(), oldDelta, nil)
+	// delta-1 is current on every axis — it survives and resumes active
+	createTestFile(t, filepath.Join(dir, deltaFileName(1)), allTierTables(), currentTestStamp(t, fileKindDelta), func(db *sql.DB) {
+		_, err := db.Exec(`INSERT INTO s1 (metric, time, count, sum) VALUES ($1, $2, $3, $4)`, int32(2), int64(1700000000), 7.0, 35.0)
+		require.NoError(t, err)
+	})
+	// a window from a binary whose archive axis is ahead — refused just the
+	// same as one behind; exact match per axis (ADR-0002, per axis)
+	futureArchive := currentTestStamp(t, fileKindArchive)
+	futureArchive.schemaVersion = ArchiveSchemaVersion + 1
+	createTestFile(t, filepath.Join(archiveDir, archiveFileName(Tier1s, 3600)), []string{TierTable(Tier1s)}, futureArchive, nil)
+	// a window written by a foreign DuckDB — quarantined on the storage axis
+	otherDuck := currentTestStamp(t, fileKindArchive)
+	otherDuck.storageVersion = "v0.0.0-someotherduckdb"
+	createTestFile(t, filepath.Join(archiveDir, archiveFileName(Tier1m, 0)), []string{TierTable(Tier1m)}, otherDuck, nil)
+	// a window current on every axis — stays, rows intact
+	good := filepath.Join(archiveDir, archiveFileName(Tier1h, 7200))
+	createTestFile(t, good, []string{TierTable(Tier1h)}, currentTestStamp(t, fileKindArchive), func(db *sql.DB) {
+		_, err := db.Exec(`INSERT INTO s1h (metric, time, count, sum) VALUES ($1, $2, $3, $4)`, int32(8), int64(7200), 6.0, 36.0)
+		require.NoError(t, err)
+	})
+
+	s, _ := openTestStoreWithSchemaAxes(t, dir, DeltaSchemaVersion, ArchiveSchemaVersion)
+
+	// three files leave, each attributed to the axis that excluded it
+	quarantined := s.Quarantined()
+	require.Len(t, quarantined, 3)
+	perAxis := map[QuarantineAxis]int{}
+	for _, q := range quarantined {
+		perAxis[q.Axis]++
+	}
+	require.Equal(t, map[QuarantineAxis]int{
+		QuarantineDeltaSchema:   1,
+		QuarantineArchiveSchema: 1,
+		QuarantineStorage:       1,
+	}, perAxis)
+	require.NoFileExists(t, filepath.Join(dir, deltaFileName(0)))
+	require.NoFileExists(t, filepath.Join(archiveDir, archiveFileName(Tier1s, 3600)))
+	require.NoFileExists(t, filepath.Join(archiveDir, archiveFileName(Tier1m, 0)))
+
+	// the correct subset serves: the good delta resumes active (no fresh
+	// generation — the newest valid one is active material) and the good
+	// window keeps its rows
+	require.Equal(t, []int64{1}, s.DeltaGenerations())
+	require.EqualValues(t, 1, s.ActiveDeltaGeneration())
+	var count float64
+	require.NoError(t, s.Delta().QueryRow(`SELECT sum(count) FROM s1`).Scan(&count))
+	require.EqualValues(t, 7, count)
+	windows := s.Windows()
+	require.Len(t, windows, 1)
+	require.Equal(t, Tier1h, windows[0].Tier)
+	require.EqualValues(t, 7200, windows[0].WindowStart)
+	db, err := openStoreFile(good, true, ResourcesConfig{})
+	require.NoError(t, err)
+	require.NoError(t, db.QueryRow(`SELECT sum(count) FROM s1h`).Scan(&count))
+	require.EqualValues(t, 6, count)
+	require.NoError(t, db.Close())
+	requireDeltaServes(t, s)
+}
+
 func TestOpenStoreQuarantinesBadArchivesAndKeepsServing(t *testing.T) {
 	dir := t.TempDir()
 	s, _ := openTestStore(t, dir) // a perfectly good delta
@@ -317,12 +527,12 @@ func TestOpenStoreQuarantinesBadArchivesAndKeepsServing(t *testing.T) {
 
 	// a valid window with rows in it
 	good := filepath.Join(archiveDir, archiveFileName(Tier1s, 3600))
-	createTestFile(t, good, []string{TierTable(Tier1s)}, currentTestStamp(t), func(db *sql.DB) {
+	createTestFile(t, good, []string{TierTable(Tier1s)}, currentTestStamp(t, fileKindArchive), func(db *sql.DB) {
 		_, err := db.Exec(`INSERT INTO s1 (metric, time, count, sum) VALUES ($1, $2, $3, $4)`, int32(9), int64(3600), 4.0, 16.0)
 		require.NoError(t, err)
 	})
 	// a window from a different StatsHouse version
-	other := currentTestStamp(t)
+	other := currentTestStamp(t, fileKindArchive)
 	other.statshouseVersion = "someone-else"
 	createTestFile(t, filepath.Join(archiveDir, archiveFileName(Tier1m, 0)), []string{TierTable(Tier1m)}, other, nil)
 	// a file that is not a database at all
@@ -411,7 +621,7 @@ func TestCreateFileLandsSchemaWithoutItsWal(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, archiveSubdir, archiveFileName(Tier1s, 3600))
 	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
-	require.NoError(t, createFile(path, []string{TierTable(Tier1s)}, currentTestStamp(t), ResourcesConfig{}))
+	require.NoError(t, createFile(path, []string{TierTable(Tier1s)}, currentTestStamp(t, fileKindArchive), ResourcesConfig{}))
 	if fi, err := os.Stat(path + ".wal"); err == nil {
 		require.Zero(t, fi.Size(), "the schema and stamp must live in the main file, not pending in the write-ahead log")
 		require.NoError(t, os.Remove(path+".wal"), "the discard the window rename performs must succeed")
@@ -431,7 +641,7 @@ func TestQuarantineDoesNotOverwriteEarlierQuarantine(t *testing.T) {
 	dir := t.TempDir()
 	archiveDir := filepath.Join(dir, archiveSubdir)
 
-	other := currentTestStamp(t)
+	other := currentTestStamp(t, fileKindArchive)
 	other.statshouseVersion = "someone-else"
 
 	createTestFile(t, filepath.Join(archiveDir, archiveFileName(Tier1s, 3600)), []string{TierTable(Tier1s)}, other, nil)

@@ -103,6 +103,16 @@ type Store struct {
 	// the second stamp axis.
 	storageVersion string
 
+	// deltaSchemaVersion and archiveSchemaVersion are the schema-version
+	// axes this binary writes and verifies, one per file kind. They take the
+	// DeltaSchemaVersion and ArchiveSchemaVersion constants and exist as
+	// fields for one reason: the axes are meant to diverge — a delta layout
+	// change bumps only the delta axis — and a test can only pin that
+	// divergence by opening with the axes apart, which no constant-only
+	// shape can express. Nothing outside the package can configure them.
+	deltaSchemaVersion   int
+	archiveSchemaVersion int
+
 	// mu guards the fields below. The files themselves are serialized by
 	// DuckDB; this only keeps the in-memory view coherent across the writer,
 	// the consumer and readers.
@@ -149,10 +159,12 @@ func OpenStore(cfg StoreConfig) (*Store, error) {
 		return nil, fmt.Errorf("duck-store: %w", err)
 	}
 	s := &Store{
-		cfg:            cfg,
-		storageVersion: storageVersion,
-		consumed:       map[windowKey]map[int64]struct{}{},
-		rolledOff:      map[int64]time.Time{},
+		cfg:                  cfg,
+		storageVersion:       storageVersion,
+		deltaSchemaVersion:   DeltaSchemaVersion,
+		archiveSchemaVersion: ArchiveSchemaVersion,
+		consumed:             map[windowKey]map[int64]struct{}{},
+		rolledOff:            map[int64]time.Time{},
 	}
 
 	// The directory tree is the whole setup: an operator points duck-store at
@@ -339,7 +351,7 @@ func (s *Store) openDeltas() error {
 		// never reused.
 		gen := maxSeen + 1
 		path := filepath.Join(s.cfg.Dir, deltaFileName(gen))
-		if err := createFile(path, allTierTables(), s.currentStamp(), s.cfg.Resources); err != nil {
+		if err := createFile(path, allTierTables(), s.currentStamp(fileKindDelta), s.cfg.Resources); err != nil {
 			return fmt.Errorf("duck-store: %w", err)
 		}
 		deltas = append(deltas, gen)
@@ -368,25 +380,29 @@ func (s *Store) verifyDeltaGeneration(gen int64) bool {
 		return false
 	}
 	defer db.Close()
-	st, err := s.verifyStamp(db, path)
+	st, err := s.verifyStamp(db, path, fileKindDelta)
 	if err != nil {
-		s.quarantineFile(path, err.Error(), s.stampMismatchAxis(st))
+		s.quarantineFile(path, err.Error(), s.stampMismatchAxis(st, fileKindDelta))
 		return false
 	}
 	return true
 }
 
-// stampMismatchAxis names the axis a stamp verifyStamp rejected: which of the
-// three version axes disagreed, or that there was no readable stamp to
-// compare at all.
-func (s *Store) stampMismatchAxis(st stamp) QuarantineAxis {
+// stampMismatchAxis names the axis a stamp verifyStamp rejected for a file of
+// the given kind: which of the version axes disagreed — the kind's own
+// schema axis, DuckDB's storage format, the StatsHouse version — or that
+// there was no readable stamp to compare at all.
+func (s *Store) stampMismatchAxis(st stamp, kind fileKind) QuarantineAxis {
 	if st.storageVersion == "" && st.schemaVersion == 0 {
 		return QuarantineUnreadable
 	}
-	cur := s.currentStamp()
+	cur := s.currentStamp(kind)
 	switch {
 	case st.schemaVersion != cur.schemaVersion:
-		return QuarantineSchema
+		if kind == fileKindDelta {
+			return QuarantineDeltaSchema
+		}
+		return QuarantineArchiveSchema
 	case st.storageVersion != cur.storageVersion:
 		return QuarantineStorage
 	default:
@@ -448,10 +464,10 @@ func (s *Store) scanArchives() error {
 			s.quarantineFile(path, fmt.Sprintf("cannot open: %v", err), QuarantineUnreadable)
 			continue
 		}
-		st, err := s.verifyStamp(db, path)
+		st, err := s.verifyStamp(db, path, fileKindArchive)
 		axis := QuarantineUnreadable
 		if err != nil {
-			axis = s.stampMismatchAxis(st)
+			axis = s.stampMismatchAxis(st, fileKindArchive)
 		}
 		var sealed bool
 		if err == nil {
@@ -489,32 +505,44 @@ type stamp struct {
 	statshouseVersion string
 }
 
-// currentStamp is the stamp the running binary writes into files it creates.
-func (s *Store) currentStamp() stamp {
+// currentStamp is the stamp the running binary writes into files of the
+// given kind it creates: the kind's own schema-version axis plus the two
+// axes shared by every file.
+func (s *Store) currentStamp(kind fileKind) stamp {
+	var schemaVersion int
+	switch kind {
+	case fileKindDelta:
+		schemaVersion = s.deltaSchemaVersion
+	default:
+		schemaVersion = s.archiveSchemaVersion
+	}
 	return stamp{
-		schemaVersion:     SchemaVersion,
+		schemaVersion:     schemaVersion,
 		storageVersion:    s.storageVersion,
 		statshouseVersion: s.cfg.StatshouseVersion,
 	}
 }
 
 // verifyStamp reads path's version-stamp table and demands an exact match
-// with the running binary on all three axes: duck-store schema, DuckDB
-// storage and StatsHouse. A file written by a different version is refused
-// rather than misread; there is no in-place upgrade and no compatibility
-// shim. The returned stamp is the file's own, for logging.
-func (s *Store) verifyStamp(db *sql.DB, path string) (stamp, error) {
+// with the running binary on every axis for a file of the given kind: the
+// kind's own duck-store schema axis (a delta file against the delta axis, an
+// archive window against the archive axis — the axes are verified
+// independently, so they can move independently), DuckDB storage and
+// StatsHouse. A file written by a different version is refused rather than
+// misread; there is no in-place upgrade and no compatibility shim. The
+// returned stamp is the file's own, for logging.
+func (s *Store) verifyStamp(db *sql.DB, path string, kind fileKind) (stamp, error) {
 	var st stamp
 	err := db.QueryRow("SELECT schema_version, storage_version, statshouse_version FROM "+VersionTable).
 		Scan(&st.schemaVersion, &st.storageVersion, &st.statshouseVersion)
 	if err != nil {
 		return st, fmt.Errorf("no %s table: %v", VersionTable, err)
 	}
-	cur := s.currentStamp()
+	cur := s.currentStamp(kind)
 	switch {
 	case st.schemaVersion != cur.schemaVersion:
-		return st, fmt.Errorf("duck-store schema version mismatch: file has %d, this binary writes %d",
-			st.schemaVersion, cur.schemaVersion)
+		return st, fmt.Errorf("duck-store %s schema version mismatch: file has %d, this binary writes %d",
+			kind.label(), st.schemaVersion, cur.schemaVersion)
 	case st.storageVersion != cur.storageVersion:
 		return st, fmt.Errorf("DuckDB storage version mismatch: file was written by DuckDB %q, this binary embeds %q",
 			st.storageVersion, cur.storageVersion)

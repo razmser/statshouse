@@ -1586,17 +1586,19 @@ var duckTierToValue = map[int32]string{
 }
 
 const (
-	TagValueIDDuckQuarantineSchema     = 1
-	TagValueIDDuckQuarantineStorage    = 2
-	TagValueIDDuckQuarantineStatshouse = 3
-	TagValueIDDuckQuarantineUnreadable = 4
+	TagValueIDDuckQuarantineDeltaSchema   = 1
+	TagValueIDDuckQuarantineArchiveSchema = 2
+	TagValueIDDuckQuarantineStorage       = 3
+	TagValueIDDuckQuarantineStatshouse    = 4
+	TagValueIDDuckQuarantineUnreadable    = 5
 )
 
 var duckQuarantineAxisToValue = map[int32]string{
-	TagValueIDDuckQuarantineSchema:     "schema",
-	TagValueIDDuckQuarantineStorage:    "storage",
-	TagValueIDDuckQuarantineStatshouse: "statshouse",
-	TagValueIDDuckQuarantineUnreadable: "unreadable",
+	TagValueIDDuckQuarantineDeltaSchema:   "delta_schema",
+	TagValueIDDuckQuarantineArchiveSchema: "archive_schema",
+	TagValueIDDuckQuarantineStorage:       "storage",
+	TagValueIDDuckQuarantineStatshouse:    "statshouse",
+	TagValueIDDuckQuarantineUnreadable:    "unreadable",
 }
 
 const (
@@ -1682,7 +1684,7 @@ Set by aggregator.`,
 var BuiltinMetricMetaDuckQuarantinedFiles = &MetricMetaValue{
 	Name: "__duck_store_quarantined_files",
 	Kind: MetricKindCounter,
-	Description: `Store files the aggregator quarantined on open, by the version axis that excluded them (schema, DuckDB storage, statshouse version, or unreadable).
+	Description: `Store files the aggregator quarantined on open, by the version axis that excluded them (delta schema, archive schema, DuckDB storage, statshouse version, or unreadable).
 Count is the number of files. Set by aggregator.`,
 	NoSampleAgent:           true, // generated on aggregators, must be delivered without losses
 	BuiltinAllowedToReceive: false,

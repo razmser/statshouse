@@ -150,7 +150,7 @@ func (s *Store) RollGeneration() error {
 	path := filepath.Join(s.cfg.Dir, deltaFileName(next))
 	// A file left by a failed earlier roll is complete (createFile is
 	// all-or-nothing) and stamped by this binary, so it is reused as-is.
-	if err := createFile(path, allTierTables(), s.currentStamp(), s.cfg.Resources); err != nil {
+	if err := createFile(path, allTierTables(), s.currentStamp(fileKindDelta), s.cfg.Resources); err != nil {
 		return fmt.Errorf("duck-store: roll: %w", err)
 	}
 	db, err := openStoreFile(path, false, s.cfg.Resources)
@@ -239,7 +239,7 @@ func (s *Store) consumeWindow(ctx context.Context, gen int64, deltaPath string, 
 	}
 	path := filepath.Join(s.cfg.Dir, archiveSubdir, archiveFileName(k.tier, k.start))
 	if _, err := os.Stat(path); os.IsNotExist(err) {
-		if err := createArchiveWindow(path, k.tier, s.currentStamp(), s.cfg.Resources); err != nil {
+		if err := createArchiveWindow(path, k.tier, s.currentStamp(fileKindArchive), s.cfg.Resources); err != nil {
 			return fmt.Errorf("duck-store: consume generation %d: %w", gen, err)
 		}
 	}

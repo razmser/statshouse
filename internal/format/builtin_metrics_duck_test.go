@@ -125,10 +125,11 @@ func TestDuckStoreMetricValueComments(t *testing.T) {
 			meta: BuiltinMetricMetaDuckQuarantinedFiles,
 			tag:  0,
 			entries: map[int32]string{
-				TagValueIDDuckQuarantineSchema:     "schema",
-				TagValueIDDuckQuarantineStorage:    "storage",
-				TagValueIDDuckQuarantineStatshouse: "statshouse",
-				TagValueIDDuckQuarantineUnreadable: "unreadable",
+				TagValueIDDuckQuarantineDeltaSchema:   "delta_schema",
+				TagValueIDDuckQuarantineArchiveSchema: "archive_schema",
+				TagValueIDDuckQuarantineStorage:       "storage",
+				TagValueIDDuckQuarantineStatshouse:    "statshouse",
+				TagValueIDDuckQuarantineUnreadable:    "unreadable",
 			},
 		},
 		{
