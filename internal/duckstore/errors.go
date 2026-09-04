@@ -29,6 +29,17 @@ import (
 // constant lives in this untagged contract file where both sides see it.
 const MaxSeriesRowLimit = 1_000_000
 
+// QueryVerb distinguishes the two structured store-query verbs. It lives in
+// this untagged contract file for the same reason MaxSeriesRowLimit does: the
+// aggregator's query listener — built without the duckdb tag — labels its
+// admission outcomes with the same vocabulary the store's own metrics use.
+type QueryVerb string
+
+const (
+	QuerySeries    QueryVerb = "series"
+	QueryTagValues QueryVerb = "tag_values"
+)
+
 const (
 	// ErrCodeBadRequest marks a malformed request; never retry.
 	ErrCodeBadRequest int32 = -5100

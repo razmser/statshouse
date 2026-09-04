@@ -145,20 +145,9 @@ func (m *duckMetrics) StoreQuery(verb duckstore.QueryVerb, err error, dur time.D
 // never executes never reaches the renderers' own StoreQuery point — without
 // this, overload is invisible in __duck_store_query_time, which is exactly
 // when it matters.
-func (m *duckMetrics) StoreQueryAdmission(verb storeQueryVerb, outcome storeQueryAdmission, wait time.Duration) {
-	// The listener's verb vocabulary mirrors duckstore's ("series",
-	// "tag_values") but is a distinct type — the listener is built without
-	// the duckdb tag — so it maps to the same tag values through its own
-	// switch.
-	var verbTag int32
-	switch verb {
-	case storeQuerySeries:
-		verbTag = format.TagValueIDDuckQuerySeries
-	case storeQueryTagValues:
-		verbTag = format.TagValueIDDuckQueryTagValues
-	}
+func (m *duckMetrics) StoreQueryAdmission(verb duckstore.QueryVerb, outcome storeQueryAdmission, wait time.Duration) {
 	m.sh.AddValueCounter(m.now(), format.BuiltinMetricMetaDuckQueryTime,
-		[]int32{0, verbTag, duckQueryAdmissionTag(outcome)}, wait.Seconds(), 1)
+		[]int32{0, duckQueryVerbTag(verb), duckQueryAdmissionTag(outcome)}, wait.Seconds(), 1)
 }
 
 func (m *duckMetrics) StoreSize(location duckstore.SizeLocation, used, free int64) {

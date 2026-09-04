@@ -381,8 +381,8 @@ func TestDuckMetricsForwardsEvents(t *testing.T) {
 	// queued/refused status values — the only place a query shed at admission
 	// is ever visible, since it never reaches the renderer's own StoreQuery.
 	sink.valueCounters = nil
-	m.StoreQueryAdmission(storeQuerySeries, storeQueryQueued, 1500*time.Millisecond)
-	m.StoreQueryAdmission(storeQueryTagValues, storeQueryRefused, 250*time.Millisecond)
+	m.StoreQueryAdmission(duckstore.QuerySeries, storeQueryQueued, 1500*time.Millisecond)
+	m.StoreQueryAdmission(duckstore.QueryTagValues, storeQueryRefused, 250*time.Millisecond)
 	require.Equal(t, []duckValueCounterCall{
 		{format.BuiltinMetricMetaDuckQueryTime,
 			[]int32{0, format.TagValueIDDuckQuerySeries, format.TagValueIDDuckQueryQueued}, 1.5, 1},

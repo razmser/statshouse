@@ -80,14 +80,6 @@ const (
 	QuarantineUnreadable    QuarantineAxis = "unreadable"
 )
 
-// QueryVerb distinguishes the two structured store-query verbs.
-type QueryVerb string
-
-const (
-	QuerySeries    QueryVerb = "series"
-	QueryTagValues QueryVerb = "tag_values"
-)
-
 // SizeLocation is which part of the store a size sample measured.
 type SizeLocation string
 

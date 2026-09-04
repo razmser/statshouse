@@ -785,12 +785,12 @@ type recordingAdmissions struct {
 }
 
 type recordedAdmission struct {
-	verb    storeQueryVerb
+	verb    duckstore.QueryVerb
 	outcome storeQueryAdmission
 	wait    time.Duration
 }
 
-func (r *recordingAdmissions) StoreQueryAdmission(verb storeQueryVerb, outcome storeQueryAdmission, wait time.Duration) {
+func (r *recordingAdmissions) StoreQueryAdmission(verb duckstore.QueryVerb, outcome storeQueryAdmission, wait time.Duration) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.events = append(r.events, recordedAdmission{verb, outcome, wait})
@@ -825,7 +825,7 @@ func TestStoreQueryServerAdmissionOutcomesRecorded(t *testing.T) {
 		requireErrorCode(t, err, duckstore.ErrCodeOverloaded, "the shed query")
 		events := rec.snapshot()
 		require.Len(t, events, 1, "the refusal is the one admission outcome")
-		require.Equal(t, storeQuerySeries, events[0].verb)
+		require.Equal(t, duckstore.QuerySeries, events[0].verb)
 		require.Equal(t, storeQueryRefused, events[0].outcome)
 		require.Positive(t, events[0].wait, "the refused query reports how long it waited")
 	})
@@ -863,7 +863,7 @@ func TestStoreQueryServerAdmissionOutcomesRecorded(t *testing.T) {
 		}
 		events := rec.snapshot()
 		require.Len(t, events, 1, "the wait is the one admission outcome")
-		require.Equal(t, storeQueryTagValues, events[0].verb)
+		require.Equal(t, duckstore.QueryTagValues, events[0].verb)
 		require.Equal(t, storeQueryQueued, events[0].outcome)
 		require.Positive(t, events[0].wait, "the queued query reports how long it waited")
 	})

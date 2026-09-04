@@ -175,20 +175,10 @@ func addressedMetricIDs(base tlstatshouse.StoreQueryBase) []int32 {
 	return ids
 }
 
-// storeQueryVerb names which of the two structured store-query verbs a query
-// is, for the admission outcomes the listener records itself. duckstore's own
-// QueryVerb lives behind the duckdb build tag; the listener is built without
-// it, so the vocabulary lives here.
-type storeQueryVerb string
-
-const (
-	storeQuerySeries    storeQueryVerb = "series"
-	storeQueryTagValues storeQueryVerb = "tag_values"
-)
-
 // storeQueryAdmission labels how a query left the listener's admission path —
 // outcomes the store's renderers cannot record, because a query that is shed,
-// or still waiting for its slot, never reaches them.
+// or still waiting for its slot, never reaches them. The verbs themselves are
+// duckstore.QueryVerb, the untagged contract vocabulary.
 type storeQueryAdmission string
 
 const (
@@ -210,7 +200,7 @@ type storeQueryMetrics interface {
 	// waited before the refusal, zero when shed at once). A query that found
 	// a slot without waiting is not reported — its load is the executor's own
 	// point.
-	StoreQueryAdmission(verb storeQueryVerb, outcome storeQueryAdmission, wait time.Duration)
+	StoreQueryAdmission(verb duckstore.QueryVerb, outcome storeQueryAdmission, wait time.Duration)
 }
 
 // storeQueryServerConfig configures the query listener.
@@ -390,7 +380,7 @@ func (s *storeQueryServer) handleQuerySeries(ctx context.Context, hctx *rpc.Hand
 	if _, err := args.ReadTL1(hctx.Request); err != nil {
 		return badStoreQueryRequest("storeQuerySeries", err)
 	}
-	return executeQuery(s, ctx, hctx, args.Base, storeQuerySeries,
+	return executeQuery(s, ctx, hctx, args.Base, duckstore.QuerySeries,
 		func(qctx context.Context) (tlstatshouse.StoreSeriesResponse, error) {
 			return s.executor.QuerySeries(qctx, args)
 		},
@@ -406,7 +396,7 @@ func (s *storeQueryServer) handleQueryTagValues(ctx context.Context, hctx *rpc.H
 	if _, err := args.ReadTL1(hctx.Request); err != nil {
 		return badStoreQueryRequest("storeQueryTagValues", err)
 	}
-	return executeQuery(s, ctx, hctx, args.Base, storeQueryTagValues,
+	return executeQuery(s, ctx, hctx, args.Base, duckstore.QueryTagValues,
 		func(qctx context.Context) (tlstatshouse.StoreTagValuesResponse, error) {
 			return s.executor.QueryTagValues(qctx, args)
 		},
@@ -429,7 +419,7 @@ func badStoreQueryRequest(verb string, err error) error {
 // context — which FinishLongpoll hands out only afterwards, a fresh context
 // rather than the handler's own (the transport reuses that one the moment the
 // handler returns).
-func executeQuery[R any](s *storeQueryServer, ctx context.Context, hctx *rpc.HandlerContext, base tlstatshouse.StoreQueryBase, verb storeQueryVerb,
+func executeQuery[R any](s *storeQueryServer, ctx context.Context, hctx *rpc.HandlerContext, base tlstatshouse.StoreQueryBase, verb duckstore.QueryVerb,
 	run func(qctx context.Context) (R, error), write func(respCtx *rpc.HandlerContext, resp R) error) error {
 	// Two cancel layers: the cause-carrying cancel lets the longpoll
 	// canceller record WHY the query died, and the timeout layer bounds it by
@@ -512,7 +502,7 @@ func executeQuery[R any](s *storeQueryServer, ctx context.Context, hctx *rpc.Han
 
 // recordAdmission reports one admission outcome to the configured recorder,
 // if there is one.
-func (s *storeQueryServer) recordAdmission(verb storeQueryVerb, outcome storeQueryAdmission, wait time.Duration) {
+func (s *storeQueryServer) recordAdmission(verb duckstore.QueryVerb, outcome storeQueryAdmission, wait time.Duration) {
 	if s.cfg.Metrics != nil {
 		s.cfg.Metrics.StoreQueryAdmission(verb, outcome, wait)
 	}
