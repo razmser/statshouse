@@ -1204,3 +1204,55 @@ func TestBlobListCoversDriverVariants(t *testing.T) {
 	_, err = blobList(42)
 	require.Error(t, err)
 }
+
+// TestCompactToleratesGenerationConsumedBySealBarrier pins the compactor's
+// half of a consume race the barrier's half already tolerates (seal.go): the
+// compactor and the sealer run on independent goroutines and both consume
+// rolled generations, so whichever finishes second finds the winner's file
+// already unlinked — the barrier reads that as done, and so must the
+// compactor, instead of failing its pass.
+func TestCompactToleratesGenerationConsumedBySealBarrier(t *testing.T) {
+	b1 := (writerNowUnix - 7200) / 60 * 60
+	s, w := newTestWriter(t)
+	require.NoError(t, w.WriteRound(context.Background(), []Row{
+		{Metric: testMetricID, Time: uint32(b1), Tags: tag0(11), Count: 3},
+	}))
+	require.NoError(t, s.RollGeneration()) // generation 0 rolled off
+	require.NoError(t, w.WriteRound(context.Background(), []Row{
+		{Metric: testMetricID, Time: uint32(b1 + 60), Tags: tag0(11), Count: 7},
+	}))
+	require.NoError(t, s.RollGeneration()) // generation 1 rolled off, 2 active
+
+	// the pass consumes oldest first: a reader pin parks it inside its consume
+	// of generation 0 — past its snapshot, at the unlink barrier — so the test
+	// can run the barrier's consume of generation 1 to completion under it
+	windows0, err := generationWindows(filepath.Join(s.cfg.Dir, deltaFileName(0)), s.cfg.Resources)
+	require.NoError(t, err)
+	pin := s.AcquireDeltaPin(0)
+	require.NotNil(t, pin)
+	done := make(chan error, 1)
+	go func() { done <- NewCompactor(s, CompactorConfig{}).CompactOnce(context.Background()) }()
+	require.Eventually(t, func() bool {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		for k := range windows0 {
+			if _, ok := s.consumed[k][0]; !ok {
+				return false
+			}
+		}
+		return true
+	}, 10*time.Second, 5*time.Millisecond, "the pass parked at generation 0's pin barrier")
+
+	// the barrier's consume finishing under the pass: the windows record
+	// generation 1, the bookkeeping forgets it, and its file is unlinked
+	require.NoError(t, s.ConsumeGeneration(context.Background(), 1, ConsumeOptions{AppendWindow: collapseWindowRows}))
+	pin.Release()
+	require.NoError(t, <-done, "the pass reads the vanished generation as done")
+
+	// the rows the barrier consumed under the pass still answer
+	require.NoError(t, runSeriesQuery(context.Background(), s, testMetricID, b1+30, b1+120, seriesCounts{
+		time:  []int64{b1 + 60},
+		tag0:  []int64{11},
+		count: []float64{7},
+	}))
+}

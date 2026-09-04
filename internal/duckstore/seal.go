@@ -333,8 +333,8 @@ func (s *Store) generationContributesToDue(gen int64, due map[windowKey]struct{}
 }
 
 // deltaFileGone reports whether a delta generation's file left the disk — the
-// barrier's way to tell a generation the compactor finished under it from one
-// its own consume genuinely failed to land.
+// maintenance consumers' way to tell a generation another consumer finished
+// under them from one their own consume genuinely failed to land.
 func deltaFileGone(path string) bool {
 	_, err := os.Stat(path)
 	return errors.Is(err, fs.ErrNotExist)

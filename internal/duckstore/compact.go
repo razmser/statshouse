@@ -13,6 +13,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -117,6 +118,9 @@ func (c *Compactor) compactOnce(ctx context.Context) error {
 			break // the active generation is not consumption input
 		}
 		if err := s.ConsumeGeneration(ctx, gen, opts); err != nil {
+			if deltaFileGone(filepath.Join(s.cfg.Dir, deltaFileName(gen))) {
+				continue // the seal barrier finished this generation under the pass; its windows hold the rows
+			}
 			return fmt.Errorf("duck-store: consume generation %d: %w", gen, err)
 		}
 	}
@@ -130,6 +134,9 @@ func (c *Compactor) compactOnce(ctx context.Context) error {
 		return fmt.Errorf("duck-store: roll to seal generation %d: %w", gen, err)
 	}
 	if err := s.ConsumeGeneration(ctx, gen, opts); err != nil {
+		if deltaFileGone(filepath.Join(s.cfg.Dir, deltaFileName(gen))) {
+			return nil // the seal barrier consumed the just-rolled generation under the pass
+		}
 		return fmt.Errorf("duck-store: consume generation %d: %w", gen, err)
 	}
 	return nil
