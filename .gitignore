@@ -22,8 +22,9 @@ node_modules/
 
 */**/y.output
 
-# e2e harness per-run artifacts (logs, dumps, summaries)
+# e2e harness per-run results (logs, dumps, summaries) and load-test session workspaces
 /e2e/artifacts/
+/e2e/test-results/
 
 # built harness binary (go build run inside e2e/)
 /e2e/e2e

@@ -215,7 +215,7 @@ func realMain(runtimeFlag, runIDFlag, archFlag string, backend storageBackend, k
 		fmt.Fprintf(os.Stderr, "FAIL: %v\n", err)
 		return 2
 	}
-	artifactsDir := filepath.Join(root, "e2e", "artifacts", runID)
+	artifactsDir := filepath.Join(root, "e2e", "test-results", runID)
 	if err := os.MkdirAll(artifactsDir, 0o755); err != nil {
 		fmt.Fprintf(os.Stderr, "FAIL: create artifacts dir %s: %v\n", artifactsDir, err)
 		return 2
@@ -1083,7 +1083,7 @@ type recorder struct {
 
 // failedQuery is one /api/query whose result did not satisfy an assertion, with
 // the verbatim response bytes (the exact payload a human needs to diagnose a
-// mismatch without rerunning). Serialized into e2e/artifacts/<runid>/failed-
+// mismatch without rerunning). Serialized into e2e/test-results/<runid>/failed-
 // queries.json. Body is "" when the query itself errored before any body (e.g.
 // a connection refused); the Label/URL still pinpoints it.
 type failedQuery struct {

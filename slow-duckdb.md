@@ -1,6 +1,6 @@
 # duck-store: read collapse and 6× disk, diagnosed
 
-Investigation of load-test run `20260817-233113` (`e2e/artifacts/20260817-233113/REPORT.md`),
+Investigation of load-test run `20260817-233113` (`e2e/test-results/20260817-233113/REPORT.md`),
 which measured the duck-backed stack at **~0 q/s sustained read rate** (0.8% of queries
 succeeded) and **1662 MB on disk against ClickHouse's 272 MB** for the same stream.
 
